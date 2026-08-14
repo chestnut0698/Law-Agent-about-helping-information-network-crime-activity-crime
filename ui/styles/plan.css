@@ -1,0 +1,130 @@
+/* ========================================
+   plan.css — 执行计划视图
+   ======================================== */
+
+.plan-container {
+    max-width: 800px; margin: 12px 0;
+    max-width: 800px;
+    margin: 12px auto;
+    padding: 14px 18px;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    background: var(--bg-secondary);
+    animation: fadeIn 0.3s ease;
+}
+
+.plan-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 12px;
+}
+
+.plan-header-icon {
+    width: 20px;
+    height: 20px;
+    color: var(--accent-blue);
+}
+
+.plan-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+    flex: 1;
+}
+
+.plan-count {
+    font-size: 11px;
+    color: var(--text-muted);
+    background: var(--bg-tertiary);
+    padding: 2px 8px;
+    border-radius: 10px;
+}
+
+.plan-steps {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.plan-step {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 8px 0;
+    position: relative;
+}
+
+.plan-step:not(:last-child)::before {
+    content: '';
+    position: absolute;
+    left: 11px;
+    top: 28px;
+    bottom: -4px;
+    width: 2px;
+    background: var(--border-color);
+}
+
+.plan-step.completed:not(:last-child)::before {
+    background: var(--accent-green);
+}
+
+.step-indicator {
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    font-size: 11px;
+    font-weight: 600;
+    z-index: 1;
+}
+
+.step-indicator.pending {
+    background: var(--bg-tertiary);
+    color: var(--text-muted);
+    border: 1px solid var(--border-color);
+}
+
+.step-indicator.running {
+    background: var(--accent-blue);
+    color: white;
+    animation: pulse 1.5s infinite;
+}
+
+.step-indicator.completed {
+    background: var(--accent-green);
+    color: white;
+}
+
+.step-indicator .check-svg {
+    width: 12px;
+    height: 12px;
+}
+
+.step-content {
+    flex: 1;
+    min-width: 0;
+}
+
+.step-title {
+    font-size: 13px;
+    color: var(--text-primary);
+    margin-bottom: 2px;
+}
+
+.step-desc {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+.plan-step.running .step-title {
+    color: var(--accent-blue);
+    font-weight: 500;
+}
+
+.plan-step.completed .step-title {
+    color: var(--text-secondary);
+}

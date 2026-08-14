@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agent UI - 界面示例</title>
+    <link rel="stylesheet" href="styles/main.css">
+    <link rel="stylesheet" href="styles/sidebar.css">
+    <link rel="stylesheet" href="styles/chat.css">
+    <link rel="stylesheet" href="styles/tool-call.css">
+    <link rel="stylesheet" href="styles/thinking.css">
+    <link rel="stylesheet" href="styles/plan.css">
+    <link rel="stylesheet" href="styles/input.css">
+    <link rel="stylesheet" href="styles/toast.css">
+    <link rel="stylesheet" href="styles/markdown.css">
+    <link rel="stylesheet" href="styles/responsive.css">
+</head>
+<body>
+    <div class="app-layout">
+    <!-- 侧边栏 -->
+    <aside class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+            <div class="logo">
+                <svg class="logo-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+                    <path d="M2 17l10 5 10-5"/>
+                    <path d="M2 12l10 5 10-5"/>
+                </svg>
+                <span class="logo-text">Agent UI</span>
+            </div>
+            <button class="btn-icon" id="btn-new-chat" title="新建对话">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M12 4v16m-8-8h16"/>
+                </svg>
+            </button>
+        </div>
+
+        <div class="sidebar-section">
+            <div class="section-title">对话</div>
+            <div class="conversation-list" id="conversation-list">
+                <div class="conversation-item active" data-id="1">
+                    <svg class="conv-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/>
+                    </svg>
+                    <span class="conv-title">新对话</span>
+                    <span class="conv-time">刚刚</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="sidebar-section">
+            <div class="section-title">模型</div>
+            <div class="model-list">
+                <div class="model-item active" data-model="gpt-5">
+                    <span class="model-dot" style="background:#10a37f"></span>
+                    <span>GPT-5</span>
+                </div>
+                <div class="model-item" data-model="claude-4">
+                    <span class="model-dot" style="background:#d97706"></span>
+                    <span>Claude 4</span>
+                </div>
+                <div class="model-item" data-model="gemini-2">
+                    <span class="model-dot" style="background:#3b82f6"></span>
+                    <span>Gemini 2.5</span>
+                </div>
+                <div class="model-item" data-model="deepseek-v3">
+                    <span class="model-dot" style="background:#8b5cf6"></span>
+                    <span>DeepSeek V3</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="sidebar-footer">
+            <button class="btn-theme" id="btn-theme-toggle">
+                <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="5"/>
+                    <path d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+                </svg>
+                <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/>
+                </svg>
+            </button>
+            <div class="user-info">
+                <div class="user-avatar">U</div>
+                <span class="user-name">用户</span>
+            </div>
+        </div>
+    </aside>
+
+    <!-- 主内容区 -->
+    <main class="main-content">
+        <!-- 顶部栏 -->
+        <header class="top-bar">
+            <button class="btn-icon btn-toggle-sidebar" id="btn-toggle-sidebar">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M3 12h18M3 6h18M3 18h18"/>
+                </svg>
+            </button>
+            <div class="top-bar-center">
+                <div class="model-selector" id="model-selector">
+                    <span class="model-selector-label">模型：</span>
+                    <span class="model-selector-value" id="current-model">GPT-5</span>
+                    <svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M6 9l6 6 6-6"/>
+                    </svg>
+                </div>
+            </div>
+            <div class="top-bar-right">
+                <div class="agent-status" id="agent-status">
+                    <span class="status-dot status-idle"></span>
+                    <span class="status-text">空闲</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- 消息区域 -->
+        <div class="chat-container" id="chat-container">
+            <div class="chat-messages" id="chat-messages">
+                <!-- 欢迎消息 -->
+                <div class="welcome-screen" id="welcome-screen">
+                    <div class="welcome-logo">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+                            <path d="M2 17l10 5 10-5"/>
+                            <path d="M2 12l10 5 10-5"/>
+                        </svg>
+                    </div>
+                    <h1 class="welcome-title">你好，我是 Agent</h1>
+                    <p class="welcome-subtitle">我可以思考、规划、调用工具来帮你完成复杂任务</p>
+                    <div class="welcome-prompts">
+                        <button class="prompt-card" data-prompt="帮我搜索2026年AI Agent领域的最新技术趋势">
+                            <span class="prompt-icon">🔍</span>
+                            <span>搜索AI Agent最新趋势</span>
+                        </button>
+                        <button class="prompt-card" data-prompt="帮我写一个Python脚本，爬取天气预报数据并生成可视化图表">
+                            <span class="prompt-icon">📊</span>
+                            <span>写代码+数据可视化</span>
+                        </button>
+                        <button class="prompt-card" data-prompt="帮我规划一次从北京到东京的5天商务旅行">
+                            <span class="prompt-icon">✈️</span>
+                            <span>规划商务旅行</span>
+                        </button>
+                        <button class="prompt-card" data-prompt="分析这段代码的时间复杂度并给出优化建议">
+                            <span class="prompt-icon">🧮</span>
+                            <span>代码分析优化</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 状态栏 -->
+            <div class="status-bar" id="status-bar" style="display: none;">
+                <div class="status-bar-left">
+                    <div class="status-bar-icon" id="status-bar-icon">
+                        <svg class="spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M21 12a9 9 0 11-6.219-8.56"/>
+                        </svg>
+                    </div>
+                    <span class="status-bar-text" id="status-bar-text">思考中...</span>
+                </div>
+                <div class="status-bar-right">
+                    <div class="progress-bar-mini">
+                        <div class="progress-fill" id="progress-fill"></div>
+                    </div>
+                    <span class="token-count" id="token-count">0 tokens</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- 输入区域 -->
+        <div class="input-area">
+            <div class="input-wrapper">
+                <div class="input-toolbar">
+                    <button class="toolbar-btn" title="附件">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/>
+                        </svg>
+                    </button>
+                    <button class="toolbar-btn" title="语音输入">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z"/>
+                            <path d="M19 10v2a7 7 0 01-14 0v-2M12 19v4M8 23h8"/>
+                        </svg>
+                    </button>
+                    <div class="toolbar-divider"></div>
+                    <button class="toolbar-btn" title="工具">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M14.7 6.3a1 1 0 000 1.4l1.6 1.6a1 1 0 001.4 0l3.77-3.77a6 6 0 01-7.94 7.94l-6.91 6.91a2.12 2.12 0 01-3-3l6.91-6.91a6 6 0 017.94-7.94l-3.76 3.76z"/>
+                        </svg>
+                    </button>
+                    <button class="toolbar-btn" title="代码">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M16 18l6-6-6-6M8 6l-6 6 6 6"/>
+                        </svg>
+                    </button>
+                </div>
+                <div class="input-box">
+                    <textarea
+                        class="input-textarea"
+                        id="input-textarea"
+                        placeholder="给 Agent 发送消息... (Enter 发送 / Shift+Enter 换行)"
+                        rows="1"
+                    ></textarea>
+                    <button class="btn-send" id="btn-send" disabled>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/>
+                        </svg>
+                    </button>
+                </div>
+                <div class="input-footer">
+                    <span class="input-hint">Agent 可以调用工具、搜索网络、执行代码</span>
+                    <span class="shortcut-hint">⌘K 新对话 · ⌘B 侧边栏</span>
+                </div>
+            </div>
+        </div>
+    </main>
+    </div>
+
+    <!-- Toast 容器 -->
+    <div class="toast-container" id="toast-container"></div>
+
+    <!-- 模型选择弹窗 -->
+    <div class="modal-overlay" id="model-modal" style="display: none;">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>选择模型(示例)</h3>
+                <button class="btn-icon" id="btn-close-modal">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M18 6L6 18M6 6l12 12"/>
+                    </svg>
+                </button>
+            </div>
+            <div class="modal-body">
+                <div class="model-option" data-model="gpt-5">
+                    <div class="model-option-info">
+                        <span class="model-dot" style="background:#10a37f"></span>
+                        <div>
+                            <div class="model-option-name">GPT-5</div>
+                            <div class="model-option-desc">OpenAI 最强推理模型</div>
+                        </div>
+                    </div>
+                    <svg class="check-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M20 6L9 17l-5-5"/>
+                    </svg>
+                </div>
+                <div class="model-option" data-model="claude-4">
+                    <div class="model-option-info">
+                        <span class="model-dot" style="background:#d97706"></span>
+                        <div>
+                            <div class="model-option-name">Claude 4</div>
+                            <div class="model-option-desc">Anthropic 长上下文模型</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="model-option" data-model="gemini-2">
+                    <div class="model-option-info">
+                        <span class="model-dot" style="background:#3b82f6"></span>
+                        <div>
+                            <div class="model-option-name">Gemini 2.5</div>
+                            <div class="model-option-desc">Google 多模态模型</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="model-option" data-model="deepseek-v3">
+                    <div class="model-option-info">
+                        <span class="model-dot" style="background:#8b5cf6"></span>
+                        <div>
+                            <div class="model-option-name">DeepSeek V3</div>
+                            <div class="model-option-desc">开源推理模型</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- JavaScript 模块 -->
+    <script src="js/state.js"></script>
+    <script src="js/utils.js"></script>
+    <script src="js/toast.js"></script>
+    <script src="js/markdown.js"></script>
+    <script src="js/plan.js"></script>
+    <script src="js/thinking.js"></script>
+    <script src="js/tool-call.js"></script>
+    <script src="js/message.js"></script>
+    <script src="js/agent.js"></script>
+    <script src="js/sidebar.js"></script>
+    <script src="js/input.js"></script>
+    <script src="js/theme.js"></script>
+    <script src="js/main.js"></script>
+</body>
+</html>

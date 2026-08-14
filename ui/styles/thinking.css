@@ -1,0 +1,135 @@
+/* ========================================
+   thinking.css — 思考过程面板
+   ======================================== */
+
+.thinking-block {
+    max-width: 800px; margin: 12px 0;
+    max-width: 800px;
+    margin: 12px auto;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    background: var(--bg-secondary);
+    overflow: hidden;
+    animation: fadeIn 0.3s ease;
+}
+
+.thinking-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    cursor: pointer;
+    user-select: none;
+    transition: background var(--transition-fast);
+}
+
+.thinking-header:hover {
+    background: var(--bg-hover);
+}
+
+.thinking-icon {
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--accent-orange), var(--accent-red));
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+}
+
+.thinking-icon svg {
+    width: 14px;
+    height: 14px;
+    color: white;
+    animation: spin 3s linear infinite;
+}
+
+.thinking-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+    flex: 1;
+}
+
+.thinking-meta {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+.thinking-chevron {
+    width: 16px;
+    height: 16px;
+    color: var(--text-muted);
+    transition: transform var(--transition-fast);
+}
+
+.thinking-block.expanded .thinking-chevron {
+    transform: rotate(180deg);
+}
+
+.thinking-body {
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height var(--transition-normal);
+}
+
+.thinking-block.expanded .thinking-body {
+    max-height: 1000px;
+}
+
+.thinking-content {
+    padding: 4px 14px 14px 48px;
+    font-size: 13px;
+    color: var(--text-secondary);
+    line-height: 1.7;
+}
+
+.thinking-step {
+    position: relative;
+    padding: 6px 0;
+    padding-left: 20px;
+}
+
+.thinking-step::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 14px;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent-orange);
+    opacity: 0.6;
+}
+
+.thinking-step::after {
+    content: '';
+    position: absolute;
+    left: 3px;
+    top: 22px;
+    bottom: -6px;
+    width: 2px;
+    background: var(--border-color);
+}
+
+.thinking-step:last-child::after {
+    display: none;
+}
+
+.thinking-step.active::before {
+    background: var(--accent-blue);
+    opacity: 1;
+    animation: pulse 1.5s infinite;
+}
+
+.thinking-step.done::before {
+    background: var(--accent-green);
+    opacity: 1;
+}
+
+.thinking-block.compact .thinking-body {
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height var(--transition-normal);
+}

@@ -1,0 +1,228 @@
+/* ========================================
+   tool-call.css — 工具调用卡片
+   ======================================== */
+
+.tool-call-container {
+    max-width: 800px;
+    margin: 12px auto;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.tool-call-card {
+    max-width: 800px; margin: 12px auto;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    background: var(--bg-secondary);
+    overflow: hidden;
+    transition: all var(--transition-fast);
+    animation: fadeIn 0.3s ease;
+}
+
+.tool-call-card:hover {
+    border-color: var(--border-light);
+    box-shadow: var(--shadow-sm);
+}
+
+/* 工具调用头部 */
+.tool-call-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    cursor: pointer;
+    user-select: none;
+    transition: background var(--transition-fast);
+}
+
+.tool-call-header:hover {
+    background: var(--bg-hover);
+}
+
+.tool-icon {
+    width: 28px;
+    height: 28px;
+    border-radius: var(--radius-sm);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    font-size: 14px;
+}
+
+.tool-icon.search  { background: rgba(59,130,246,0.15); color: var(--accent-blue); }
+.tool-icon.code    { background: rgba(139,92,246,0.15); color: var(--accent-purple); }
+.tool-icon.file    { background: rgba(16,163,127,0.15); color: var(--accent-primary); }
+.tool-icon.calc    { background: rgba(245,158,11,0.15); color: var(--accent-orange); }
+.tool-icon.db      { background: rgba(6,182,212,0.15); color: var(--accent-cyan); }
+.tool-icon.email   { background: rgba(239,68,68,0.15); color: var(--accent-red); }
+.tool-icon.terminal{ background: rgba(34,197,94,0.15); color: var(--accent-green); }
+.tool-icon.weather { background: rgba(3,169,244,0.15); color: #03a9f4; }
+
+.tool-info {
+    flex: 1;
+    min-width: 0;
+}
+
+.tool-name {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.tool-desc {
+    font-size: 11px;
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.tool-status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+}
+
+.tool-status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+}
+
+.tool-status-dot.pending {
+    background: var(--text-muted);
+}
+
+.tool-status-dot.running {
+    background: var(--accent-blue);
+    animation: pulse 1s infinite;
+}
+
+.tool-status-dot.success {
+    background: var(--accent-green);
+}
+
+.tool-status-dot.error {
+    background: var(--accent-red);
+}
+
+.tool-status-dot.approval {
+    background: var(--accent-orange);
+}
+
+.tool-status-text {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+.tool-chevron {
+    width: 16px;
+    height: 16px;
+    color: var(--text-muted);
+    transition: transform var(--transition-fast);
+}
+
+.tool-call-card.expanded .tool-chevron {
+    transform: rotate(180deg);
+}
+
+/* 工具调用主体 */
+.tool-call-body {
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height var(--transition-normal);
+}
+
+.tool-call-card.expanded .tool-call-body {
+    max-height: 600px;
+}
+
+.tool-section {
+    padding: 10px 14px;
+    border-top: 1px solid var(--border-color);
+}
+
+.tool-section-label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+}
+
+.tool-params {
+    background: var(--bg-tertiary);
+    border-radius: var(--radius-sm);
+    padding: 10px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+    word-break: break-all;
+    line-height: 1.5;
+}
+
+.tool-result {
+    background: var(--bg-tertiary);
+    border-radius: var(--radius-sm);
+    padding: 10px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+    word-break: break-word;
+    line-height: 1.5;
+    max-height: 300px;
+    overflow-y: auto;
+}
+
+.tool-result.success {
+    border-left: 3px solid var(--accent-green);
+}
+
+.tool-result.error {
+    border-left: 3px solid var(--accent-red);
+    color: var(--accent-red);
+}
+
+/* 审批操作 */
+.tool-approval-actions {
+    display: flex;
+    gap: 8px;
+    padding: 10px 14px;
+    border-top: 1px solid var(--border-color);
+}
+
+.btn-approve, .btn-reject {
+    padding: 6px 14px;
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    border: 1px solid var(--border-color);
+    transition: all var(--transition-fast);
+    font-family: inherit;
+}
+
+.btn-approve {
+    background: var(--accent-primary);
+    color: white;
+    border-color: var(--accent-primary);
+}
+
+.btn-approve:hover {
+    background: var(--accent-hover);
+}
+
+.btn-reject {
+    background: transparent;
+    color: var(--text-secondary);
+}
+
+.btn-reject:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+}

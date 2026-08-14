@@ -1,0 +1,125 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "get_current_time",
+      "description": "获取当前的日期和时间",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "web_search",
+      "description": "检索互联网上的实时公开信息，用于回答时效性问题、查最新事实",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "搜索关键词，应为精炼的检索式而非完整句子"
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "返回结果数量，默认 5"
+          }
+        },
+        "required": ["query", "max_results"]
+      }
+    }
+  },
+  {
+      "type": "function",
+      "function": {
+          "name": "web_fetch",
+          "description": "输入一个网页 URL，返回该网页清洗后的正文（Markdown 格式）。用于深入阅读搜索结果中的具体页面,不支持抓取搜索引擎结果页.",
+          "parameters": {
+              "type": "object",
+              "properties": {
+                  "url": {
+                      "type": "string",
+                      "description": "完整的网页 URL"
+                  }
+              },
+              "required": ["url"]
+          }
+      }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "search_lawlibrary",
+      "description": "查询本地法律法规库（docx文件）。可列出所有法规、获取指定条文、关键词检索。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "list",
+              "get_clause",
+              "search"
+            ],
+            "description": "操作类型：list=列出所有法规, get_clause=获取条文, search=关键词检索"
+          },
+          "law_title": {
+            "type": "string",
+            "description": "法规标题关键词，如'民法典'、'劳动法'。list 操作时无需此参数"
+          },
+          "clause": {
+            "type": "string",
+            "description": "条号，如'第一条'或'577'。仅 get_clause 操作使用"
+          },
+          "keyword": {
+            "type": "string",
+            "description": "检索关键词，如'合同'、'违约责任'。仅 search 操作使用"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "search_policy_query",
+      "description": "查询本地政策文件库（意见/通知/办法/规定等）。支持列出文件、获取具体段落、关键词检索、获取全文。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "list",
+              "get_section",
+              "search",
+              "full_text"
+            ],
+            "description": "操作类型"
+          },
+          "keyword": {
+            "type": "string",
+            "description": "文件标题关键词或检索词"
+          },
+          "section_ref": {
+            "type": "string",
+            "description": "段落标识，如'一、' '（二）' '第一条'。留空返回目录"
+          },
+          "policy_type": {
+            "type": "string",
+            "description": "政策类型过滤：意见/通知/办法/规定/决定"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      }
+    }
+  }
+]
