@@ -1,9 +1,10 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import asyncio
 from agents.react_agent import *
+import shutil
 
 
 app = FastAPI()
@@ -24,6 +25,13 @@ def load_meta() -> list:
 def save_meta(meta: list):
     with open(META_FILE, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
+
+def get_workspace(conv_id: str) -> Path:
+    """获取对话的工作目录，不存在则创建"""
+    path = WORKSPACE_DIR / str(conv_id)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
 
 # ---------- 对话管理 API ----------
 @app.get("/conversations")
@@ -52,6 +60,11 @@ async def delete_conversation(conv_id: str):
     path = DATA_DIR / f"{conv_id}.json"
     if path.exists():
         path.unlink()
+
+    workspace = get_workspace(conv_id)
+    if workspace.exists():
+        shutil.rmtree(workspace)
+
     return {"status": "ok"}
 
 @app.patch("/conversations/{conv_id}")
@@ -74,8 +87,66 @@ async def get_messages(conv_id: str):
     return {"messages": []}
 
 
-# 初始化智能体
-agent = ReactAgent()
+# ---------- 文件上传 ----------
+@app.post("/conversations/{conv_id}/upload")
+async def upload_file(conv_id: str, file: UploadFile = File(...)):
+    workspace = get_workspace(conv_id)
+    # 安全处理文件名（防止路径遍历）
+    safe_name = Path(file.filename).name
+    file_path = workspace / safe_name
+
+    # 写入文件
+    with open(file_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    # 返回文件信息
+    return {
+        "filename": safe_name,
+        "size": file_path.stat().st_size,
+        "path": str(file_path),
+        "url": f"/files/{conv_id}/{safe_name}"
+    }
+
+
+# ---------- 文件列表 ----------
+@app.get("/conversations/{conv_id}/files")
+async def list_files(conv_id: str):
+    workspace = get_workspace(conv_id)
+    files = []
+    for f in sorted(workspace.iterdir()):
+        if f.is_file():
+            files.append({
+                "filename": f.name,
+                "size": f.stat().st_size,
+                "url": f"/files/{conv_id}/{f.name}"
+            })
+    return {"files": files}
+
+
+# ---------- 文件删除 ----------
+@app.delete("/conversations/{conv_id}/files/{filename}")
+async def delete_file(conv_id: str, filename: str):
+    workspace = get_workspace(conv_id)
+    safe_name = Path(filename).name
+    file_path = workspace / safe_name
+    if file_path.exists():
+        file_path.unlink()
+    return {"status": "ok"}
+
+
+# ---------- 静态文件服务（让前端能预览/下载）----------
+from fastapi.responses import FileResponse
+
+
+@app.get("/files/{conv_id}/{filename}")
+async def serve_file(conv_id: str, filename: str):
+    workspace = get_workspace(conv_id)
+    safe_name = Path(filename).name
+    file_path = workspace / safe_name
+    if not file_path.exists():
+        return {"error": "文件不存在"}
+    return FileResponse(file_path)
+
 
 
 # 前后端通信
@@ -100,7 +171,12 @@ async def chat(request: Request, conv_id):
                 yield f"data: {json.dumps({'type': 'thinking', 'content': chunk_data})}\n\n"
 
             elif chunk_type == "tool_calls":
-                tool_type = 'search' if (chunk_data['name'][:3] == "web" or chunk_data['name'][:3] == "sea") else 'code'
+                if (chunk_data['name'][:3] == "web" or chunk_data['name'][:3] == "sea"):
+                    tool_type = 'search'
+                elif (chunk_data['name'][:4] == "file"):
+                    tool_type = "file"
+                else:
+                    tool_type = 'code'
                 # 工具调用 → 发送 tool_call 事件
                 yield f"data: {json.dumps({'type': 'tool_call', 'tool': {
                     'type': tool_type, 
@@ -138,37 +214,12 @@ async def chat(request: Request, conv_id):
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
+
+# 初始化智能体
+agent = ReactAgent()
+
 app.mount("/", StaticFiles(directory="../ui", html=True), name="ui")
 
-"""
-while 1:
-    is_reasoning = True
-    is_call_tool = True
-    is_content = True
-
-    print(agent.messages)
-    user_input = input("用户:")
-
-
-    responses = agent.chat(user_input)
-    for chunk in responses:
-        if chunk[0] == "reasoning_content":
-            if is_reasoning:
-                print("思考:", end="")
-                is_reasoning = False
-
-            print(chunk[1], end="")
-        if chunkp[0] == "tool_calls":
-            if
-
-        if chunk[0] == "content":
-            if is_content:
-                print("\n回答:", end="")
-                is_content = False
-            print(chunk[1], end="")
-
-
-    print('\n', end="")"""
 
 if __name__ == "__main__":
     import uvicorn

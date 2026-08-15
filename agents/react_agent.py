@@ -1,6 +1,6 @@
 from agents.base_agent import *
 from app.config import *
-
+import inspect
 
 # ReAct（Reason + Act）模式的核心思想——让 AI 交替进行"推理（Reason）"和"行动（Act）"，并通过观察（Observation）来驱动下一步。
 class ReactAgent(BaseAgent):
@@ -17,7 +17,11 @@ class ReactAgent(BaseAgent):
         try:
             fn = tool_functions[data["function_name"]]
             args = json.loads(data["arguments"])
-            result = fn(**args)
+            sig = inspect.signature(fn)
+            if "conv_id" in sig.parameters:
+                result = fn(**args, conv_id=self.conv_id)
+            else:
+                result = fn(**args)
         except Exception as e:
             result = f"工具调用出错: {e}"
 
@@ -38,6 +42,10 @@ class ReactAgent(BaseAgent):
     def switch_id(self, conv_id):
         if self.conv_id == conv_id:return
 
+        path = WORKSPACE_DIR / str(conv_id)
+        if not path.exists():
+            path.mkdir(parents=True, exist_ok=True)
+
         path = DATA_DIR / f"{conv_id}.json"
         self.save_conversation(self.conv_id)
 
@@ -55,6 +63,13 @@ class ReactAgent(BaseAgent):
         自动将最终完整回复追加到历史中
         """
         self.messages.append({"role": "user", "content": user_input})
+
+        workspace = WORKSPACE_DIR / str(self.conv_id)
+        if workspace.exists():
+            files =  [f.name for f in workspace.iterdir() if f.is_file()]
+            file_list = "\n".join([f"  - {f}" for f in files])
+            self.messages.append({"role": "system",
+                                  "content": f"\n\n[工作区文件]\n当前对话工作区包含以下文件：\n{file_list}\n你可以读取、分析这些文件来回答用户问题。"})
 
         if PLANS:
             plan_steps = []

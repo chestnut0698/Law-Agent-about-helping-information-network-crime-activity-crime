@@ -171,11 +171,12 @@
         <div class="input-area">
             <div class="input-wrapper">
                 <div class="input-toolbar">
-                    <button class="toolbar-btn" title="附件">
+                    <button class="toolbar-btn" id="btn-attachment" title="附件">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/>
                         </svg>
                     </button>
+                    <input type="file" id="file-input" multiple style="display:none" />
                     <button class="toolbar-btn" title="语音输入">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z"/>
@@ -207,6 +208,7 @@
                         </svg>
                     </button>
                 </div>
+                <div id="file-preview-list" class="file-preview-list"></div>
                 <div class="input-footer">
                     <span class="input-hint">Agent 可以调用工具、搜索网络、执行代码</span>
                     <span class="shortcut-hint">⌘K 新对话 · ⌘B 侧边栏</span>
@@ -280,6 +282,7 @@
     <script src="js/toast.js"></script>
     <script src="js/markdown.js"></script>
     <script src="js/plan.js"></script>
+    <script src="js/file-upload.js"></script>
     <script src="js/thinking.js"></script>
     <script src="js/tool-call.js"></script>
     <script src="js/message.js"></script>

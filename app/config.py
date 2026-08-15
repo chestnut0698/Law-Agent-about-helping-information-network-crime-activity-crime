@@ -3,10 +3,13 @@ from dotenv import load_dotenv
 from pathlib import Path
 
 
-DATA_DIR = Path("../data/user")
+DATA_DIR = Path("../data/conversations")
 META_FILE = DATA_DIR / "conversations.json"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+WORKSPACE_DIR = Path("../data/workspace")
+WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 
 PLANS = [[
     "1.理解用户需求",

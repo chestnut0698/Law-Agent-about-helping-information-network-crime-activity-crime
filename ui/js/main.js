@@ -17,6 +17,7 @@
         // 初始化各模块（注意顺序：State → Toast → Sidebar → Input → Theme → Agent）
         Toast.init();
         Sidebar.init();
+        FileUpload.init();
         Input.init();
         Theme.init();
 

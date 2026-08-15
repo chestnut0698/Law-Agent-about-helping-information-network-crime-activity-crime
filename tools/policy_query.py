@@ -332,8 +332,8 @@ class PolicyLibrary:
 
 
 # ---------- 统一工具函数 ----------
-def search_policy_query(action: str, keyword: str = "", section_ref: str = "",
-                 policy_type: str = "", policy_dir: str = "./policies") -> str:
+def search_policy(action: str, keyword: str = "", section_ref: str = "",
+                 policy_type: str = "") -> str:
     """
     统一政策文件查询工具。
 
@@ -346,6 +346,7 @@ def search_policy_query(action: str, keyword: str = "", section_ref: str = "",
 
     返回：JSON 字符串
     """
+    policy_dir = "../knowledge/legal_interpretation"
     lib = PolicyLibrary(policy_dir=policy_dir)
 
     if action == "list":

@@ -88,7 +88,7 @@
   {
     "type": "function",
     "function": {
-      "name": "search_policy_query",
+      "name": "search_policy",
       "description": "查询本地政策文件库（意见/通知/办法/规定等）。支持列出文件、获取具体段落、关键词检索、获取全文。",
       "parameters": {
         "type": "object",
