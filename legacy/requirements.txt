@@ -6,3 +6,4 @@ baidusearch==1.0.3
 selenium==4.47.0
 webdriver-manager==4.1.2
 python-docx==1.2.0
+python-multipart==0.0.20

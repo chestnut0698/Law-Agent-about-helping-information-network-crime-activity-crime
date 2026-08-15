@@ -22,6 +22,64 @@
     box-shadow: 0 0 0 3px var(--accent-light);
 }
 
+/* 拖拽悬停效果 */
+.input-wrapper.drag-over {
+    outline: 2px dashed var(--accent-color, #4A90D9);
+    outline-offset: -4px;
+    background: rgba(74, 144, 217, 0.03);
+    transition: outline 0.2s ease, background 0.2s ease;
+}
+
+/* 可选：显示拖拽提示文字（通过伪元素） */
+.input-wrapper.drag-over::after {
+    content: '释放以上传文件';
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    color: var(--accent-color, #4A90D9);
+    font-size: 14px;
+    pointer-events: none;
+    background: var(--bg-primary, #fff);
+    padding: 8px 16px;
+    border-radius: 8px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+}
+
+
+.file-preview-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 8px 16px;
+    max-height: 120px;
+    overflow-y: auto;
+}
+.file-preview-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    background: var(--bg-tertiary);
+    border-radius: 6px;
+    font-size: 12px;
+    max-width: 200px;
+}
+.file-preview-item .file-name {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.file-preview-item .file-remove {
+    cursor: pointer;
+    color: var(--text-muted);
+    font-size: 14px;
+}
+.file-preview-item .file-remove:hover {
+    color: var(--danger);
+}
+
+
 /* 工具栏 */
 .input-toolbar {
     display: flex;

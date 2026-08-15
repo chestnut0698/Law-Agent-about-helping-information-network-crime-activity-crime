@@ -62,7 +62,11 @@
             const text = this.textarea.value.trim();
             if (!text || State.agentState === 'thinking' || State.agentState === 'working') return;
 
-             if (!State.currentConversationId || !State.conversations.find(c => c.id === State.currentConversationId)) {
+            // 先上传待发送的文件
+            const uploadedFiles = await FileUpload.uploadPending();
+
+
+            if (!State.currentConversationId || !State.conversations.find(c => c.id === State.currentConversationId)) {
                 // 静默创建一个新对话（不弹出 toast）
                 await Sidebar._createNewConversation(true);
                 // 注意：_createNewConversation 是 async 的，会更新 State
