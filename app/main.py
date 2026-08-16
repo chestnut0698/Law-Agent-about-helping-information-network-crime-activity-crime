@@ -1,10 +1,15 @@
-from fastapi import FastAPI, Request, UploadFile, File
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, Form, Header, Request, UploadFile, File
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import asyncio
 from agents.react_agent import *
 import shutil
+from pathlib import Path
+from typing import Optional
+
+from app.config import REPO_ROOT
+from tools.files import MaterialError, get_material_service, init_db
 
 
 app = FastAPI()
@@ -15,6 +20,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+init_db()
 
 def load_meta() -> list:
     if META_FILE.exists():
@@ -134,6 +141,150 @@ async def delete_file(conv_id: str, filename: str):
     return {"status": "ok"}
 
 
+# ---------- 案件卷宗上传与处理 ----------
+def material_error_response(exc: MaterialError) -> JSONResponse:
+    return JSONResponse(status_code=400, content=exc.to_dict())
+
+
+@app.post("/api/materials/upload")
+async def upload_materials(
+    case_id: str = Form(...),
+    files: list[UploadFile] = File(...),
+    parse: bool = Form(True),
+    keep_duplicate: bool = Form(False),
+    replace_document_id: Optional[str] = Form(None),
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    service = get_material_service()
+    try:
+        results = []
+        for item in files:
+            results.append(
+                service.upload_one(
+                    case_id=case_id,
+                    filename=item.filename or "unnamed.bin",
+                    content=await item.read(),
+                    user_id=x_user_id,
+                    parse=parse,
+                    keep_duplicate=keep_duplicate,
+                    replace_document_id=replace_document_id,
+                )
+            )
+        return {"results": results}
+    except MaterialError as exc:
+        return material_error_response(exc)
+
+
+@app.get("/api/materials/cases/{case_id}")
+async def list_case_materials_api(
+    case_id: str,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    try:
+        return {"materials": get_material_service().list_materials(case_id, user_id=x_user_id)}
+    except MaterialError as exc:
+        return material_error_response(exc)
+
+
+@app.get("/api/materials/documents/{document_id}/status")
+async def material_status(
+    document_id: str,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    try:
+        return get_material_service().get_status(document_id, user_id=x_user_id)
+    except MaterialError as exc:
+        return material_error_response(exc)
+
+
+@app.post("/api/materials/documents/{document_id}/reparse")
+async def reparse_material(
+    document_id: str,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    service = get_material_service()
+    try:
+        current = service.get_status(document_id, user_id=x_user_id).get("current_version")
+        if not current:
+            raise MaterialError("MATERIAL_NOT_FOUND", "no current version")
+        return service.parse_version(current["id"], user_id=x_user_id)
+    except MaterialError as exc:
+        return material_error_response(exc)
+
+
+@app.post("/api/materials/documents/{document_id}/correct")
+async def correct_material_page(
+    document_id: str,
+    payload: dict,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    try:
+        return get_material_service().apply_correction(
+            document_id=document_id,
+            source_version_id=payload["source_version_id"],
+            page_no=int(payload["page_no"]),
+            corrected_text=payload["corrected_text"],
+            user_id=x_user_id,
+        )
+    except MaterialError as exc:
+        return material_error_response(exc)
+    except KeyError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"error_code": "MATERIAL_PARSE_FAILED", "message": f"missing field: {exc}"},
+        )
+
+
+@app.get("/api/materials/documents/{document_id}/delete-impact")
+async def material_delete_impact(
+    document_id: str,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    try:
+        return get_material_service().preview_delete_impact(document_id, user_id=x_user_id)
+    except MaterialError as exc:
+        return material_error_response(exc)
+
+
+@app.delete("/api/materials/documents/{document_id}")
+async def delete_material(
+    document_id: str,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    try:
+        return get_material_service().logical_delete(document_id, user_id=x_user_id)
+    except MaterialError as exc:
+        return material_error_response(exc)
+
+
+@app.post("/api/materials/documents/{document_id}/duplicate")
+async def resolve_material_duplicate(
+    document_id: str,
+    payload: dict,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    try:
+        return get_material_service().resolve_duplicate(
+            document_id, action=payload.get("action", "keep"), user_id=x_user_id
+        )
+    except MaterialError as exc:
+        return material_error_response(exc)
+
+
+@app.get("/api/materials/versions/{version_id}/chunks/{chunk_id}")
+async def read_material_chunk_api(
+    version_id: str,
+    chunk_id: str,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    try:
+        return get_material_service().read_redacted_chunk(
+            version_id, chunk_id=chunk_id, user_id=x_user_id
+        )
+    except MaterialError as exc:
+        return material_error_response(exc)
+
+
 # ---------- 静态文件服务（让前端能预览/下载）----------
 from fastapi.responses import FileResponse
 
@@ -171,26 +322,35 @@ async def chat(request: Request, conv_id):
                 yield f"data: {json.dumps({'type': 'thinking', 'content': chunk_data})}\n\n"
 
             elif chunk_type == "tool_calls":
-                if (chunk_data['name'][:3] == "web" or chunk_data['name'][:3] == "sea"):
-                    tool_type = 'search'
-                elif (chunk_data['name'][:4] == "file"):
+                name = chunk_data["name"]
+                if name[:3] in {"web", "sea"}:
+                    tool_type = "search"
+                elif name[:4] == "file":
                     tool_type = "file"
                 else:
-                    tool_type = 'code'
-                # 工具调用 → 发送 tool_call 事件
-                yield f"data: {json.dumps({'type': 'tool_call', 'tool': {
-                    'type': tool_type, 
-                    'name': chunk_data['name'],
-                    'params': chunk_data.get('arguments', {}),
-                    'status': 'running'
-                }})}\n\n"
+                    tool_type = "code"
+                payload = {
+                    "type": "tool_call",
+                    "tool": {
+                        "type": tool_type,
+                        "name": name,
+                        "params": chunk_data.get("arguments", {}),
+                        "status": "running",
+                    },
+                }
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
             elif chunk_type == "tool_result":
-                # 发送 tool_result 事件
-                yield f"data: {json.dumps({'type': 'tool_result', 'tool': {
-                    'result': chunk_data,
-                    'status': 'success' if not "工具调用出错" in chunk_data else 'error'
-                }})}\n\n"
+                payload = {
+                    "type": "tool_result",
+                    "tool": {
+                        "result": chunk_data,
+                        "status": (
+                            "error" if "工具调用出错" in str(chunk_data) else "success"
+                        ),
+                    },
+                }
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
             elif chunk_type == "content":
                 # 文本内容 → 逐字符发送 text_delta（或整段发送）
@@ -218,7 +378,7 @@ async def chat(request: Request, conv_id):
 # 初始化智能体
 agent = ReactAgent()
 
-app.mount("/", StaticFiles(directory="../ui", html=True), name="ui")
+app.mount("/", StaticFiles(directory=str(REPO_ROOT / "ui"), html=True), name="ui")
 
 
 if __name__ == "__main__":

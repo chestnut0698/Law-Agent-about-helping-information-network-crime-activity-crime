@@ -51,21 +51,9 @@
         <div class="sidebar-section">
             <div class="section-title">模型</div>
             <div class="model-list">
-                <div class="model-item active" data-model="gpt-5">
-                    <span class="model-dot" style="background:#10a37f"></span>
-                    <span>GPT-5</span>
-                </div>
-                <div class="model-item" data-model="claude-4">
-                    <span class="model-dot" style="background:#d97706"></span>
-                    <span>Claude 4</span>
-                </div>
-                <div class="model-item" data-model="gemini-2">
-                    <span class="model-dot" style="background:#3b82f6"></span>
-                    <span>Gemini 2.5</span>
-                </div>
-                <div class="model-item" data-model="deepseek-v3">
+                <div class="model-item active" data-model="deepseek-v4-flash">
                     <span class="model-dot" style="background:#8b5cf6"></span>
-                    <span>DeepSeek V3</span>
+                    <span>DeepSeek V4 Flash</span>
                 </div>
             </div>
         </div>
@@ -99,7 +87,7 @@
             <div class="top-bar-center">
                 <div class="model-selector" id="model-selector">
                     <span class="model-selector-label">模型：</span>
-                    <span class="model-selector-value" id="current-model">GPT-5</span>
+                    <span class="model-selector-value" id="current-model">DeepSeek V4 Flash</span>
                     <svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <path d="M6 9l6 6 6-6"/>
                     </svg>
@@ -221,11 +209,11 @@
     <!-- Toast 容器 -->
     <div class="toast-container" id="toast-container"></div>
 
-    <!-- 模型选择弹窗 -->
+    <!-- 默认模型：DeepSeek V4 Flash -->
     <div class="modal-overlay" id="model-modal" style="display: none;">
         <div class="modal">
             <div class="modal-header">
-                <h3>选择模型(示例)</h3>
+                <h3>当前模型</h3>
                 <button class="btn-icon" id="btn-close-modal">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <path d="M18 6L6 18M6 6l12 12"/>
@@ -233,44 +221,17 @@
                 </button>
             </div>
             <div class="modal-body">
-                <div class="model-option" data-model="gpt-5">
+                <div class="model-option" data-model="deepseek-v4-flash">
                     <div class="model-option-info">
-                        <span class="model-dot" style="background:#10a37f"></span>
+                        <span class="model-dot" style="background:#8b5cf6"></span>
                         <div>
-                            <div class="model-option-name">GPT-5</div>
-                            <div class="model-option-desc">OpenAI 最强推理模型</div>
+                            <div class="model-option-name">DeepSeek V4 Flash</div>
+                            <div class="model-option-desc">默认接入模型</div>
                         </div>
                     </div>
                     <svg class="check-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <path d="M20 6L9 17l-5-5"/>
                     </svg>
-                </div>
-                <div class="model-option" data-model="claude-4">
-                    <div class="model-option-info">
-                        <span class="model-dot" style="background:#d97706"></span>
-                        <div>
-                            <div class="model-option-name">Claude 4</div>
-                            <div class="model-option-desc">Anthropic 长上下文模型</div>
-                        </div>
-                    </div>
-                </div>
-                <div class="model-option" data-model="gemini-2">
-                    <div class="model-option-info">
-                        <span class="model-dot" style="background:#3b82f6"></span>
-                        <div>
-                            <div class="model-option-name">Gemini 2.5</div>
-                            <div class="model-option-desc">Google 多模态模型</div>
-                        </div>
-                    </div>
-                </div>
-                <div class="model-option" data-model="deepseek-v3">
-                    <div class="model-option-info">
-                        <span class="model-dot" style="background:#8b5cf6"></span>
-                        <div>
-                            <div class="model-option-name">DeepSeek V3</div>
-                            <div class="model-option-desc">开源推理模型</div>
-                        </div>
-                    </div>
                 </div>
             </div>
         </div>

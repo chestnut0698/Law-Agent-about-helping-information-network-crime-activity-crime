@@ -121,5 +121,106 @@
         ]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_case_materials",
+      "description": "列出指定案件下的电子卷宗材料清单，含处理状态与质量摘要。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "case_id": {
+            "type": "string",
+            "description": "案件 ID"
+          }
+        },
+        "required": ["case_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_material_status",
+      "description": "查询单份材料的处理状态、版本链与质量提示。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "document_id": {
+            "type": "string",
+            "description": "材料（document）ID"
+          }
+        },
+        "required": ["document_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "locate_low_quality_pages",
+      "description": "定位某材料中识别质量不佳、需要人工修正的页面。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "document_id": {
+            "type": "string",
+            "description": "材料（document）ID"
+          }
+        },
+        "required": ["document_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "read_material_chunk",
+      "description": "读取已脱敏的材料文本片段。未脱敏或失效版本会被外发门控拒绝。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "document_version_id": {
+            "type": "string",
+            "description": "文书版本 ID"
+          },
+          "chunk_id": {
+            "type": "string",
+            "description": "可选，指定 chunk；省略则返回首个可用脱敏片段"
+          }
+        },
+        "required": ["document_version_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "submit_ocr_correction",
+      "description": "提交某页 OCR 人工修正文本，生成新版本且不覆盖历史原文。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "document_id": {
+            "type": "string",
+            "description": "材料 ID"
+          },
+          "source_version_id": {
+            "type": "string",
+            "description": "被修正的源版本 ID"
+          },
+          "page_no": {
+            "type": "integer",
+            "description": "页码，从 1 开始"
+          },
+          "corrected_text": {
+            "type": "string",
+            "description": "人工修正后的整页文本"
+          }
+        },
+        "required": ["document_id", "source_version_id", "page_no", "corrected_text"]
+      }
+    }
   }
 ]

@@ -1,2 +1,10 @@
 .env
 .idea/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/database/*.db
+data/storage/
+data/workspace/
+data/conversations/*.json
+!data/conversations/.gitkeep

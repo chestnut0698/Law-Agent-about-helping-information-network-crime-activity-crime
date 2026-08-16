@@ -24,9 +24,9 @@
         ],
 
         // 模型
-        currentModel: 'DeepSeek-V4-flash',
+        currentModel: 'deepseek-v4-flash',
         modelNames: {
-            'DeepSeek-V4-flash': 'DeepSeek-V4-flash'
+            'deepseek-v4-flash': 'DeepSeek V4 Flash'
         },
 
         // Agent 状态
