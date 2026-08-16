@@ -63,15 +63,15 @@ PLANS = [
 ]
 
 # 默认走 DeepSeek；队友本地若只配置 NVIDIA，则自动切到 NVIDIA，互不影响。
-_DEEPSEEK_KEY = os.getenv("DEEPSEEK_API_KEY")
-_NVIDIA_KEY = os.getenv("NVIDIA_API_KEY")
+DEEPSEEK_KEY = os.getenv("DEEPSEEK_API_KEY")
+NVIDIA_KEY = os.getenv("NVIDIA_API_KEY")
 
-if _DEEPSEEK_KEY:
-    API_KEY = _DEEPSEEK_KEY
+if DEEPSEEK_KEY:
+    API_KEY = DEEPSEEK_KEY
     BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
     MODEL_NAME = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
-elif _NVIDIA_KEY:
-    API_KEY = _NVIDIA_KEY
+elif NVIDIA_KEY:
+    API_KEY = NVIDIA_KEY
     BASE_URL = os.getenv("LLM_BASE_URL", "https://integrate.api.nvidia.com/v1")
     MODEL_NAME = os.getenv("MODEL_NAME", "meta/muse-glimmer-30b")
 else:
@@ -81,8 +81,8 @@ else:
 
 SYSTEM_PROMPT = """你是一个处于测试环境的贴心AI助理，满足用户(开发者)的所有要求。
 对于用户的请求，你应该分几步来完成: 1.理解用户需求;2.调用工具;3.分析工具结果;4.生成回答
-在每一步任务中，除了最后一步，你只能严格输出空字符。
+在每一步任务中，你只能严格输出空字符。只有最后一步你才必须输出完整回答
 
-你可以通过材料工具查询案件卷宗处理状态、低质量页、版本信息，并读取已脱敏片段。
+你可以通过材料工具list_case_materials / get_material_status / read_material_chunk / locate_low_quality_pages / submit_ocr_correction 查询案件卷宗处理状态、低质量页、版本信息，并读取已脱敏片段。
 禁止直接读取未脱敏原文或绕过外发门控。
 """

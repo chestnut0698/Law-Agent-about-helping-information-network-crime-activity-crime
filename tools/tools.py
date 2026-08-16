@@ -3,6 +3,7 @@ from tools.web import *
 from tools.search_lawlibrary import *
 from tools.policy_query import *
 from tools.files import *
+from tools.files_for_workspace import *
 
 
 tool_functions = {
@@ -16,4 +17,6 @@ tool_functions = {
     "locate_low_quality_pages": locate_low_quality_pages,
     "read_material_chunk": read_material_chunk,
     "submit_ocr_correction": submit_ocr_correction,
+    "list_user_files": list_user_files,
+    "read_any_file": read_any_file,
 }

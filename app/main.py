@@ -325,7 +325,7 @@ async def chat(request: Request, conv_id):
                 name = chunk_data["name"]
                 if name[:3] in {"web", "sea"}:
                     tool_type = "search"
-                elif name[:4] == "file":
+                elif "file" in name:
                     tool_type = "file"
                 else:
                     tool_type = "code"

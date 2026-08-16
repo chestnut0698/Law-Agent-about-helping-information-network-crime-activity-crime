@@ -74,9 +74,8 @@ class ReactAgent(BaseAgent):
                     {
                         "role": "system",
                         "content": (
-                            f"\n\n[会话附件-兼容路径]\n当前对话工作区包含以下附件（非案件卷宗正式入口）：\n{file_list}\n"
-                            "正式电子卷宗请使用 list_case_materials / get_material_status / "
-                            "read_material_chunk / locate_low_quality_pages / submit_ocr_correction 工具。"
+                            f"\n\n[会话附件-兼容路径]\n当前对话工作区包含以下附件：\n{file_list}\n"
+                            "正式电子卷宗请使用指定工具。"
                         ),
                     }
                 )
