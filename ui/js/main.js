@@ -14,12 +14,13 @@
     }
 
     ready(() => {
-        // 初始化各模块（注意顺序：State → Toast → Sidebar → Input → Theme → Agent）
+        // 初始化各模块（注意顺序：State → Toast → Sidebar → Input → Theme → Workbench）
         Toast.init();
         Sidebar.init();
         FileUpload.init();
         Input.init();
         Theme.init();
+        Workbench.init();
 
         // 监听 Agent 状态变化，更新顶部状态指示器
         Events.on('agent:state-change', (state) => {
@@ -74,11 +75,7 @@
         // 阻止表单默认提交
         document.addEventListener('submit', (e) => e.preventDefault());
 
-        // 初始化欢迎页 prompt 卡片
-        Sidebar._bindPromptCards();
-
-        console.log('%c🤖 Agent UI Ready', 'color: #10a37f; font-size: 14px; font-weight: bold;');
+        console.log('%c链证智析 工作台就绪', 'color: #85CC16; font-size: 14px; font-weight: bold;');
         console.log('%c模型: ' + State.modelNames[State.currentModel], 'color: #666;');
-        console.log('%c快捷键: ⌘K 新对话 | ⌘B 切换侧边栏 | Enter 发送', 'color: #666;');
     });
 })();

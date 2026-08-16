@@ -34,9 +34,11 @@
         isStreaming: false,
         abortController: null,
 
-        // UI 状态
-        theme: safeStorage.getItem('agent-theme') || 'dark',
+        // UI 状态：没有手动选择过时跟随系统深浅色
+        theme: safeStorage.getItem('agent-theme')
+            || (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'),
         sidebarCollapsed: false,
+        taskBoundConversation: false,
 
         // 消息列表（当前会话）
         get messages() {

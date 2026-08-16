@@ -10,6 +10,7 @@ from typing import Optional
 
 from app.config import REPO_ROOT
 from tools.files import MaterialError, get_material_service, init_db
+from tools.tasks import TaskError, get_task_service, init_task_db
 
 
 app = FastAPI()
@@ -22,6 +23,7 @@ app.add_middleware(
 )
 
 init_db()
+init_task_db()
 
 def load_meta() -> list:
     if META_FILE.exists():
@@ -283,6 +285,180 @@ async def read_material_chunk_api(
         )
     except MaterialError as exc:
         return material_error_response(exc)
+
+
+# ---------- 监督分析任务与产物 ----------
+def task_error_response(exc: TaskError) -> JSONResponse:
+    return JSONResponse(status_code=400, content=exc.to_dict())
+
+
+@app.get("/api/tasks")
+async def list_tasks(limit: int = 8):
+    return {"tasks": get_task_service().list_tasks(limit=limit)}
+
+
+@app.post("/api/tasks")
+async def create_task(
+    payload: dict,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    try:
+        return get_task_service().create_task(
+            title=payload.get("title", ""),
+            purpose=payload.get("purpose", ""),
+            authorized_until=payload.get("authorized_until", ""),
+            cases=payload.get("cases", []),
+            note=payload.get("note", ""),
+            user_id=x_user_id,
+        )
+    except TaskError as exc:
+        return task_error_response(exc)
+
+
+@app.get("/api/tasks/{task_id}")
+async def get_task(task_id: str):
+    try:
+        return get_task_service().get_task(task_id)
+    except TaskError as exc:
+        return task_error_response(exc)
+
+
+@app.get("/api/tasks/{task_id}/plan")
+async def task_plan_preview(task_id: str):
+    try:
+        return get_task_service().plan_preview(task_id)
+    except TaskError as exc:
+        return task_error_response(exc)
+
+
+@app.patch("/api/tasks/{task_id}/scope")
+async def update_task_scope(task_id: str, payload: dict):
+    try:
+        return get_task_service().update_scope(
+            task_id,
+            title=payload.get("title", ""),
+            purpose=payload.get("purpose", ""),
+            authorized_until=payload.get("authorized_until", ""),
+            cases=payload.get("cases", []),
+            note=payload.get("note", ""),
+        )
+    except TaskError as exc:
+        return task_error_response(exc)
+
+
+@app.post("/api/tasks/{task_id}/plan/confirm")
+async def task_plan_confirm(
+    task_id: str,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    try:
+        return get_task_service().confirm_plan(task_id, user_id=x_user_id)
+    except TaskError as exc:
+        return task_error_response(exc)
+
+
+@app.post("/api/tasks/{task_id}/entity-candidates")
+async def save_task_entity_candidates(task_id: str, payload: dict):
+    """供抽取/归一步骤写入候选集；候选不会被自动认定为同一实体。"""
+    try:
+        return get_task_service().save_entity_candidates(
+            task_id,
+            candidates=payload.get("candidates", []),
+            summary=payload.get("summary"),
+            run_id=payload.get("run_id"),
+        )
+    except TaskError as exc:
+        return task_error_response(exc)
+
+
+@app.post("/api/tasks/{task_id}/entity-candidates/{candidate_id}/decision")
+async def review_task_entity_candidate(task_id: str, candidate_id: str, payload: dict):
+    try:
+        return get_task_service().review_entity_candidate(
+            task_id,
+            candidate_id,
+            decision=payload.get("decision", ""),
+            reason=payload.get("reason", ""),
+            correction=payload.get("correction"),
+        )
+    except TaskError as exc:
+        return task_error_response(exc)
+
+
+@app.post("/api/tasks/{task_id}/materials")
+async def upload_task_materials(
+    task_id: str,
+    case_id: str = Form(...),
+    files: list[UploadFile] = File(...),
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    """材料必须归属任务内的已选案件，上传后同步落为 MATERIAL_DOC 产物。"""
+    tasks = get_task_service()
+    materials = get_material_service()
+    # documents.uploaded_by 有外键约束；本地演示未登录时回落到 system
+    actor = x_user_id or "system"
+    try:
+        task = tasks.get_task(task_id)
+        if case_id not in {c["case_id"] for c in task["cases"]}:
+            raise TaskError("TASK_INVALID_SCOPE", "材料所属案件不在本任务范围内")
+
+        results = []
+        for item in files:
+            upload = materials.upload_one(
+                case_id=case_id,
+                filename=item.filename or "unnamed.bin",
+                content=await item.read(),
+                user_id=actor,
+            )
+            results.append(
+                tasks.record_material(
+                    task_id=task_id, case_id=case_id, upload_result=upload, user_id=actor
+                )
+            )
+        return {"results": results, "task": tasks.get_task(task_id)}
+    except TaskError as exc:
+        return task_error_response(exc)
+    except MaterialError as exc:
+        return material_error_response(exc)
+
+
+@app.get("/api/tasks/{task_id}/materials")
+async def refresh_task_materials(
+    task_id: str,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    try:
+        artifact = get_task_service().refresh_material_batch(task_id, user_id=x_user_id)
+        return {"artifact_id": artifact["id"], "version": artifact["current_version"]}
+    except TaskError as exc:
+        return task_error_response(exc)
+
+
+@app.get("/api/tasks/{task_id}/artifacts/{artifact_id}")
+async def get_task_artifact(task_id: str, artifact_id: str, version: Optional[int] = None):
+    """任务目录与智能体消息链接共用此入口，保证解析到同一产物对象。"""
+    try:
+        return get_task_service().get_artifact(task_id, artifact_id, version=version)
+    except TaskError as exc:
+        return task_error_response(exc)
+
+
+@app.get("/api/tasks/{task_id}/artifacts/{artifact_id}/impact")
+async def preview_artifact_impact(task_id: str, artifact_id: str):
+    try:
+        return get_task_service().preview_impact(task_id, artifact_id)
+    except TaskError as exc:
+        return task_error_response(exc)
+
+
+@app.post("/api/tasks/{task_id}/artifacts/{artifact_id}/impact")
+async def apply_artifact_impact(task_id: str, artifact_id: str, payload: dict | None = None):
+    try:
+        return get_task_service().apply_impact(
+            task_id, artifact_id, reason=(payload or {}).get("reason", "")
+        )
+    except TaskError as exc:
+        return task_error_response(exc)
 
 
 # ---------- 静态文件服务（让前端能预览/下载）----------

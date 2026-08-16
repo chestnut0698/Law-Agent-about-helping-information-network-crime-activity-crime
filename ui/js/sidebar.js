@@ -19,7 +19,10 @@
                 const resp = await fetch('/conversations');
                 const data = await resp.json();
                 State.conversations = data.conversations || [];
-                if (State.conversations.length === 0) {
+                // 会话已由监督分析任务接管时，不再回退到独立对话
+                if (State.taskBoundConversation) {
+                    this._renderConversationList();
+                } else if (State.conversations.length === 0) {
                     await this._createNewConversation(true); // silent=true
                 } else {
                     State.currentConversationId = State.conversations[0].id;
@@ -243,34 +246,16 @@
         _clearChatArea() {
             const container = Utils.$('#chat-messages');
             if (!container) return;
-            // 保留欢迎页
+            // 空会话提示：只读提问即时执行，改动业务状态需确认
             container.innerHTML = `
                 <div class="welcome-screen" id="welcome-screen">
-                    <div class="welcome-logo">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                            <path d="M12 2L2 7l10 5 10-5-10-5z"/>
-                            <path d="M2 17l10 5 10-5"/>
-                            <path d="M2 12l10 5 10-5"/>
-                        </svg>
-                    </div>
-                    <h1 class="welcome-title">你好，我是 Agent</h1>
-                    <p class="welcome-subtitle">我可以思考、规划、调用工具来帮你完成复杂任务</p>
+                    <p class="welcome-subtitle">可以询问当前产物、材料处理情况，或提出下一步要求。</p>
                     <div class="welcome-prompts">
-                        <button class="prompt-card" data-prompt="帮我搜索2026年AI Agent领域的最新技术趋势">
-                            <span class="prompt-icon">🔍</span>
-                            <span>搜索AI Agent最新趋势</span>
+                        <button class="prompt-card" data-prompt="解释当前材料处理进度">
+                            <span>解释当前处理进度</span>
                         </button>
-                        <button class="prompt-card" data-prompt="帮我写一个Python脚本，爬取天气预报数据并生成可视化图表">
-                            <span class="prompt-icon">📊</span>
-                            <span>写代码+数据可视化</span>
-                        </button>
-                        <button class="prompt-card" data-prompt="帮我规划一次从北京到东京的5天商务旅行">
-                            <span class="prompt-icon">✈️</span>
-                            <span>规划商务旅行</span>
-                        </button>
-                        <button class="prompt-card" data-prompt="分析这段代码的时间复杂度并给出优化建议">
-                            <span class="prompt-icon">🧮</span>
-                            <span>代码分析优化</span>
+                        <button class="prompt-card" data-prompt="列出需要人工处理的材料及原因">
+                            <span>列出需人工处理的材料</span>
                         </button>
                     </div>
                 </div>`;

@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="zh-CN" data-theme="dark">
+<html lang="zh-CN" data-theme="light">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Agent UI - 界面示例</title>
+    <title>链证智析 · 跨案关联线索监督工作台</title>
     <link rel="stylesheet" href="styles/main.css">
     <link rel="stylesheet" href="styles/sidebar.css">
     <link rel="stylesheet" href="styles/chat.css">
@@ -14,52 +14,37 @@
     <link rel="stylesheet" href="styles/toast.css">
     <link rel="stylesheet" href="styles/markdown.css">
     <link rel="stylesheet" href="styles/responsive.css">
+    <link rel="stylesheet" href="styles/workbench.css">
+    <script>
+        // 在样式生效前定妥主题，避免深色模式下首帧闪白
+        (function () {
+            var saved = null;
+            try { saved = localStorage.getItem('agent-theme'); } catch (e) { }
+            var dark = saved ? saved === 'dark'
+                : window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+            document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+        })();
+    </script>
 </head>
 <body>
-    <div class="app-layout">
-    <!-- 侧边栏 -->
-    <aside class="sidebar" id="sidebar">
-        <div class="sidebar-header">
-            <div class="logo">
-                <svg class="logo-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M12 2L2 7l10 5 10-5-10-5z"/>
-                    <path d="M2 17l10 5 10-5"/>
-                    <path d="M2 12l10 5 10-5"/>
-                </svg>
-                <span class="logo-text">Agent UI</span>
-            </div>
-            <button class="btn-icon" id="btn-new-chat" title="新建对话">
+<div class="wb-app" id="wb-app">
+
+    <!-- 全局栏：切换的是监督分析任务，不是一次性对话 -->
+    <aside class="wb-rail" id="sidebar">
+        <div class="wb-rail-top">
+            <div class="wb-brand" title="链证智析">链证</div>
+            <button class="wb-rail-btn wb-rail-primary" id="wb-new-task" title="新建监督分析任务">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M12 4v16m-8-8h16"/>
                 </svg>
             </button>
         </div>
 
-        <div class="sidebar-section">
-            <div class="section-title">对话</div>
-            <div class="conversation-list" id="conversation-list">
-                <div class="conversation-item active" data-id="1">
-                    <svg class="conv-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/>
-                    </svg>
-                    <span class="conv-title">新对话</span>
-                    <span class="conv-time">刚刚</span>
-                </div>
-            </div>
-        </div>
+        <div class="wb-rail-label">最近任务</div>
+        <div class="wb-task-list" id="wb-task-list"></div>
 
-        <div class="sidebar-section">
-            <div class="section-title">模型</div>
-            <div class="model-list">
-                <div class="model-item active" data-model="deepseek-v4-flash">
-                    <span class="model-dot" style="background:#8b5cf6"></span>
-                    <span>DeepSeek V4 Flash</span>
-                </div>
-            </div>
-        </div>
-
-        <div class="sidebar-footer">
-            <button class="btn-theme" id="btn-theme-toggle">
+        <div class="wb-rail-footer">
+            <button class="wb-rail-btn" id="btn-theme-toggle" title="切换主题">
                 <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <circle cx="12" cy="12" r="5"/>
                     <path d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
@@ -68,23 +53,131 @@
                     <path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/>
                 </svg>
             </button>
-            <div class="user-info">
-                <div class="user-avatar">U</div>
-                <span class="user-name">用户</span>
-            </div>
-        </div>
-    </aside>
-
-    <!-- 主内容区 -->
-    <main class="main-content">
-        <!-- 顶部栏 -->
-        <header class="top-bar">
-            <button class="btn-icon btn-toggle-sidebar" id="btn-toggle-sidebar">
+            <button class="wb-rail-btn" id="wb-settings" title="设置">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M3 12h18M3 6h18M3 18h18"/>
+                    <circle cx="12" cy="12" r="3"/>
+                    <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 11-4 0v-.09a1.65 1.65 0 00-1.08-1.51 1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06A1.65 1.65 0 004.6 15a1.65 1.65 0 00-1.51-1H3a2 2 0 110-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06A1.65 1.65 0 009 4.6a1.65 1.65 0 001-1.51V3a2 2 0 114 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06A1.65 1.65 0 0019.4 9v0a1.65 1.65 0 001.51 1H21a2 2 0 110 4h-.09a1.65 1.65 0 00-1.51 1z"/>
                 </svg>
             </button>
-            <div class="top-bar-center">
+            <button class="wb-rail-btn" id="wb-help" title="帮助与文档">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="10"/>
+                    <path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3M12 17h.01"/>
+                </svg>
+            </button>
+            <div class="wb-user" id="wb-user" title="当前用户">检</div>
+        </div>
+
+        <!-- 会话容器由聊天模块使用，产品层不暴露 -->
+        <div class="conversation-list" id="conversation-list" hidden></div>
+        <button id="btn-new-chat" hidden></button>
+        <button id="btn-toggle-sidebar" hidden></button>
+    </aside>
+
+    <!-- 状态 A/B：范围设置与计划确认，确认后才进工作台 -->
+    <section class="wb-start" id="wb-start">
+        <div class="wb-start-inner">
+            <header class="wb-start-head">
+                <div class="wb-brand wb-brand-lg">链证</div>
+                <div>
+                    <div class="wb-start-brandname">链证智析</div>
+                    <div class="wb-start-brandsub">帮信罪跨案关联线索智能监督</div>
+                </div>
+            </header>
+
+            <h1 class="wb-start-title">开始一项跨案监督分析</h1>
+            <p class="wb-start-desc">
+                选择至少两起已授权案件，说明本次监督目的，并上传需要分析的材料。系统形成的线索均可回到原文核验。
+            </p>
+
+            <div class="wb-card wb-scope" id="wb-scope">
+                <div class="wb-card-head">
+                    <span>任务启动面板</span>
+                    <span class="wb-pill" id="wb-scope-check">必填项 0/3</span>
+                </div>
+                <div class="wb-card-body">
+                    <label class="wb-field">
+                        <span class="wb-field-label">监督目的</span>
+                        <textarea id="wb-purpose" rows="2"
+                            placeholder="例如：核查三起案件中重复出现的银行卡、手机号和设备标识，并梳理相关人员角色变化。"></textarea>
+                    </label>
+
+                    <div class="wb-field-row">
+                        <label class="wb-field">
+                            <span class="wb-field-label">任务名称</span>
+                            <input id="wb-title" type="text" placeholder="银行卡—设备跨案关联核查">
+                        </label>
+                        <label class="wb-field">
+                            <span class="wb-field-label">授权有效期</span>
+                            <input id="wb-until" type="date">
+                        </label>
+                    </div>
+
+                    <div class="wb-field">
+                        <span class="wb-field-label">案件范围（至少两起）</span>
+                        <div class="wb-case-list" id="wb-case-list"></div>
+                        <button class="wb-btn wb-btn-ghost" id="wb-add-case">添加案件</button>
+                    </div>
+
+                    <div class="wb-field">
+                        <span class="wb-field-label">材料（创建任务后按案件上传）</span>
+                        <div class="wb-hint-box">材料必须归属到已选案件，因此在计划确认后进入工作台上传。</div>
+                    </div>
+
+                    <div class="wb-actions">
+                        <button class="wb-btn wb-btn-primary" id="wb-gen-plan">生成分析计划</button>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+    </section>
+
+    <!-- 状态 C：四区工作台 -->
+    <section class="wb-workspace" id="wb-workspace" hidden>
+        <!-- 任务目录：业务对象清单，可收起 -->
+        <nav class="wb-dir" id="wb-dir">
+            <div class="wb-dir-head">
+                <div class="wb-dir-title" id="wb-dir-title">监督分析任务</div>
+                <div class="wb-dir-meta" id="wb-dir-meta"></div>
+            </div>
+            <div class="wb-dir-body" id="wb-dir-body"></div>
+        </nav>
+
+        <!-- 中间产物工作区 -->
+        <div class="wb-center">
+            <header class="wb-topbar">
+                <button class="wb-icon-btn" id="wb-toggle-rail" title="收起 / 展开全局任务栏">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="4" width="6" height="16" rx="1.5"/>
+                        <path d="M13 8h8M13 12h8M13 16h5"/>
+                    </svg>
+                </button>
+                <div class="wb-topbar-context" id="wb-topbar-context"></div>
+                <button class="wb-icon-btn" id="wb-toggle-agent" title="收起 / 展开智能体">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/>
+                    </svg>
+                </button>
+            </header>
+            <div class="wb-tabs" id="wb-tabs"></div>
+            <div class="wb-panel" id="wb-panel"></div>
+        </div>
+
+        <!-- 右侧智能体面板 -->
+        <aside class="wb-agent" id="wb-agent">
+            <div class="wb-agent-head">
+                <div>
+                    <div class="wb-agent-title">智能体</div>
+                    <div class="wb-agent-sub" id="wb-agent-context">当前绑定：任务</div>
+                </div>
+                <div class="agent-status" id="agent-status">
+                    <span class="status-dot status-idle"></span>
+                    <span class="status-text">空闲</span>
+                </div>
+            </div>
+
+            <div class="wb-agent-model">
                 <div class="model-selector" id="model-selector">
                     <span class="model-selector-label">模型：</span>
                     <span class="model-selector-value" id="current-model">DeepSeek V4 Flash</span>
@@ -93,164 +186,100 @@
                     </svg>
                 </div>
             </div>
-            <div class="top-bar-right">
-                <div class="agent-status" id="agent-status">
-                    <span class="status-dot status-idle"></span>
-                    <span class="status-text">空闲</span>
-                </div>
-            </div>
-        </header>
 
-        <!-- 消息区域 -->
-        <div class="chat-container" id="chat-container">
-            <div class="chat-messages" id="chat-messages">
-                <!-- 欢迎消息 -->
-                <div class="welcome-screen" id="welcome-screen">
-                    <div class="welcome-logo">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                            <path d="M12 2L2 7l10 5 10-5-10-5z"/>
-                            <path d="M2 17l10 5 10-5"/>
-                            <path d="M2 12l10 5 10-5"/>
-                        </svg>
-                    </div>
-                    <h1 class="welcome-title">你好，我是 Agent</h1>
-                    <p class="welcome-subtitle">我可以思考、规划、调用工具来帮你完成复杂任务</p>
-                    <div class="welcome-prompts">
-                        <button class="prompt-card" data-prompt="帮我搜索2026年AI Agent领域的最新技术趋势">
-                            <span class="prompt-icon">🔍</span>
-                            <span>搜索AI Agent最新趋势</span>
-                        </button>
-                        <button class="prompt-card" data-prompt="帮我写一个Python脚本，爬取天气预报数据并生成可视化图表">
-                            <span class="prompt-icon">📊</span>
-                            <span>写代码+数据可视化</span>
-                        </button>
-                        <button class="prompt-card" data-prompt="帮我规划一次从北京到东京的5天商务旅行">
-                            <span class="prompt-icon">✈️</span>
-                            <span>规划商务旅行</span>
-                        </button>
-                        <button class="prompt-card" data-prompt="分析这段代码的时间复杂度并给出优化建议">
-                            <span class="prompt-icon">🧮</span>
-                            <span>代码分析优化</span>
-                        </button>
-                    </div>
-                </div>
-            </div>
-
-            <!-- 状态栏 -->
-            <div class="status-bar" id="status-bar" style="display: none;">
-                <div class="status-bar-left">
-                    <div class="status-bar-icon" id="status-bar-icon">
-                        <svg class="spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <path d="M21 12a9 9 0 11-6.219-8.56"/>
-                        </svg>
-                    </div>
-                    <span class="status-bar-text" id="status-bar-text">思考中...</span>
-                </div>
-                <div class="status-bar-right">
-                    <div class="progress-bar-mini">
-                        <div class="progress-fill" id="progress-fill"></div>
-                    </div>
-                    <span class="token-count" id="token-count">0 tokens</span>
-                </div>
-            </div>
-        </div>
-
-        <!-- 输入区域 -->
-        <div class="input-area">
-            <div class="input-wrapper">
-                <div class="input-toolbar">
-                    <button class="toolbar-btn" id="btn-attachment" title="附件">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/>
-                        </svg>
-                    </button>
-                    <input type="file" id="file-input" multiple style="display:none" />
-                    <button class="toolbar-btn" title="语音输入">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z"/>
-                            <path d="M19 10v2a7 7 0 01-14 0v-2M12 19v4M8 23h8"/>
-                        </svg>
-                    </button>
-                    <div class="toolbar-divider"></div>
-                    <button class="toolbar-btn" title="工具">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <path d="M14.7 6.3a1 1 0 000 1.4l1.6 1.6a1 1 0 001.4 0l3.77-3.77a6 6 0 01-7.94 7.94l-6.91 6.91a2.12 2.12 0 01-3-3l6.91-6.91a6 6 0 017.94-7.94l-3.76 3.76z"/>
-                        </svg>
-                    </button>
-                    <button class="toolbar-btn" title="代码">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <path d="M16 18l6-6-6-6M8 6l-6 6 6 6"/>
-                        </svg>
-                    </button>
-                </div>
-                <div class="input-box">
-                    <textarea
-                        class="input-textarea"
-                        id="input-textarea"
-                        placeholder="给 Agent 发送消息... (Enter 发送 / Shift+Enter 换行)"
-                        rows="1"
-                    ></textarea>
-                    <button class="btn-send" id="btn-send" disabled>
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/>
-                        </svg>
-                    </button>
-                </div>
-                <div id="file-preview-list" class="file-preview-list"></div>
-                <div class="input-footer">
-                    <span class="input-hint">Agent 可以调用工具、搜索网络、执行代码</span>
-                    <span class="shortcut-hint">⌘K 新对话 · ⌘B 侧边栏</span>
-                </div>
-            </div>
-        </div>
-    </main>
-    </div>
-
-    <!-- Toast 容器 -->
-    <div class="toast-container" id="toast-container"></div>
-
-    <!-- 默认模型：DeepSeek V4 Flash -->
-    <div class="modal-overlay" id="model-modal" style="display: none;">
-        <div class="modal">
-            <div class="modal-header">
-                <h3>当前模型</h3>
-                <button class="btn-icon" id="btn-close-modal">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M18 6L6 18M6 6l12 12"/>
-                    </svg>
-                </button>
-            </div>
-            <div class="modal-body">
-                <div class="model-option" data-model="deepseek-v4-flash">
-                    <div class="model-option-info">
-                        <span class="model-dot" style="background:#8b5cf6"></span>
-                        <div>
-                            <div class="model-option-name">DeepSeek V4 Flash</div>
-                            <div class="model-option-desc">默认接入模型</div>
+            <div class="chat-container" id="chat-container">
+                <div class="chat-messages" id="chat-messages"></div>
+                <div class="status-bar" id="status-bar" style="display: none;">
+                    <div class="status-bar-left">
+                        <div class="status-bar-icon" id="status-bar-icon">
+                            <svg class="spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M21 12a9 9 0 11-6.219-8.56"/>
+                            </svg>
                         </div>
+                        <span class="status-bar-text" id="status-bar-text">思考中...</span>
                     </div>
-                    <svg class="check-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M20 6L9 17l-5-5"/>
-                    </svg>
+                    <div class="status-bar-right">
+                        <div class="progress-bar-mini">
+                            <div class="progress-fill" id="progress-fill"></div>
+                        </div>
+                        <span class="token-count" id="token-count">0 tokens</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="input-area">
+                <div class="input-wrapper">
+                    <div class="input-toolbar">
+                        <button class="toolbar-btn" id="btn-attachment" title="会话附件">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/>
+                            </svg>
+                        </button>
+                        <input type="file" id="file-input" multiple style="display:none" />
+                    </div>
+                    <div class="input-box">
+                        <textarea
+                            class="input-textarea"
+                            id="input-textarea"
+                            placeholder="询问当前产物，或提出下一步要求…（Enter 发送 / Shift+Enter 换行）"
+                            rows="1"
+                        ></textarea>
+                        <button class="btn-send" id="btn-send" disabled>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/>
+                            </svg>
+                        </button>
+                    </div>
+                    <div id="file-preview-list" class="file-preview-list"></div>
+                    <div class="input-footer">
+                        <span class="input-hint">只读提问即时执行；改动业务状态需确认</span>
+                    </div>
+                </div>
+            </div>
+        </aside>
+    </section>
+</div>
+
+<div class="toast-container" id="toast-container"></div>
+
+<div class="modal-overlay" id="model-modal" style="display: none;">
+    <div class="modal">
+        <div class="modal-header">
+            <h3>当前模型</h3>
+            <button class="btn-icon" id="btn-close-modal">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M18 6L6 18M6 6l12 12"/>
+                </svg>
+            </button>
+        </div>
+        <div class="modal-body">
+            <div class="model-option" data-model="deepseek-v4-flash">
+                <div class="model-option-info">
+                    <span class="model-dot"></span>
+                    <div>
+                        <div class="model-option-name">DeepSeek V4 Flash</div>
+                        <div class="model-option-desc">默认接入模型</div>
+                    </div>
                 </div>
             </div>
         </div>
     </div>
+</div>
 
-    <!-- JavaScript 模块 -->
-    <script src="js/state.js"></script>
-    <script src="js/utils.js"></script>
-    <script src="js/toast.js"></script>
-    <script src="js/markdown.js"></script>
-    <script src="js/plan.js"></script>
-    <script src="js/file-upload.js"></script>
-    <script src="js/thinking.js"></script>
-    <script src="js/tool-call.js"></script>
-    <script src="js/message.js"></script>
-    <script src="js/agent.js"></script>
-    <script src="js/sidebar.js"></script>
-    <script src="js/input.js"></script>
-    <script src="js/theme.js"></script>
-    <script src="js/main.js"></script>
+<script src="js/state.js"></script>
+<script src="js/utils.js"></script>
+<script src="js/toast.js"></script>
+<script src="js/markdown.js"></script>
+<script src="js/plan.js"></script>
+<script src="js/file-upload.js"></script>
+<script src="js/thinking.js"></script>
+<script src="js/tool-call.js"></script>
+<script src="js/message.js"></script>
+<script src="js/agent.js"></script>
+<script src="js/sidebar.js"></script>
+<script src="js/input.js"></script>
+<script src="js/theme.js"></script>
+<script src="js/workbench.js"></script>
+<script src="js/main.js"></script>
 </body>
 </html>
