@@ -4,7 +4,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(REPO_ROOT / ".env")
+load_dotenv()
 
 DATA_DIR = REPO_ROOT / "data" / "conversations"
 META_FILE = DATA_DIR / "conversations.json"
@@ -32,6 +32,7 @@ REDACTION_STORAGE_DIR = Path(
 REDACTION_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
+MATERIAL_AUTH_MODE = "allow_all"
 OCR_TEXT_DENSITY_THRESHOLD = float(os.getenv("OCR_TEXT_DENSITY_THRESHOLD", "0.08"))
 OCR_LOW_CONFIDENCE_THRESHOLD = float(os.getenv("OCR_LOW_CONFIDENCE_THRESHOLD", "0.75"))
 OCR_MAX_PAGE_RETRIES = int(os.getenv("OCR_MAX_PAGE_RETRIES", "2"))
