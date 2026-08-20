@@ -5,11 +5,10 @@ from fastapi.staticfiles import StaticFiles
 import asyncio
 import json
 from agents.react_agent import *
-import shutil
 from pathlib import Path
 from typing import Optional
 
-from app.config import REPO_ROOT
+from app.config import REPO_ROOT, WORKSPACE_DIR
 from agents.gateway import GatewayError, get_gateway, init_gateway_db
 from tools.files import ERROR_CODES, MaterialError, get_material_service, init_db
 from tools.entities import init_entity_db
@@ -30,122 +29,13 @@ init_task_db()
 init_gateway_db()
 init_entity_db()
 
-def load_meta() -> list:
-    if META_FILE.exists():
-        with open(META_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return []
 
-def save_meta(meta: list):
-    with open(META_FILE, "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
-
-def get_workspace(conv_id: str) -> Path:
-    """获取对话的工作目录，不存在则创建"""
-    path = WORKSPACE_DIR / str(conv_id)
+def get_workspace(task_id: str) -> Path:
+    """任务工作区目录（兼容会话附件工具；正式卷宗走材料管线）。"""
+    path = WORKSPACE_DIR / str(task_id)
     path.mkdir(parents=True, exist_ok=True)
     return path
 
-
-# ---------- 对话管理 API ----------
-@app.get("/conversations")
-async def list_conversations():
-    return {"conversations": load_meta()}
-
-@app.post("/conversations")
-async def create_conversation(request: Request):
-    data = await request.json()
-    title = data.get("title", "新对话")
-    import time
-    conv_id = str(int(time.time() * 1000))
-
-    meta = load_meta()
-    meta.append({"id": conv_id, "title": title, "time": "刚刚"})
-    save_meta(meta)
-
-    return {"id": conv_id, "title": title}
-
-@app.delete("/conversations/{conv_id}")
-async def delete_conversation(conv_id: str):
-    meta = load_meta()
-    meta = [c for c in meta if c["id"] != conv_id]
-    save_meta(meta)
-    # 删除消息文件
-    path = DATA_DIR / f"{conv_id}.json"
-    if path.exists():
-        path.unlink()
-
-    workspace = get_workspace(conv_id)
-    if workspace.exists():
-        shutil.rmtree(workspace)
-
-    return {"status": "ok"}
-
-@app.patch("/conversations/{conv_id}")
-async def rename_conversation(conv_id: str, request: Request):
-    data = await request.json()
-    meta = load_meta()
-    for c in meta:
-        if c["id"] == conv_id:
-            c["title"] =  data.get("title", "")
-            break
-    save_meta(meta)
-    return {"status": "ok"}
-
-@app.get("/conversations/{conv_id}/messages")
-async def get_messages(conv_id: str):
-    path = DATA_DIR / f"{conv_id}.json"
-    if path.exists():
-        with open(path, "r", encoding="utf-8") as f:
-            return {"messages": json.load(f)}
-    return {"messages": []}
-
-
-# ---------- 文件上传 ----------
-@app.post("/conversations/{conv_id}/upload")
-async def upload_file(conv_id: str, file: UploadFile = File(...)):
-    workspace = get_workspace(conv_id)
-    # 安全处理文件名（防止路径遍历）
-    safe_name = Path(file.filename).name
-    file_path = workspace / safe_name
-
-    # 写入文件
-    with open(file_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-
-    # 返回文件信息
-    return {
-        "filename": safe_name,
-        "size": file_path.stat().st_size,
-        "path": str(file_path),
-        "url": f"/files/{conv_id}/{safe_name}"
-    }
-
-
-# ---------- 文件列表 ----------
-@app.get("/conversations/{conv_id}/files")
-async def list_files(conv_id: str):
-    workspace = get_workspace(conv_id)
-    files = []
-    for f in sorted(workspace.iterdir()):
-        if f.is_file():
-            files.append({
-                "filename": f.name,
-                "size": f.stat().st_size,
-                "url": f"/files/{conv_id}/{f.name}"
-            })
-    return {"files": files}
-
-
-# ---------- 文件删除 ----------
-@app.delete("/conversations/{conv_id}/files/{filename}")
-async def delete_file(conv_id: str, filename: str):
-    workspace = get_workspace(conv_id)
-    safe_name = Path(filename).name
-    file_path = workspace / safe_name
-    if file_path.exists():
-        file_path.unlink()
-    return {"status": "ok"}
 
 
 # ---------- 案件卷宗上传与处理 ----------
@@ -497,6 +387,7 @@ async def apply_artifact_impact(task_id: str, artifact_id: str, payload: dict | 
         return task_error_response(exc)
 
 
+
 def gateway_error_response(exc: GatewayError) -> JSONResponse:
     status = 503 if exc.degraded else 400
     return JSONResponse(status_code=status, content=exc.to_dict())
@@ -709,21 +600,52 @@ async def serve_file(conv_id: str, filename: str):
         return {"error": "文件不存在"}
     return FileResponse(file_path)
 
+@app.get("/chat/{task_id}/messages")
+async def get_chat_history(task_id: str):
+    """获取任务的历史聊天记录"""
+    from tools.files import db_session, _rows
+    with db_session() as conn:
+        rows = _rows(
+            conn,
+            "SELECT role, content, created_at FROM chat_messages "
+            "WHERE task_id = ? ORDER BY created_at ASC",
+            (task_id,)
+        )
+    return {"messages": rows}
+
 
 
 # 前后端通信
-@app.post("/chat/{conv_id}")
-async def chat(request: Request, conv_id):
+@app.post("/chat/{task_id}")
+async def chat(request: Request, task_id):
     data = await request.json()
     messages = data.get("messages", [])
+    # 查询任务详情，构建系统上下文
+    task = get_task_service().get_task(task_id)
+    cases_info = "\n".join(
+        f"- 案件 {c['case_id']}: {c['display_name']}"
+        for c in task.get("cases", [])
+    )
+    system_context = (
+        f"当前监督任务：{task['title']}\n"
+        f"监督目的：{task['purpose']}\n"
+        f"包含案件：\n{cases_info}\n"
+        f"你可以调用 list_case_materials(case_id) 等工具来分析材料。"
+    )
+    messages.insert(0, {"role": "system", "content": system_context})
+
     # 提取最后一条用户消息
     user_message = messages[-1]["content"] if messages else ""
 
+    # 保存用户消息
+    get_task_service().save_message(task_id, "user", user_message)
+
     async def event_stream():
-        agent.switch_id(conv_id)
+        agent.switch_id(task_id)
         # 调用 agent.chat() 获得生成器
         responses = agent.chat(user_message)
 
+        assistant_content = []
         for chunk in responses:
             chunk_type = chunk[0]
             chunk_data = chunk[1]
@@ -764,6 +686,7 @@ async def chat(request: Request, conv_id):
                 yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
             elif chunk_type == "content":
+                assistant_content.append(chunk_data)
                 # 文本内容 → 逐字符发送 text_delta（或整段发送）
                 for char in chunk_data:
                     yield f"data: {json.dumps({'type': 'text_delta', 'text': char})}\n\n"
@@ -777,6 +700,11 @@ async def chat(request: Request, conv_id):
 
             # 每次 yield 后小睡，让出事件循环 → 触发真实网络 flush
             await asyncio.sleep(0)
+
+        # 保存助手回复到数据库（整轮结束后一次）
+        full_reply = "".join(assistant_content)
+        if full_reply:
+            get_task_service().save_message(task_id, "assistant", full_reply)
 
         # 发送完成信号
         yield f"data: {json.dumps({'type': 'done'})}\n\n"

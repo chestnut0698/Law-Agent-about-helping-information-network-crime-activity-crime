@@ -18,8 +18,14 @@
     };
 
     const State = {
-        // 会话状态
-        currentConversationId: 1,
+        // 会话/任务：工作台以 task_id 为主；兼容旧字段名 currentConversationId
+        currentTaskId: null,
+        get currentConversationId() {
+            return this.currentTaskId;
+        },
+        set currentConversationId(value) {
+            this.currentTaskId = value;
+        },
         conversations: [
         ],
 

@@ -6,9 +6,10 @@ from dotenv import load_dotenv
 REPO_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(REPO_ROOT / ".env")
 
+# 任务智能体历史与兼容会话附件仍可用；正式聊天优先落 SQLite chat_messages。
 DATA_DIR = REPO_ROOT / "data" / "conversations"
-META_FILE = DATA_DIR / "conversations.json"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+META_FILE = DATA_DIR / "conversations.json"
 
 WORKSPACE_DIR = REPO_ROOT / "data" / "workspace"
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
@@ -32,6 +33,8 @@ REDACTION_STORAGE_DIR = Path(
 REDACTION_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
+# 远程约定进 config；允许 .env 覆盖，默认演示放行
+MATERIAL_AUTH_MODE = (os.getenv("MATERIAL_AUTH_MODE") or "allow_all").strip().lower() or "allow_all"
 OCR_TEXT_DENSITY_THRESHOLD = float(os.getenv("OCR_TEXT_DENSITY_THRESHOLD", "0.08"))
 OCR_LOW_CONFIDENCE_THRESHOLD = float(os.getenv("OCR_LOW_CONFIDENCE_THRESHOLD", "0.75"))
 OCR_MAX_PAGE_RETRIES = int(os.getenv("OCR_MAX_PAGE_RETRIES", "2"))
@@ -61,6 +64,7 @@ PLANS = [
         "4.此轮必须生成回答，并验证，重要信息有出处",
     ],
 ]
+
 
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)

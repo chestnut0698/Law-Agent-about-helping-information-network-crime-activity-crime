@@ -32,6 +32,7 @@ from app.config import (
     OCR_TEXT_DENSITY_THRESHOLD,
     PARSER_VERSION,
     REDACTION_STORAGE_DIR,
+    MATERIAL_AUTH_MODE
 )
 
 # ---------- 状态与错误码 ----------
@@ -458,10 +459,7 @@ def allow_all_auth(user_id: str | None, case_id: str | None, action: str) -> tup
 
 
 def _default_auth():
-    mode = (os.getenv("MATERIAL_AUTH_MODE") or "").strip().lower()
-    if not mode:
-        app_env = (os.getenv("APP_ENV") or "development").strip().lower()
-        mode = "allow_all" if app_env in {"development", "dev", "local"} else "deny_all"
+    mode = (MATERIAL_AUTH_MODE or "").strip().lower() or "allow_all"
     return allow_all_auth if mode == "allow_all" else deny_all_auth
 
 
