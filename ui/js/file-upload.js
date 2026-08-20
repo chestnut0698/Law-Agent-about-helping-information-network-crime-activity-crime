@@ -95,6 +95,18 @@
 
         async uploadPending() {
             if (this.pendingFiles.length === 0) return [];
+            if (global.Workbench && Workbench.task) {
+                const select = Utils.$('#wb-composer-case');
+                const caseId = (select && select.value) || ((Workbench.task.cases || [])[0] || {}).case_id;
+                if (!caseId) {
+                    Toast.error('请先选择材料归属的案件');
+                    return [];
+                }
+                const ok = await Workbench._uploadMaterials(caseId, this.pendingFiles, null);
+                this.pendingFiles = [];
+                this._renderPreview();
+                return ok ? [{ ok: true }] : [];
+            }
             const convId = State.currentConversationId;
             const uploaded = [];
             for (const file of this.pendingFiles) {

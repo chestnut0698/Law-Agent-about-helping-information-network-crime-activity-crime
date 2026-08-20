@@ -33,6 +33,11 @@
     <aside class="wb-rail" id="sidebar">
         <div class="wb-rail-top">
             <div class="wb-brand" title="链证智析">链证</div>
+            <button class="wb-rail-btn" id="wb-collapse-rail" title="收起侧栏">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M15 18l-6-6 6-6"/>
+                </svg>
+            </button>
             <button class="wb-rail-btn wb-rail-primary" id="wb-new-task" title="新建监督分析任务">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M12 4v16m-8-8h16"/>
@@ -42,6 +47,8 @@
 
         <div class="wb-rail-label">最近任务</div>
         <div class="wb-task-list" id="wb-task-list"></div>
+        <div class="wb-rail-label">History</div>
+        <div class="wb-task-history" id="wb-task-history"></div>
 
         <div class="wb-rail-footer">
             <button class="wb-rail-btn" id="btn-theme-toggle" title="切换主题">
@@ -73,63 +80,66 @@
         <button id="btn-new-chat" hidden></button>
         <button id="btn-toggle-sidebar" hidden></button>
     </aside>
+    <button class="wb-rail-expand" id="wb-expand-rail" title="展开侧栏">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M9 18l6-6-6-6"/>
+        </svg>
+    </button>
 
-    <!-- 状态 A/B：范围设置与计划确认，确认后才进工作台 -->
+    <!-- 状态 A：对话式任务启动（保留范围选项，可按案件上传） -->
     <section class="wb-start" id="wb-start">
-        <div class="wb-start-inner">
+        <div class="wb-start-inner wb-start-chat">
             <header class="wb-start-head">
                 <div class="wb-brand wb-brand-lg">链证</div>
                 <div>
                     <div class="wb-start-brandname">链证智析</div>
-                    <div class="wb-start-brandsub">帮信罪跨案关联线索智能监督</div>
+                    <div class="wb-start-brandsub">DeepSeek V4 Flash · 跨案关联线索监督</div>
                 </div>
             </header>
 
-            <h1 class="wb-start-title">开始一项跨案监督分析</h1>
-            <p class="wb-start-desc">
-                选择至少两起已授权案件，说明本次监督目的，并上传需要分析的材料。系统形成的线索均可回到原文核验。
-            </p>
-
-            <div class="wb-card wb-scope" id="wb-scope">
-                <div class="wb-card-head">
-                    <span>任务启动面板</span>
-                    <span class="wb-pill" id="wb-scope-check">必填项 0/3</span>
+            <div class="wb-start-thread" id="wb-start-thread">
+                <div class="wb-start-hello">
+                    我是监督分析智能体。请先填好案件范围与监督目的，并把材料挂到对应案件；生成计划后会移到右侧，无需再补材料或提示词即可执行。
                 </div>
-                <div class="wb-card-body">
-                    <label class="wb-field">
-                        <span class="wb-field-label">监督目的</span>
-                        <textarea id="wb-purpose" rows="2"
-                            placeholder="例如：核查三起案件中重复出现的银行卡、手机号和设备标识，并梳理相关人员角色变化。"></textarea>
-                    </label>
 
-                    <div class="wb-field-row">
+                <div class="wb-card wb-scope" id="wb-scope">
+                    <div class="wb-card-head">
+                        <span>任务范围（必填选项）</span>
+                        <span class="wb-pill" id="wb-scope-check">必填项 0/3</span>
+                    </div>
+                    <div class="wb-card-body">
                         <label class="wb-field">
-                            <span class="wb-field-label">任务名称</span>
-                            <input id="wb-title" type="text" placeholder="银行卡—设备跨案关联核查">
+                            <span class="wb-field-label">监督目的</span>
+                            <textarea id="wb-purpose" rows="2"
+                                placeholder="例如：核查两起案件中重复出现的银行卡、手机号和设备标识，线索须回原文核验。"></textarea>
                         </label>
-                        <label class="wb-field">
-                            <span class="wb-field-label">授权有效期</span>
-                            <input id="wb-until" type="date">
-                        </label>
-                    </div>
 
-                    <div class="wb-field">
-                        <span class="wb-field-label">案件范围（至少两起）</span>
-                        <div class="wb-case-list" id="wb-case-list"></div>
-                        <button class="wb-btn wb-btn-ghost" id="wb-add-case">添加案件</button>
-                    </div>
+                        <div class="wb-field-row">
+                            <label class="wb-field">
+                                <span class="wb-field-label">任务名称</span>
+                                <input id="wb-title" type="text" placeholder="银行卡—设备跨案关联核查">
+                            </label>
+                            <label class="wb-field">
+                                <span class="wb-field-label">授权有效期</span>
+                                <input id="wb-until" type="date">
+                            </label>
+                        </div>
 
-                    <div class="wb-field">
-                        <span class="wb-field-label">材料（创建任务后按案件上传）</span>
-                        <div class="wb-hint-box">材料必须归属到已选案件，因此在计划确认后进入工作台上传。</div>
-                    </div>
-
-                    <div class="wb-actions">
-                        <button class="wb-btn wb-btn-primary" id="wb-gen-plan">生成分析计划</button>
+                        <div class="wb-field">
+                            <span class="wb-field-label">案件范围与材料（至少两起，材料挂到对应案件）</span>
+                            <div class="wb-case-list" id="wb-case-list"></div>
+                            <button class="wb-btn wb-btn-ghost" id="wb-add-case">添加案件</button>
+                        </div>
                     </div>
                 </div>
             </div>
 
+            <div class="wb-start-composer">
+                <div class="wb-hint-box">支持 PDF / DOCX / TXT / PNG / JPEG。XML、XLSX 暂不能作为卷宗正文解析。</div>
+                <div class="wb-actions">
+                    <button class="wb-btn wb-btn-primary" id="wb-gen-plan">生成分析计划</button>
+                </div>
+            </div>
         </div>
     </section>
 
@@ -233,6 +243,10 @@
                     <div id="file-preview-list" class="file-preview-list"></div>
                     <div class="input-footer">
                         <span class="input-hint">只读提问即时执行；改动业务状态需确认</span>
+                        <label class="wb-composer-case" id="wb-composer-case-wrap" hidden>
+                            <span>材料归属</span>
+                            <select id="wb-composer-case"></select>
+                        </label>
                     </div>
                 </div>
             </div>

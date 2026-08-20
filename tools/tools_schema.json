@@ -28,26 +28,31 @@
             "description": "返回结果数量，默认 5"
           }
         },
-        "required": ["query", "max_results"]
+        "required": [
+          "query",
+          "max_results"
+        ]
       }
     }
   },
   {
-      "type": "function",
-      "function": {
-          "name": "web_fetch",
-          "description": "输入一个网页 URL，返回该网页清洗后的正文（Markdown 格式）。用于深入阅读搜索结果中的具体页面,不支持抓取搜索引擎结果页.",
-          "parameters": {
-              "type": "object",
-              "properties": {
-                  "url": {
-                      "type": "string",
-                      "description": "完整的网页 URL"
-                  }
-              },
-              "required": ["url"]
+    "type": "function",
+    "function": {
+      "name": "web_fetch",
+      "description": "输入一个网页 URL，返回该网页清洗后的正文（Markdown 格式）。用于深入阅读搜索结果中的具体页面,不支持抓取搜索引擎结果页.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "完整的网页 URL"
           }
+        },
+        "required": [
+          "url"
+        ]
       }
+    }
   },
   {
     "type": "function",
@@ -135,7 +140,9 @@
             "description": "案件 ID"
           }
         },
-        "required": ["case_id"]
+        "required": [
+          "case_id"
+        ]
       }
     }
   },
@@ -152,7 +159,9 @@
             "description": "材料（document）ID"
           }
         },
-        "required": ["document_id"]
+        "required": [
+          "document_id"
+        ]
       }
     }
   },
@@ -169,7 +178,9 @@
             "description": "材料（document）ID"
           }
         },
-        "required": ["document_id"]
+        "required": [
+          "document_id"
+        ]
       }
     }
   },
@@ -190,7 +201,9 @@
             "description": "可选，指定 chunk；省略则返回首个可用脱敏片段"
           }
         },
-        "required": ["document_version_id"]
+        "required": [
+          "document_version_id"
+        ]
       }
     }
   },
@@ -219,7 +232,12 @@
             "description": "人工修正后的整页文本"
           }
         },
-        "required": ["document_id", "source_version_id", "page_no", "corrected_text"]
+        "required": [
+          "document_id",
+          "source_version_id",
+          "page_no",
+          "corrected_text"
+        ]
       }
     }
   },
@@ -255,6 +273,78 @@
         "required": [
           "filename"
         ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_task_overview",
+      "description": "查看当前监督分析任务的范围、案件、材料进度与已有产物清单。跨案分析开始前应先调用。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "confirm_task_plan",
+      "description": "确认监督分析计划（任务仍为草稿 SCOPE_DRAFT 时必须调用），并刷新材料批次产物。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "refresh_task_materials",
+      "description": "刷新任务材料接入与质量批次产物。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "run_task_collision",
+      "description": "对任务范围内已解析材料执行强标识确定性碰撞，生成实体候选产物（ENTITY_CANDIDATE_SET）。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "run_task_timeline",
+      "description": "抽取转账与联络事件，生成角色时间线产物（ROLE_TIMELINE），供资金路径/共同联系人规则使用。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "generate_task_clues",
+      "description": "根据 R001–R005 规则命中生成跨案线索产物（CLUE_SET），含线索表述与输出校核。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
       }
     }
   }

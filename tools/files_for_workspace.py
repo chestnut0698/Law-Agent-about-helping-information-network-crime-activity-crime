@@ -1,11 +1,21 @@
 import json
 from pathlib import Path
-import pymupdf
-import fitz  # PyMuPDF，PDF 文本提取
+
 from app.config import WORKSPACE_DIR
 
 # ---------- 全局变量 ----------
 _ocr_engine = None
+
+
+def _get_fitz():
+    """懒加载 PyMuPDF，避免未安装时拖垮整个应用启动。"""
+    try:
+        import fitz  # PyMuPDF
+    except ImportError as exc:
+        raise RuntimeError(
+            "缺少 pymupdf，请执行: pip install pymupdf==1.28.2"
+        ) from exc
+    return fitz
 
 # ---------- 文件类型分类 ----------
 TEXT_EXTS = {
@@ -87,6 +97,7 @@ def _read_text_file(path: Path) -> str:
 
 def _extract_pdf(path: Path) -> str:
     """PDF：先抽文本，空页再 OCR。"""
+    fitz = _get_fitz()
     text_parts = []
     doc = fitz.open(path)
     try:
@@ -248,6 +259,7 @@ def read_any_file(conv_id: str, filename: str, sub_path: str = "") -> str:
         # ---- PDF ----
         elif ext in PDF_EXTS:
             try:
+                fitz = _get_fitz()
                 doc = fitz.open(target)
             except Exception as e:
                 return json.dumps({"error": f"PDF 打开失败: {e}"}, ensure_ascii=False)

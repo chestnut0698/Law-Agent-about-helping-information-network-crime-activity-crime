@@ -14,6 +14,8 @@ import json
 from typing import Any, Optional
 
 from tools.files import (
+    MaterialError,
+    MaterialService,
     _insert,
     _row,
     _rows,
@@ -22,9 +24,11 @@ from tools.files import (
     ensure_demo_case,
     get_material_service,
     init_db,
+    list_chunks,
     new_id,
     utc_now,
 )
+from tools.entities import init_entity_db
 
 # ---------- 状态与错误码 ----------
 
@@ -213,6 +217,7 @@ class TaskService:
         self.db_path = db_path
         init_db(db_path)
         init_task_db(db_path)
+        init_entity_db(db_path)
 
     # ----- 任务 -----
 
@@ -502,6 +507,7 @@ class TaskService:
         decision: str,
         reason: str,
         correction: dict[str, Any] | None = None,
+        expected_version: int | None = None,
     ) -> dict[str, Any]:
         """记录合并/分离/修正/暂缓决定，并为候选集追加版本。"""
         allowed = {"MERGE", "KEEP_SEPARATE", "CORRECT", "DEFER"}
@@ -515,20 +521,37 @@ class TaskService:
             raise TaskError(TASK_ERROR_CODES["ARTIFACT_NOT_FOUND"], "实体候选集不存在")
         if current["status"] in {"STALE", "INVALID"}:
             raise TaskError(TASK_ERROR_CODES["STATE_CONFLICT"], "候选集已过期或失效，请先更新")
+        if expected_version is not None and int(current["current_version"]) != int(expected_version):
+            raise TaskError(
+                TASK_ERROR_CODES["STATE_CONFLICT"],
+                "候选集版本已变化，请刷新后重试",
+                {"expected_version": expected_version, "current_version": current["current_version"]},
+            )
 
         detail = self.get_artifact(task_id, current["id"])
         payload = detail["payload"]
-        found = False
+        found = None
         for candidate in payload.get("candidates", []):
             if candidate.get("candidate_id") == candidate_id:
                 candidate["decision"] = decision
                 candidate["reason"] = reason.strip()
                 candidate["correction"] = correction
                 candidate["reviewed_at"] = utc_now()
-                found = True
+                found = candidate
                 break
         if not found:
             raise TaskError(TASK_ERROR_CODES["ARTIFACT_NOT_FOUND"], "实体候选不存在")
+
+        if decision == "KEEP_SEPARATE" and found.get("fingerprint"):
+            from tools.entities import remember_rejection
+
+            remember_rejection(
+                task_id,
+                found["fingerprint"],
+                decision,
+                reason.strip(),
+                db_path=self.db_path,
+            )
 
         candidates = payload.get("candidates", [])
         reviewed = sum(1 for item in candidates if item.get("decision") != "PENDING")
@@ -763,6 +786,609 @@ class TaskService:
         batch = self.refresh_material_batch(task_id, user_id=user_id)
         return {"artifact": doc_artifact, "batch_artifact_id": batch["id"], "upload": upload_result}
 
+    def remove_material(
+        self,
+        task_id: str,
+        document_id: str,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """逻辑删除材料，并同步目录：MATERIAL_DOC 作废、刷新批次、下游过期。"""
+        task = self.get_task(task_id)
+        case_ids = {c["case_id"] for c in task["cases"]}
+        service = MaterialService(db_path=self.db_path)
+        with db_session(self.db_path) as conn:
+            document = _row(conn, "SELECT * FROM documents WHERE id = ?", (document_id,))
+        if not document:
+            raise TaskError(TASK_ERROR_CODES["NOT_FOUND"], "材料不存在")
+        if document["case_id"] not in case_ids:
+            raise TaskError(TASK_ERROR_CODES["INVALID_SCOPE"], "材料不属于本任务案件范围")
+
+        delete_result = service.logical_delete(document_id, user_id=user_id)
+        doc_art = self.find_artifact(task_id, "MATERIAL_DOC", document_id)
+        if doc_art:
+            self.write_artifact(
+                task_id=task_id,
+                type="MATERIAL_DOC",
+                title=doc_art.get("title") or document.get("filename") or "材料",
+                ref_key=document_id,
+                status="INVALID",
+                payload={
+                    "document_id": document_id,
+                    "case_id": document["case_id"],
+                    "filename": document.get("filename"),
+                    "status": "DELETED",
+                    "deleted": True,
+                },
+            )
+        batch = self.refresh_material_batch(task_id, user_id=user_id)
+        impact = self.apply_impact(
+            task_id,
+            batch["id"],
+            reason=f"材料已删除：{document.get('filename') or document_id}",
+        )
+        return {
+            "status": "DELETED",
+            "document_id": document_id,
+            "delete": delete_result,
+            "batch_artifact_id": batch["id"],
+            "impact": impact,
+            "task": self.get_task(task_id),
+        }
+
+    # ----- 阶段4：最小上下文检索与结构化角色 -----
+
+    def list_gated_chunks(
+        self,
+        task_id: str,
+        user_id: str | None = None,
+        *,
+        chunk_ids: list[str] | None = None,
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        """只从任务案件范围读取有效版本，并经外发门控取最小脱敏 chunk。"""
+        task = self.get_task(task_id)
+        if task["status"] == "SCOPE_DRAFT":
+            raise TaskError(TASK_ERROR_CODES["STATE_CONFLICT"], "计划尚未确认")
+
+        service = get_material_service()
+        wanted = set(chunk_ids) if chunk_ids else None
+        collected: list[dict[str, Any]] = []
+        for case in task["cases"]:
+            try:
+                materials = service.list_materials(case["case_id"], user_id=user_id)
+            except MaterialError:
+                continue
+            for item in materials:
+                current = item.get("current_version")
+                if not current:
+                    continue
+                version_id = current["id"]
+                with db_session(self.db_path) as conn:
+                    rows = list_chunks(conn, version_id, active_only=True)
+                for chunk in rows:
+                    if wanted and chunk["id"] not in wanted:
+                        continue
+                    try:
+                        gated = service.read_redacted_chunk(
+                            version_id,
+                            chunk_id=chunk["id"],
+                            user_id=user_id or "system",
+                        )
+                    except MaterialError:
+                        continue
+                    collected.append(
+                        {
+                            **gated,
+                            "case_id": case["case_id"],
+                            "document_id": item.get("id"),
+                            "filename": item.get("filename"),
+                        }
+                    )
+                    if not wanted and len(collected) >= limit:
+                        return collected
+        return collected
+
+    def run_extraction(
+        self,
+        task_id: str,
+        user_id: str | None = None,
+        *,
+        chunk_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        from agents.gateway import GatewayError
+        from agents.structured_roles import run_extraction
+        from app.config import PROMPT_VERSIONS
+
+        chunks = self.list_gated_chunks(task_id, user_id, chunk_ids=chunk_ids)
+        try:
+            result = run_extraction(
+                chunks,
+                task_id=task_id,
+                approval_id=f"task:{task_id}",
+            )
+        except GatewayError as exc:
+            raise TaskError(exc.code, exc.message, details=exc.to_dict()) from exc
+
+        mentions = []
+        chunk_meta = {item["chunk_id"]: item for item in chunks}
+        for obj in (result["output"].get("objects") or []):
+            records = []
+            for ev in obj.get("evidence") or []:
+                meta = chunk_meta.get(ev.get("chunk_id")) or {}
+                records.append(
+                    {
+                        "case_id": meta.get("case_id"),
+                        "document_id": meta.get("document_id"),
+                        "filename": meta.get("filename"),
+                        "chunk_id": ev.get("chunk_id"),
+                        "quote": ev.get("quote"),
+                        "quote_hash": ev.get("quote_hash"),
+                        "page_start": ev.get("page_start"),
+                        "page_end": ev.get("page_end"),
+                    }
+                )
+            mentions.append(
+                {
+                    "mention_id": new_id(),
+                    "object_type": obj.get("object_type"),
+                    "display_name": obj.get("surface"),
+                    "attributes": obj.get("attributes") or {},
+                    "confidence": obj.get("confidence"),
+                    "confidence_label": "待核验",
+                    "records": records,
+                    "decision": "PENDING",
+                }
+            )
+
+        existing = self.find_artifact(task_id, "ENTITY_CANDIDATE_SET", "entity-candidates")
+        previous = {}
+        if existing:
+            previous = self.get_artifact(task_id, existing["id"]).get("payload") or {}
+        batch = self.find_artifact(task_id, "MATERIAL_BATCH", "batch")
+        artifact = self.write_artifact(
+            task_id=task_id,
+            type="ENTITY_CANDIDATE_SET",
+            title="实体候选·待复核" if not result.get("degraded") else "实体候选·降级",
+            ref_key="entity-candidates",
+            status="PENDING_REVIEW" if mentions else "VALID",
+            parent_ids=[batch["id"]] if batch else [],
+            payload={
+                "summary": {
+                    "total": len(previous.get("candidates") or []),
+                    "pending": len(previous.get("candidates") or []),
+                    "reviewed": 0,
+                    "mention_count": len(mentions),
+                    "degraded": bool(result.get("degraded")),
+                    "mode": "deterministic_only" if result.get("degraded") else "model",
+                },
+                "mentions": mentions,
+                "candidates": previous.get("candidates") or [],
+                "boundary": "抽取结果仅为材料记载候选，不代表系统已认定为同一实体。",
+            },
+            input_snapshot={
+                "chunk_ids": [item["chunk_id"] for item in chunks],
+                "prompt_version": PROMPT_VERSIONS["extraction"],
+            },
+            run_id=result.get("run_id"),
+        )
+        return {
+            "artifact": artifact,
+            "run_id": result.get("run_id"),
+            "degraded": bool(result.get("degraded")),
+            "reused": bool(result.get("reused")),
+            "mention_count": len(mentions),
+            "task": self.get_task(task_id),
+        }
+
+    def run_normalization(
+        self,
+        task_id: str,
+        entity_a: dict[str, Any],
+        entity_b: dict[str, Any],
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        from agents.gateway import GatewayError
+        from agents.structured_roles import run_normalization
+
+        self.get_task(task_id)
+        try:
+            result = run_normalization(
+                entity_a,
+                entity_b,
+                task_id=task_id,
+                approval_id=f"task:{task_id}",
+            )
+        except GatewayError as exc:
+            raise TaskError(exc.code, exc.message, details=exc.to_dict()) from exc
+
+        records_a = entity_a.get("records") or entity_a.get("sources") or []
+        records_b = entity_b.get("records") or entity_b.get("sources") or []
+        candidate = {
+            "candidate_id": new_id(),
+            "entity_type": entity_a.get("entity_type") or entity_a.get("object_type") or "OTHER",
+            "display_name": entity_a.get("display_name") or entity_a.get("surface") or "候选",
+            "confidence_label": "待核验",
+            "match_basis": result["output"].get("consistencies") or [],
+            "differences": result["output"].get("differences") or [],
+            "questions_for_human": result["output"].get("questions_for_human") or [],
+            "records": records_a + records_b,
+            "impact": {},
+            "decision": "PENDING",
+            "reason": "",
+            "correction": None,
+        }
+        saved = self.save_entity_candidates(
+            task_id,
+            candidates=[candidate],
+            summary={
+                "degraded": bool(result.get("degraded")),
+                "normalization_run_id": result.get("run_id"),
+            },
+            run_id=result.get("run_id"),
+        )
+        return {**saved, "run_id": result.get("run_id"), "degraded": bool(result.get("degraded"))}
+
+    def run_clue_wording(
+        self,
+        task_id: str,
+        rule_hits: list[dict[str, Any]],
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        from agents.gateway import GatewayError
+        from agents.structured_roles import run_clue_wording
+
+        self.get_task(task_id)
+        try:
+            result = run_clue_wording(
+                rule_hits,
+                task_id=task_id,
+                approval_id=f"task:{task_id}",
+            )
+        except GatewayError as exc:
+            raise TaskError(exc.code, exc.message, details=exc.to_dict()) from exc
+        return result
+
+    def run_output_verify(
+        self,
+        task_id: str,
+        clue_text: str,
+        evidence: list[dict[str, Any]],
+        reverse_materials: list[dict[str, Any]] | None = None,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        from agents.gateway import GatewayError
+        from agents.structured_roles import run_output_verify
+
+        self.get_task(task_id)
+        try:
+            return run_output_verify(
+                clue_text,
+                evidence,
+                reverse_materials,
+                task_id=task_id,
+                approval_id=f"task:{task_id}",
+            )
+        except GatewayError as exc:
+            raise TaskError(exc.code, exc.message, details=exc.to_dict()) from exc
+
+    def run_collision(
+        self,
+        task_id: str,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """规则抽取原文标识 → 强碰撞 → 写入实体候选产物。系统不自动合并。"""
+        from tools.entities import EXTRACTOR_VERSION, extract_and_collide
+
+        task = self.get_task(task_id)
+        if task["status"] == "SCOPE_DRAFT":
+            raise TaskError(TASK_ERROR_CODES["STATE_CONFLICT"], "计划尚未确认")
+
+        result = extract_and_collide(task_id, task["cases"], db_path=self.db_path)
+        existing = self.find_artifact(task_id, "ENTITY_CANDIDATE_SET", "entity-candidates")
+        previous = {}
+        if existing:
+            previous = self.get_artifact(task_id, existing["id"]).get("payload") or {}
+
+        previous_by_fp = {
+            item.get("fingerprint"): item
+            for item in (previous.get("candidates") or [])
+            if item.get("fingerprint")
+        }
+        candidates = []
+        seen = set()
+        for item in previous.get("candidates") or []:
+            decision = item.get("decision")
+            fingerprint = item.get("fingerprint")
+            if decision not in {None, "PENDING", "DEFER"}:
+                candidates.append(item)
+                if fingerprint:
+                    seen.add(fingerprint)
+        for item in result["candidates"]:
+            fingerprint = item.get("fingerprint")
+            if not fingerprint or fingerprint in seen:
+                continue
+            prior = previous_by_fp.get(fingerprint)
+            if prior and prior.get("decision") in {None, "PENDING", "DEFER"}:
+                merged = dict(item)
+                merged["candidate_id"] = prior.get("candidate_id") or merged.get("candidate_id")
+                merged["decision"] = prior.get("decision") or "PENDING"
+                merged["reason"] = prior.get("reason") or ""
+                merged["correction"] = prior.get("correction")
+                candidates.append(merged)
+            else:
+                candidates.append(item)
+            seen.add(fingerprint)
+        pending = sum(1 for item in candidates if item.get("decision") == "PENDING")
+        batch = self.find_artifact(task_id, "MATERIAL_BATCH", "batch")
+        artifact = self.write_artifact(
+            task_id=task_id,
+            type="ENTITY_CANDIDATE_SET",
+            title="实体候选·待复核" if pending else "实体候选·已完成",
+            ref_key="entity-candidates",
+            status="PENDING_REVIEW" if pending else "VALID",
+            parent_ids=[batch["id"]] if batch else [],
+            payload={
+                "summary": {
+                    "total": len(candidates),
+                    "pending": pending,
+                    "reviewed": len(candidates) - pending,
+                    "mention_count": result["mention_count"],
+                    "scanned_chunks": result["scanned_chunks"],
+                    "mode": "deterministic",
+                    "extractor_version": EXTRACTOR_VERSION,
+                },
+                "mentions": result["mentions"],
+                "candidates": candidates,
+                "boundary": "强标识等值仅为待核验候选。系统不自动合并，是否同一对象由人工决定。",
+            },
+            input_snapshot={
+                "extractor_version": EXTRACTOR_VERSION,
+                "exclusion_version": result.get("exclusion_version"),
+                "case_ids": [item["case_id"] for item in task["cases"]],
+            },
+        )
+        return {
+            "artifact": artifact,
+            "candidate_count": len(candidates),
+            "mention_count": result["mention_count"],
+            "task": self.get_task(task_id),
+        }
+
+    def generate_clues(
+        self,
+        task_id: str,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """R001–R005 命中 → 线索表述 → 独立校核 → 通过者落 CLUE 产物。"""
+        from agents.gateway import GatewayError
+        from agents.structured_roles import run_clue_wording, run_output_verify
+        from tools.entities import LEGAL_BOUNDARY, collect_rule_hits
+
+        task = self.get_task(task_id)
+        if task["status"] == "SCOPE_DRAFT":
+            raise TaskError(TASK_ERROR_CODES["STATE_CONFLICT"], "计划尚未确认")
+
+        hits = collect_rule_hits(task_id, task["cases"], db_path=self.db_path)
+        existing_set = self.find_artifact(task_id, "CLUE_SET", "clues")
+        existing_fps = set()
+        if existing_set:
+            prev = self.get_artifact(task_id, existing_set["id"]).get("payload") or {}
+            existing_fps = {
+                item.get("fingerprint")
+                for item in (prev.get("items") or [])
+                if item.get("fingerprint")
+            }
+
+        created = []
+        skipped = []
+        parent = self.find_artifact(task_id, "ENTITY_CANDIDATE_SET", "entity-candidates")
+        timeline = self.find_artifact(task_id, "ROLE_TIMELINE", "role-timeline")
+        parent_ids = []
+        if parent:
+            parent_ids.append(parent["id"])
+        if timeline:
+            parent_ids.append(timeline["id"])
+
+        for hit in hits:
+            fingerprint = hit.get("fingerprint")
+            if fingerprint in existing_fps:
+                skipped.append({"fingerprint": fingerprint, "reason": "duplicate"})
+                continue
+            evidence = hit.get("evidence") or []
+            case_ids = {item.get("case_id") for item in evidence if item.get("case_id")}
+            chunk_ids = {item.get("chunk_id") for item in evidence if item.get("chunk_id")}
+            if len(case_ids) < 2 or len(chunk_ids) < 2:
+                skipped.append({"fingerprint": fingerprint, "reason": "below_cross_case_threshold"})
+                continue
+            try:
+                wording = run_clue_wording(
+                    [hit],
+                    task_id=task_id,
+                    approval_id=f"task:{task_id}",
+                )
+            except GatewayError as exc:
+                skipped.append({"fingerprint": fingerprint, "reason": exc.code})
+                continue
+            output = wording.get("output") or {}
+            clue_text = f"{output.get('title') or ''}\n{output.get('summary') or ''}"
+            try:
+                verified = run_output_verify(
+                    clue_text,
+                    evidence,
+                    task_id=task_id,
+                    approval_id=f"task:{task_id}",
+                )
+            except GatewayError as exc:
+                skipped.append({"fingerprint": fingerprint, "reason": exc.code})
+                continue
+            verdict = verified.get("output") or {}
+            if not verdict.get("passed", True) or verdict.get("over_bound"):
+                skipped.append({"fingerprint": fingerprint, "reason": "verify_rejected"})
+                continue
+
+            item_payload = {
+                "title": output.get("title") or hit.get("label"),
+                "summary": output.get("summary") or "",
+                "rule_id": hit.get("rule_id"),
+                "rule_version": hit.get("rule_version"),
+                "evidence_mode": hit.get("evidence_mode") or "DIRECT_MATERIAL",
+                "cases": hit.get("cases") or [],
+                "evidence": evidence,
+                "generation": "rule+template",
+                "uncertainty": "标识重合仅为待核验线索，不代表同一人、同一账户控制关系或共同犯罪。",
+                "boundary": LEGAL_BOUNDARY,
+                "fingerprint": fingerprint,
+                "degraded": bool(wording.get("degraded") or verified.get("degraded")),
+                "run_id": wording.get("run_id"),
+                "verify_run_id": verified.get("run_id"),
+            }
+            artifact = self.write_artifact(
+                task_id=task_id,
+                type="CLUE_ITEM",
+                title=item_payload["title"],
+                ref_key=f"clue:{fingerprint[:16]}",
+                status="VALID",
+                parent_ids=parent_ids,
+                payload=item_payload,
+                input_snapshot={"rule_id": hit.get("rule_id"), "fingerprint": fingerprint},
+                run_id=wording.get("run_id"),
+            )
+            created.append(
+                {
+                    "artifact_id": artifact["id"],
+                    "title": item_payload["title"],
+                    "rule_id": hit.get("rule_id"),
+                    "fingerprint": fingerprint,
+                    "case_count": len(case_ids),
+                    "chunk_count": len(chunk_ids),
+                }
+            )
+            existing_fps.add(fingerprint)
+
+        all_items = created[:]
+        if existing_set:
+            prev = self.get_artifact(task_id, existing_set["id"]).get("payload") or {}
+            for item in prev.get("items") or []:
+                if item.get("fingerprint") not in {c["fingerprint"] for c in created}:
+                    all_items.append(item)
+
+        clue_set = self.write_artifact(
+            task_id=task_id,
+            type="CLUE_SET",
+            title="关联线索",
+            ref_key="clues",
+            status="VALID" if all_items else "DRAFT",
+            parent_ids=parent_ids,
+            payload={
+                "summary": {
+                    "total": len(all_items),
+                    "created": len(created),
+                    "skipped": len(skipped),
+                },
+                "items": all_items,
+                "skipped": skipped,
+                "boundary": LEGAL_BOUNDARY,
+            },
+        )
+        return {
+            "artifact": clue_set,
+            "created": created,
+            "skipped": skipped,
+            "hit_count": len(hits),
+            "task": self.get_task(task_id),
+        }
+
+    def run_role_timeline(
+        self,
+        task_id: str,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """先把转账/联络事件落成可核验产物，为后续 R004/R005 提供事实层。"""
+        from tools.entities import EVENT_EXTRACTOR_VERSION, extract_task_events
+
+        task = self.get_task(task_id)
+        if task["status"] == "SCOPE_DRAFT":
+            raise TaskError(TASK_ERROR_CODES["STATE_CONFLICT"], "计划尚未确认")
+
+        result = extract_task_events(
+            task_id,
+            [item["case_id"] for item in task["cases"]],
+            db_path=self.db_path,
+        )
+        batch = self.find_artifact(task_id, "MATERIAL_BATCH", "batch")
+        counts: dict[str, int] = {}
+        dated = 0
+        undated = 0
+        case_names = {item["case_id"]: item.get("display_name") or item["case_id"] for item in task["cases"]}
+        items = []
+        for event in result["events"]:
+            counts[event["event_type"]] = counts.get(event["event_type"], 0) + 1
+            if event.get("time_precision") == "UNKNOWN" or not event.get("time_text"):
+                undated += 1
+            else:
+                dated += 1
+            items.append(
+                {
+                    "event_id": event["event_id"],
+                    "title": "转账事件" if event["event_type"] == "TRANSFER" else "联络事件",
+                    "event_type": event["event_type"],
+                    "time_text": event.get("time_text") or "",
+                    "time_precision": event.get("time_precision") or "UNKNOWN",
+                    "amount_text": event.get("amount_text") or "",
+                    "channel": event.get("channel") or "",
+                    "summary_text": event.get("summary_text") or "",
+                    "parties": event.get("parties") or [],
+                    "case_id": event["case_id"],
+                    "case_name": case_names.get(event["case_id"]) or event["case_id"],
+                    "source": {
+                        "document_id": event.get("document_id"),
+                        "document_version_id": event.get("document_version_id"),
+                        "chunk_id": event.get("chunk_id"),
+                        "filename": event.get("filename"),
+                        "page_start": event.get("page_start"),
+                        "page_end": event.get("page_end"),
+                        "quote": event.get("quote") or "",
+                        "quote_hash": event.get("quote_hash") or "",
+                    },
+                }
+            )
+        items.sort(
+            key=lambda item: (
+                1 if item.get("time_precision") == "UNKNOWN" or not item.get("time_text") else 0,
+                item.get("time_text") or "9999",
+                item.get("case_name") or "",
+            )
+        )
+        artifact = self.write_artifact(
+            task_id=task_id,
+            type="ROLE_TIMELINE",
+            title="角色时间线·转账与联络事件",
+            ref_key="role-timeline",
+            status="VALID",
+            parent_ids=[batch["id"]] if batch else [],
+            payload={
+                "summary": {
+                    "total": len(items),
+                    "dated": dated,
+                    "undated": undated,
+                    "types": counts,
+                    "scanned_chunks": result["scanned_chunks"],
+                    "extractor_version": EVENT_EXTRACTOR_VERSION,
+                },
+                "items": items,
+                "boundary": "这里只记录材料中出现的转账/联络事件，供后续 R004/R005 规则使用；当前不直接生成共同犯罪或控制关系结论。",
+            },
+            input_snapshot={
+                "case_ids": [item["case_id"] for item in task["cases"]],
+                "extractor_version": EVENT_EXTRACTOR_VERSION,
+            },
+        )
+        return {
+            "artifact": artifact,
+            "event_count": len(items),
+            "task": self.get_task(task_id),
+        }
+
     def material_overview(self, task_id: str, user_id: str | None = None) -> dict[str, Any]:
         """按案件分组的材料处理进度：阶段用页数或状态表达，不造伪百分比。"""
         task = self.get_task(task_id)
@@ -844,7 +1470,11 @@ class TaskService:
     def _build_directory(self, artifacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         directory = []
         for group in DIRECTORY_GROUPS:
-            items = [a for a in artifacts if a["type"] in group["types"]]
+            items = [
+                a
+                for a in artifacts
+                if a["type"] in group["types"] and a.get("status") != "INVALID"
+            ]
             directory.append(
                 {
                     "key": group["key"],
@@ -885,3 +1515,139 @@ def get_task_service() -> TaskService:
     if _task_service is None:
         _task_service = TaskService()
     return _task_service
+
+
+# ---------- Agent 工具：任务级能力，供 DeepSeek ReAct 调用 ----------
+
+
+def _tool_json(data: Any) -> str:
+    return json.dumps(data, ensure_ascii=False)
+
+
+def _artifact_brief(artifact: dict[str, Any] | None, **extra: Any) -> dict[str, Any]:
+    if not artifact:
+        return {"ok": False, "message": "未生成产物", **extra}
+    return {
+        "ok": True,
+        "artifact_id": artifact.get("id"),
+        "artifact_type": artifact.get("type"),
+        "title": artifact.get("title"),
+        "status": artifact.get("status"),
+        "version": artifact.get("current_version"),
+        **extra,
+    }
+
+
+def get_task_overview(task_id: str, user_id: str | None = None) -> str:
+    """查看监督分析任务范围、案件、材料与已有产物清单。"""
+    try:
+        task = get_task_service().get_task(task_id)
+        overview = get_task_service().material_overview(task_id, user_id=user_id or "system")
+        artifacts = [
+            {
+                "artifact_id": a["id"],
+                "type": a["type"],
+                "title": a["title"],
+                "status": a["status"],
+            }
+            for a in (task.get("artifacts") or [])
+            if a.get("status") != "INVALID"
+        ]
+        return _tool_json(
+            {
+                "ok": True,
+                "task_id": task_id,
+                "title": task.get("title"),
+                "purpose": task.get("purpose"),
+                "status": task.get("status"),
+                "cases": [
+                    {"case_id": c["case_id"], "display_name": c.get("display_name")}
+                    for c in (task.get("cases") or [])
+                ],
+                "materials": overview,
+                "artifacts": artifacts,
+            }
+        )
+    except TaskError as exc:
+        return _tool_json(exc.to_dict())
+
+
+def confirm_task_plan(task_id: str, user_id: str | None = None) -> str:
+    """确认分析计划并进入工作台（若仍为 SCOPE_DRAFT）。"""
+    try:
+        result = get_task_service().confirm_plan(task_id, user_id=user_id or "system")
+        task = result.get("task") or get_task_service().get_task(task_id)
+        batch_id = result.get("batch_artifact_id")
+        batch_art = next(
+            (a for a in (task.get("artifacts") or []) if a.get("id") == batch_id),
+            next(
+                (a for a in (task.get("artifacts") or []) if a.get("type") == "MATERIAL_BATCH"),
+                None,
+            ),
+        )
+        return _tool_json(
+            _artifact_brief(
+                batch_art,
+                message="计划已确认",
+                task_status=task.get("status"),
+            )
+        )
+    except TaskError as exc:
+        return _tool_json(exc.to_dict())
+
+
+def refresh_task_materials(task_id: str, user_id: str | None = None) -> str:
+    """刷新任务材料批次产物。"""
+    try:
+        artifact = get_task_service().refresh_material_batch(task_id, user_id=user_id or "system")
+        return _tool_json(_artifact_brief(artifact, message="材料批次已刷新"))
+    except TaskError as exc:
+        return _tool_json(exc.to_dict())
+
+
+def run_task_collision(task_id: str, user_id: str | None = None) -> str:
+    """对任务范围内材料执行强标识确定性碰撞，写入实体候选产物。"""
+    try:
+        result = get_task_service().run_collision(task_id, user_id=user_id or "system")
+        return _tool_json(
+            _artifact_brief(
+                result.get("artifact"),
+                message="强标识碰撞完成",
+                candidate_count=result.get("candidate_count"),
+                mention_count=result.get("mention_count"),
+            )
+        )
+    except TaskError as exc:
+        return _tool_json(exc.to_dict())
+
+
+def run_task_timeline(task_id: str, user_id: str | None = None) -> str:
+    """抽取转账/联络事件并写入角色时间线产物。"""
+    try:
+        result = get_task_service().run_role_timeline(task_id, user_id=user_id or "system")
+        return _tool_json(
+            _artifact_brief(
+                result.get("artifact"),
+                message="事件时间线已生成",
+                event_count=result.get("event_count"),
+            )
+        )
+    except TaskError as exc:
+        return _tool_json(exc.to_dict())
+
+
+def generate_task_clues(task_id: str, user_id: str | None = None) -> str:
+    """根据 R001–R005 规则命中生成跨案线索产物（含表述与校核）。"""
+    try:
+        result = get_task_service().generate_clues(task_id, user_id=user_id or "system")
+        return _tool_json(
+            _artifact_brief(
+                result.get("artifact"),
+                message="线索生成完成",
+                created_count=len(result.get("created") or []),
+                skipped_count=len(result.get("skipped") or []),
+                hit_count=result.get("hit_count"),
+            )
+        )
+    except TaskError as exc:
+        return _tool_json(exc.to_dict())

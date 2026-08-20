@@ -58,6 +58,7 @@ ERROR_CODES = {
     "EGRESS_DENIED": "MATERIAL_EGRESS_DENIED",
     "NOT_FOUND": "MATERIAL_NOT_FOUND",
     "DUPLICATE_PENDING": "MATERIAL_DUPLICATE_PENDING",
+    "CITATION_STALE": "MATERIAL_CITATION_STALE",
 }
 
 
@@ -448,7 +449,7 @@ def add_audit(conn, **fields) -> None:
 
 def deny_all_auth(user_id: str | None, case_id: str | None, action: str) -> tuple[bool, str]:
     """默认策略：未接入真实授权前一律拒绝材料操作。"""
-    return False, "authorization_not_configured"
+    return False, "未配置材料授权。本地演示请在 .env 设置 MATERIAL_AUTH_MODE=allow_all 后重启服务"
 
 
 def allow_all_auth(user_id: str | None, case_id: str | None, action: str) -> tuple[bool, str]:
@@ -457,7 +458,10 @@ def allow_all_auth(user_id: str | None, case_id: str | None, action: str) -> tup
 
 
 def _default_auth():
-    mode = os.getenv("MATERIAL_AUTH_MODE", "deny_all").lower()
+    mode = (os.getenv("MATERIAL_AUTH_MODE") or "").strip().lower()
+    if not mode:
+        app_env = (os.getenv("APP_ENV") or "development").strip().lower()
+        mode = "allow_all" if app_env in {"development", "dev", "local"} else "deny_all"
     return allow_all_auth if mode == "allow_all" else deny_all_auth
 
 
@@ -471,8 +475,16 @@ REDACTION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
             r"(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx])(?!\d)"
         ),
     ),
-    ("bank_card", re.compile(r"(?<!\d)([1-9]\d{15,18})(?!\d)")),
+    ("bank_card", re.compile(
+        r"(?<!\d)("
+        r"[1-9]\d{15,18}"
+        r"|"
+        r"[1-9]\d{3}(?:[\s\-_.／/]+\d{4}){2,3}(?:[\s\-_.／/]+\d{1,4})?"
+        r")(?!\d)"
+    )),
     ("phone", re.compile(r"(?<!\d)(1[3-9]\d{9})(?!\d)")),
+    ("imei", re.compile(r"(?<!\d)(\d{15})(?!\d)")),
+    ("ip", re.compile(r"(?<!\d)((?:\d{1,3}\.){3}\d{1,3})(?!\d)")),
     (
         "account",
         re.compile(r"(?i)(?:账号|帐户|账户|user(?:name)?|login)[:：\s]*([A-Za-z0-9_.-]{4,32})"),
@@ -495,6 +507,7 @@ _UNREDACTED_PATTERNS = [
         r"(?<!\d)[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])"
         r"(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?!\d)"
     ),
+    re.compile(r"(?<!\d)\d{15}(?!\d)"),
 ]
 
 
@@ -516,8 +529,10 @@ def redact_text(text: str) -> tuple[str, list[RedactionHit]]:
                 start, end, original = match.start(1), match.end(1), match.group(1)
             else:
                 start, end, original = match.start(), match.end(), match.group(0)
-            if sensitive_type == "bank_card" and len(original) == 18:
-                continue
+            if sensitive_type == "bank_card":
+                digits = re.sub(r"\D", "", original)
+                if len(digits) == 18:
+                    continue
             hits.append(RedactionHit(sensitive_type, start, end, original, placeholder=""))
 
     hits.sort(key=lambda hit: (hit.start, -(hit.end - hit.start)))

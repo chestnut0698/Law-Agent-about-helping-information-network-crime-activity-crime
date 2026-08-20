@@ -10,8 +10,10 @@
          * @param {Object} data { title, steps: [{text, status}], defaultExpanded }
          */
         create(data) {
-            const block = Utils.create('div', { class: 'thinking-block expanded' });
-            if (data.defaultExpanded) block.classList.remove('compact');
+            const expanded = data.defaultExpanded === true;
+            const block = Utils.create('div', {
+                class: expanded ? 'thinking-block expanded' : 'thinking-block compact'
+            });
 
             // 头部
             const header = Utils.create('div', { class: 'thinking-header' }, [

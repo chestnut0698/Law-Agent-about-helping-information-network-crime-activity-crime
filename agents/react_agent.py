@@ -1,6 +1,9 @@
 from agents.base_agent import *
+from agents.gateway import GatewayError
 from app.config import *
+from tools.tools import WORKSPACE_ONLY_TOOLS, tool_functions
 import inspect
+import json
 from pathlib import Path
 
 # ReAct（Reason + Act）模式的核心思想——让 AI 交替进行"推理（Reason）"和"行动（Act）"，并通过观察（Observation）来驱动下一步。
@@ -22,6 +25,11 @@ class ReactAgent(BaseAgent):
                 result = fn(**args, conv_id=self.conv_id)
             else:
                 result = fn(**args)
+            if data["function_name"] in WORKSPACE_ONLY_TOOLS:
+                result = (
+                    "[会话附件-非卷宗] 此内容未经脱敏门控，不得用于抽取或碰撞。"
+                    f"\n{result}"
+                )
         except Exception as e:
             result = f"工具调用出错: {e}"
 
@@ -105,7 +113,18 @@ class ReactAgent(BaseAgent):
                 }
             )
             while 1:
-                stream = self.llm_call()
+                try:
+                    stream = self.llm_call()
+                except GatewayError as exc:
+                    notice = (
+                        "当前处于仅确定性规则模式，模型对话暂不可用。"
+                        if exc.degraded
+                        else f"模型网关错误：{exc.message}"
+                    )
+                    yield ("content", notice)
+                    self.messages.append({"role": "assistant", "content": notice})
+                    self.save_conversation(self.conv_id)
+                    break
 
                 collected_content = ""
                 tool_calls_buffer = {}

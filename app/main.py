@@ -3,13 +3,16 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import asyncio
+import json
 from agents.react_agent import *
 import shutil
 from pathlib import Path
 from typing import Optional
 
 from app.config import REPO_ROOT
-from tools.files import MaterialError, get_material_service, init_db
+from agents.gateway import GatewayError, get_gateway, init_gateway_db
+from tools.files import ERROR_CODES, MaterialError, get_material_service, init_db
+from tools.entities import init_entity_db
 from tools.tasks import TaskError, get_task_service, init_task_db
 
 
@@ -24,6 +27,8 @@ app.add_middleware(
 
 init_db()
 init_task_db()
+init_gateway_db()
+init_entity_db()
 
 def load_meta() -> list:
     if META_FILE.exists():
@@ -277,12 +282,25 @@ async def resolve_material_duplicate(
 async def read_material_chunk_api(
     version_id: str,
     chunk_id: str,
+    quote: Optional[str] = None,
+    quote_hash: Optional[str] = None,
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
     try:
-        return get_material_service().read_redacted_chunk(
+        payload = get_material_service().read_redacted_chunk(
             version_id, chunk_id=chunk_id, user_id=x_user_id
         )
+        if quote_hash:
+            from tools.entities import verify_quote_hash
+
+            if not quote or not verify_quote_hash(payload.get("text") or "", quote, quote_hash):
+                raise MaterialError(
+                    ERROR_CODES["CITATION_STALE"],
+                    "引用失效：原文已变更或哈希不匹配，禁止展示旧内容",
+                    {"chunk_id": chunk_id, "quote_hash": quote_hash},
+                )
+            payload["cite_ok"] = True
+        return payload
     except MaterialError as exc:
         return material_error_response(exc)
 
@@ -380,6 +398,7 @@ async def review_task_entity_candidate(task_id: str, candidate_id: str, payload:
             decision=payload.get("decision", ""),
             reason=payload.get("reason", ""),
             correction=payload.get("correction"),
+            expected_version=payload.get("expected_version"),
         )
     except TaskError as exc:
         return task_error_response(exc)
@@ -416,6 +435,23 @@ async def upload_task_materials(
                 )
             )
         return {"results": results, "task": tasks.get_task(task_id)}
+    except TaskError as exc:
+        return task_error_response(exc)
+    except MaterialError as exc:
+        return material_error_response(exc)
+
+
+@app.delete("/api/tasks/{task_id}/materials/{document_id}")
+async def delete_task_material(
+    task_id: str,
+    document_id: str,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    """删除任务内材料：逻辑删除文档，并同步目录中的 MATERIAL_DOC / MATERIAL_BATCH。"""
+    try:
+        return get_task_service().remove_material(
+            task_id, document_id, user_id=x_user_id or "system"
+        )
     except TaskError as exc:
         return task_error_response(exc)
     except MaterialError as exc:
@@ -459,6 +495,205 @@ async def apply_artifact_impact(task_id: str, artifact_id: str, payload: dict | 
         )
     except TaskError as exc:
         return task_error_response(exc)
+
+
+def gateway_error_response(exc: GatewayError) -> JSONResponse:
+    status = 503 if exc.degraded else 400
+    return JSONResponse(status_code=status, content=exc.to_dict())
+
+
+@app.get("/api/agent/status")
+async def agent_status():
+    """降级状态：关闭外呼后系统仍可走确定性规则，界面据此明示。"""
+    return get_gateway().status()
+
+
+@app.get("/api/agent/runs")
+async def agent_runs(purpose: Optional[str] = None, limit: int = 50):
+    return {"runs": get_gateway().list_runs(purpose=purpose, limit=limit)}
+
+
+@app.get("/api/agent/repair-queue")
+async def agent_repair_queue(limit: int = 50):
+    return {"items": get_gateway().list_repair_queue(limit=limit)}
+
+
+@app.post("/api/tasks/{task_id}/roles/extract")
+async def task_extract_role(
+    task_id: str,
+    payload: dict | None = None,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    try:
+        body = payload or {}
+        return get_task_service().run_extraction(
+            task_id,
+            user_id=x_user_id,
+            chunk_ids=body.get("chunk_ids"),
+        )
+    except TaskError as exc:
+        return task_error_response(exc)
+
+
+@app.post("/api/tasks/{task_id}/roles/normalize")
+async def task_normalize_role(
+    task_id: str,
+    payload: dict,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    try:
+        return get_task_service().run_normalization(
+            task_id,
+            entity_a=payload.get("entity_a") or {},
+            entity_b=payload.get("entity_b") or {},
+            user_id=x_user_id,
+        )
+    except TaskError as exc:
+        return task_error_response(exc)
+
+
+@app.post("/api/tasks/{task_id}/roles/clue-wording")
+async def task_clue_wording_role(
+    task_id: str,
+    payload: dict,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    try:
+        return get_task_service().run_clue_wording(
+            task_id,
+            rule_hits=payload.get("rule_hits") or [],
+            user_id=x_user_id,
+        )
+    except TaskError as exc:
+        return task_error_response(exc)
+
+
+@app.post("/api/tasks/{task_id}/roles/verify")
+async def task_verify_role(
+    task_id: str,
+    payload: dict,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    try:
+        return get_task_service().run_output_verify(
+            task_id,
+            clue_text=payload.get("clue_text") or "",
+            evidence=payload.get("evidence") or [],
+            reverse_materials=payload.get("reverse_materials"),
+            user_id=x_user_id,
+        )
+    except TaskError as exc:
+        return task_error_response(exc)
+
+
+@app.post("/api/tasks/{task_id}/collision/run")
+async def task_run_collision(
+    task_id: str,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    try:
+        return get_task_service().run_collision(task_id, user_id=x_user_id)
+    except TaskError as exc:
+        return task_error_response(exc)
+
+
+@app.post("/api/tasks/{task_id}/clues/generate")
+async def task_generate_clues(
+    task_id: str,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    try:
+        return get_task_service().generate_clues(task_id, user_id=x_user_id)
+    except TaskError as exc:
+        return task_error_response(exc)
+
+
+@app.post("/api/tasks/{task_id}/timeline/run")
+async def task_run_role_timeline(
+    task_id: str,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    try:
+        return get_task_service().run_role_timeline(task_id, user_id=x_user_id)
+    except TaskError as exc:
+        return task_error_response(exc)
+
+
+@app.post("/api/tasks/{task_id}/agent/chat")
+async def task_agent_chat(
+    task_id: str,
+    request: Request,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    """任务级 ReAct：DeepSeek 思考并调工具，SSE 推送思考/工具/产物链接。"""
+    from agents.task_agent import TaskAgent
+
+    try:
+        get_task_service().get_task(task_id)
+    except TaskError as exc:
+        return task_error_response(exc)
+
+    data = await request.json()
+    messages = data.get("messages") or []
+    user_message = ""
+    if messages:
+        user_message = messages[-1].get("content") or ""
+    if not user_message:
+        user_message = data.get("message") or ""
+
+    agent_runner = TaskAgent(task_id, user_id=x_user_id or "system")
+
+    async def event_stream():
+        for chunk in agent_runner.chat(user_message):
+            chunk_type, chunk_data = chunk[0], chunk[1]
+            if chunk_type == "reasoning_content":
+                yield f"data: {json.dumps({'type': 'thinking', 'content': chunk_data}, ensure_ascii=False)}\n\n"
+            elif chunk_type == "tool_calls":
+                name = chunk_data.get("name") or ""
+                if name.startswith("run_task_") or name.startswith("generate_task_"):
+                    tool_type = "code"
+                elif "material" in name or "file" in name or name.startswith("list_"):
+                    tool_type = "file"
+                elif name[:3] in {"web", "sea"}:
+                    tool_type = "search"
+                else:
+                    tool_type = "code"
+                payload = {
+                    "type": "tool_call",
+                    "tool": {
+                        "type": tool_type,
+                        "name": name,
+                        "params": chunk_data.get("arguments", {}),
+                        "status": "running",
+                    },
+                }
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            elif chunk_type == "tool_result":
+                payload = {
+                    "type": "tool_result",
+                    "tool": {
+                        "result": chunk_data,
+                        "status": (
+                            "error"
+                            if ("工具调用出错" in str(chunk_data) or '"ok": false' in str(chunk_data).lower())
+                            else "success"
+                        ),
+                    },
+                }
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            elif chunk_type == "artifact":
+                yield f"data: {json.dumps({'type': 'artifact', **chunk_data}, ensure_ascii=False)}\n\n"
+            elif chunk_type == "content":
+                for char in chunk_data:
+                    yield f"data: {json.dumps({'type': 'text_delta', 'text': char}, ensure_ascii=False)}\n\n"
+            elif chunk_type == "plan":
+                yield f"data: {json.dumps({'type': 'plan', 'plan': chunk_data}, ensure_ascii=False)}\n\n"
+            elif chunk_type == "done":
+                yield f"data: {json.dumps({'type': 'done', 'done': chunk_data}, ensure_ascii=False)}\n\n"
+            await asyncio.sleep(0)
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 # ---------- 静态文件服务（让前端能预览/下载）----------

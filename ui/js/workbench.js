@@ -35,7 +35,7 @@
 
         async loadTasks() {
             try {
-                const resp = await fetch('/api/tasks?limit=8');
+                const resp = await fetch('/api/tasks?limit=30');
                 const data = await resp.json();
                 this.tasks = data.tasks || [];
                 this._renderRail();
@@ -52,17 +52,52 @@
 
         _renderRail() {
             const list = Utils.$('#wb-task-list');
+            const history = Utils.$('#wb-task-history');
             if (!list) return;
             list.innerHTML = '';
-            (this.tasks || []).forEach(task => {
-                const chip = Utils.create('div', {
-                    class: `wb-task-chip${this.task && this.task.id === task.id ? ' active' : ''}`,
-                    title: `${task.title}（${task.case_count} 起案件）`,
-                    text: (task.title || '任务').slice(0, 2)
-                });
-                chip.addEventListener('click', () => this.openTask(task.id));
-                list.appendChild(chip);
-            });
+            if (history) history.innerHTML = '';
+            const tasks = this.tasks || [];
+            const recent = tasks.slice(0, 5);
+            const older = tasks.slice(5);
+
+            recent.forEach(task => list.appendChild(this._taskChip(task)));
+            if (history) {
+                if (!older.length) {
+                    history.appendChild(Utils.create('div', {
+                        class: 'wb-rail-empty',
+                        text: '暂无更多'
+                    }));
+                } else {
+                    older.forEach(task => history.appendChild(this._taskChip(task, true)));
+                }
+            }
+            this._syncRailCollapseAvailability();
+        },
+
+        _taskChip(task, compact) {
+            const chip = Utils.create('div', {
+                class: `wb-task-chip${this.task && this.task.id === task.id ? ' active' : ''}${compact ? ' is-history' : ''}`,
+                title: `${task.title}（${task.case_count || 0} 起案件）`
+            }, [
+                Utils.create('span', { class: 'wb-task-chip-abbr', text: (task.title || '任务').slice(0, 2) }),
+                Utils.create('span', { class: 'wb-task-chip-name', text: task.title || '未命名任务' })
+            ]);
+            chip.addEventListener('click', () => this.openTask(task.id));
+            return chip;
+        },
+
+        _syncRailCollapseAvailability() {
+            const railBtn = Utils.$('#wb-toggle-rail');
+            const workspace = Utils.$('#wb-workspace');
+            const canCollapse = workspace && !workspace.hidden;
+            if (railBtn) {
+                railBtn.hidden = !canCollapse;
+                railBtn.disabled = !canCollapse;
+            }
+            if (!canCollapse && State.sidebarCollapsed) {
+                State.sidebarCollapsed = false;
+                Events.emit('sidebar:toggle', false);
+            }
         },
 
         // ---------- 状态 A：范围设置 ----------
@@ -77,20 +112,44 @@
                 this._addCaseRow('案件 B');
             }
             this._checkScope();
+            this._syncRailCollapseAvailability();
         },
 
         _bindShell() {
+            const collapseBtn = Utils.$('#wb-collapse-rail');
+            const expandBtn = Utils.$('#wb-expand-rail');
+            if (collapseBtn) collapseBtn.addEventListener('click', () => {
+                Utils.$('#sidebar').classList.add('collapsed');
+            });
+            if (expandBtn) expandBtn.addEventListener('click', () => {
+                Utils.$('#sidebar').classList.remove('collapsed');
+            });
+
             const newTask = Utils.$('#wb-new-task');
             if (newTask) newTask.addEventListener('click', () => {
                 this.task = null;
                 this.draftTaskId = null;
+                const purpose = Utils.$('#wb-purpose');
+                const title = Utils.$('#wb-title');
+                const until = Utils.$('#wb-until');
+                const list = Utils.$('#wb-case-list');
+                if (purpose) purpose.value = '';
+                if (title) title.value = '';
+                if (until) until.value = '';
+                if (list) list.innerHTML = '';
                 this._renderRail();
                 this.showStart();
             });
 
-            // 只有工作台里同时存在全局栏和任务目录时，才允许收起全局栏；任务目录常驻
+            // 仅当工作台（含文件目录）出现时，才允许收起最左侧全局栏
             const railBtn = Utils.$('#wb-toggle-rail');
-            if (railBtn) railBtn.addEventListener('click', () => State.toggleSidebar());
+            if (railBtn) railBtn.addEventListener('click', () => {
+                if (Utils.$('#wb-workspace').hidden) {
+                    Toast.info('进入工作台后才可收起左侧栏');
+                    return;
+                }
+                State.toggleSidebar();
+            });
 
             const agentBtn = Utils.$('#wb-toggle-agent');
             if (agentBtn) agentBtn.addEventListener('click', () => {
@@ -123,8 +182,34 @@
             input.value = value || '';
             input.addEventListener('input', () => this._checkScope());
 
+            const fileInput = Utils.create('input', {
+                type: 'file',
+                multiple: 'multiple',
+                accept: '.pdf,.docx,.txt,.png,.jpg,.jpeg'
+            });
+            fileInput.style.display = 'none';
+            const fileBtn = Utils.create('button', {
+                class: 'wb-btn wb-btn-ghost',
+                text: '挂材料',
+                type: 'button'
+            });
+            const fileMeta = Utils.create('span', { class: 'wb-file-meta', text: '未选文件' });
+            fileBtn.addEventListener('click', (e) => {
+                e.preventDefault();
+                fileInput.click();
+            });
+            fileInput.addEventListener('change', () => {
+                row._files = Array.from(fileInput.files || []);
+                fileMeta.textContent = row._files.length
+                    ? row._files.map(f => f.name).join('、')
+                    : '未选文件';
+            });
+
             const del = Utils.create('button', { class: 'wb-case-del', text: '×', title: '移除' });
-            const row = Utils.create('div', { class: 'wb-case-row' }, [input, del]);
+            const row = Utils.create('div', { class: 'wb-case-row' }, [
+                input, fileBtn, fileMeta, del, fileInput
+            ]);
+            row._files = [];
             del.addEventListener('click', () => {
                 row.remove();
                 this._checkScope();
@@ -134,7 +219,7 @@
         },
 
         _scopeValues() {
-            const cases = Utils.$$('.wb-case-row input')
+            const cases = Utils.$$('.wb-case-row input[type="text"]')
                 .map(i => i.value.trim())
                 .filter(Boolean)
                 .map(name => ({ name }));
@@ -187,6 +272,8 @@
                     return;
                 }
                 this.draftTaskId = data.task.id;
+                this.task = data.task;
+                await this._uploadStartFiles(data.task);
                 await this._transitionToDraftWorkspace(
                     data.task.id,
                     data.scope_artifact_id || this._scopeArtifactId(data.task)
@@ -217,6 +304,19 @@
             }));
         },
 
+        async _uploadStartFiles(task) {
+            const rows = Utils.$$('.wb-case-row').filter(row => {
+                const name = (row.querySelector('input[type="text"]') || {}).value || '';
+                return name.trim();
+            });
+            for (let i = 0; i < rows.length; i++) {
+                const files = rows[i]._files || [];
+                const caseId = ((task.cases || [])[i] || {}).case_id;
+                if (!files.length || !caseId) continue;
+                await this._uploadMaterials(caseId, files, null);
+            }
+        },
+
         async _confirmPlan() {
             if (!this.draftTaskId) return;
             try {
@@ -224,11 +324,13 @@
                 const data = await resp.json();
                 if (data.error_code) {
                     Toast.error(data.message || '计划确认失败');
-                    return;
+                    return null;
                 }
                 await this.loadTasksAndOpen(this.draftTaskId, data.batch_artifact_id);
+                return data;
             } catch (e) {
                 Toast.error('计划确认失败：' + e.message);
+                return null;
             }
         },
 
@@ -258,6 +360,7 @@
             this._renderRail();
             this._renderContext();
             this._renderDirectory();
+            this._syncRailCollapseAvailability();
 
             const target = artifactId || this._defaultArtifactId();
             if (target) await this.openArtifact(target);
@@ -265,7 +368,32 @@
                 this.draftTaskId = task.id;
                 const planResp = await fetch(`/api/tasks/${task.id}/plan`);
                 this._renderAgentPlan(await planResp.json());
+            } else {
+                this.draftTaskId = task.id;
+                this._maybeOfferRerun();
             }
+        },
+
+        _maybeOfferRerun() {
+            if (!this.task || this.task.status === 'SCOPE_DRAFT') return;
+            const hasCandidates = (this.task.artifacts || []).some(a => a.type === 'ENTITY_CANDIDATE_SET');
+            const hasMaterials = (this.task.artifacts || []).some(a => a.type === 'MATERIAL_DOC' || a.type === 'MATERIAL_BATCH');
+            if (!hasMaterials || hasCandidates) return;
+            const messages = Utils.$('#chat-messages');
+            if (!messages || messages.querySelector('[data-wb-rerun]')) return;
+            const run = Utils.create('button', { class: 'wb-btn wb-btn-primary', text: '执行分析' });
+            run.addEventListener('click', () => this._executeAnalysis(run));
+            const card = Utils.create('div', { class: 'wb-agent-plan-card', 'data-wb-rerun': '1' }, [
+                Utils.create('div', { class: 'wb-agent-plan-kicker', text: '材料已接入' }),
+                Utils.create('div', { class: 'wb-agent-plan-title', text: '尚未跑完整分析' }),
+                Utils.create('div', {
+                    class: 'wb-agent-plan-desc',
+                    text: '点下方按钮，由智能体在右侧思考并调用工具；产物会出现链接，可打开中间预览。'
+                }),
+                Utils.create('div', { class: 'wb-agent-plan-actions' }, [run])
+            ]);
+            messages.appendChild(card);
+            messages.scrollTop = messages.scrollHeight;
         },
 
         /** 每个任务绑定自己的智能体会话：聊天历史随任务走，而不是随一次性对话 */
@@ -315,16 +443,16 @@
             edit.addEventListener('click', () => this._returnToScope());
             const confirm = Utils.create('button', {
                 class: 'wb-btn wb-btn-primary',
-                text: '确认并开始'
+                text: '执行分析'
             });
-            confirm.addEventListener('click', () => this._confirmPlan());
+            confirm.addEventListener('click', () => this._executeAnalysis(confirm));
 
             const card = Utils.create('div', { class: 'wb-agent-plan-card' }, [
                 Utils.create('div', { class: 'wb-agent-plan-kicker', text: '分析计划已生成' }),
                 Utils.create('div', { class: 'wb-agent-plan-title', text: plan.title }),
                 Utils.create('div', {
                     class: 'wb-agent-plan-desc',
-                    text: `${plan.cases.length} 起案件 · 授权至 ${plan.authorized_until}`
+                    text: `${plan.cases.length} 起案件 · 授权至 ${plan.authorized_until}。无需补充材料或提示词，可直接执行。`
                 }),
                 steps,
                 Utils.create('div', { class: 'wb-agent-plan-actions' }, [edit, confirm])
@@ -369,6 +497,21 @@
             if (dirMeta) dirMeta.textContent = `${task.cases.length} 起案件 · 授权有效`;
             const agentCtx = Utils.$('#wb-agent-context');
             if (agentCtx) agentCtx.textContent = `当前绑定：${task.title}`;
+            this._syncComposerCase();
+        },
+
+        _syncComposerCase() {
+            const wrap = Utils.$('#wb-composer-case-wrap');
+            const select = Utils.$('#wb-composer-case');
+            if (!wrap || !select) return;
+            const cases = (this.task && this.task.cases) || [];
+            wrap.hidden = !cases.length;
+            const current = select.value;
+            select.innerHTML = '';
+            cases.forEach(c => {
+                select.appendChild(Utils.create('option', { value: c.case_id, text: c.display_name }));
+            });
+            if (current && cases.some(c => c.case_id === current)) select.value = current;
         },
 
         _renderDirectory() {
@@ -492,18 +635,29 @@
             ]);
             panel.appendChild(head);
 
+            const split = Utils.create('div', { class: 'wb-split', id: 'wb-split' });
+            const main = Utils.create('div', { class: 'wb-split-main', id: 'wb-split-main' });
+            const cite = Utils.create('aside', { class: 'wb-cite-pane', id: 'wb-cite-pane' });
+            cite.hidden = true;
+            split.appendChild(main);
+            split.appendChild(cite);
+            panel.appendChild(split);
+
             if (status === 'STALE') {
-                panel.appendChild(Utils.create('div', { class: 'wb-callout warn' }, [
+                main.appendChild(Utils.create('div', { class: 'wb-callout warn' }, [
                     Utils.create('span', { text: '输入已变化，当前结果可能过时，不能用于处置或正式导出。' })
                 ]));
             }
 
-            if (artifact.type === 'MATERIAL_BATCH') this._renderMaterialBatch(panel, payload);
-            else if (artifact.type === 'TASK_SCOPE') this._renderScopeArtifact(panel, payload);
+            if (artifact.type === 'MATERIAL_BATCH') this._renderMaterialBatch(main, payload);
+            else if (artifact.type === 'TASK_SCOPE') this._renderScopeArtifact(main, payload);
             else if (artifact.type === 'ENTITY_CANDIDATE_SET') {
-                this._renderEntityCandidates(panel, payload, status);
+                this._renderEntityCandidates(main, payload, status, artifact, version);
             }
-            else this._renderGeneric(panel, payload);
+            else if (artifact.type === 'CLUE_SET') this._renderClueSet(main, payload);
+            else if (artifact.type === 'CLUE_ITEM') this._renderClueItem(main, payload);
+            else if (artifact.type === 'ROLE_TIMELINE') this._renderRoleTimeline(main, payload);
+            else this._renderGeneric(main, payload);
         },
 
         _renderScopeArtifact(panel, payload) {
@@ -534,6 +688,20 @@
                 ]));
             }
 
+            const actions = Utils.create('div', { class: 'wb-entity-actions', style: 'margin-bottom:12px' });
+            const runBtn = Utils.create('button', { class: 'wb-btn wb-btn-primary', text: '执行分析' });
+            runBtn.addEventListener('click', () => this._executeAnalysis(runBtn));
+            const eventBtn = Utils.create('button', { class: 'wb-btn wb-btn-ghost', text: '仅抽取事件时间线' });
+            eventBtn.addEventListener('click', () => this._runTimeline(eventBtn));
+            actions.appendChild(runBtn);
+            actions.appendChild(eventBtn);
+            panel.appendChild(actions);
+            panel.appendChild(Utils.create('div', {
+                class: 'wb-file-meta',
+                text: '完整分析由右侧智能体编排（DeepSeek 调工具）。点「执行分析」会向智能体下达指令；也可在对话框直接说明需求。',
+                style: 'margin-bottom:12px'
+            }));
+
             (payload.groups || []).forEach(group => {
                 panel.appendChild(Utils.create('div', {
                     class: 'wb-group-label',
@@ -550,7 +718,7 @@
             this._schedulePoll(payload);
         },
 
-        _renderEntityCandidates(panel, payload, status) {
+        _renderEntityCandidates(panel, payload, status, artifact, version) {
             const summary = payload.summary || {};
             panel.appendChild(Utils.create('div', { class: 'wb-callout' }, [
                 Utils.create('span', {
@@ -558,23 +726,61 @@
                 })
             ]));
 
+            const actions = Utils.create('div', { class: 'wb-entity-actions', style: 'margin-bottom:12px' });
+            const runBtn = Utils.create('button', { class: 'wb-btn wb-btn-primary', text: '执行分析' });
+            runBtn.addEventListener('click', () => this._executeAnalysis(runBtn));
+            const collideBtn = Utils.create('button', { class: 'wb-btn wb-btn-ghost', text: '仅跑碰撞' });
+            collideBtn.addEventListener('click', () => this._runCollision(collideBtn));
+            const clueBtn = Utils.create('button', { class: 'wb-btn wb-btn-ghost', text: '仅生成线索' });
+            clueBtn.addEventListener('click', () => this._generateClues(clueBtn));
+            actions.appendChild(runBtn);
+            actions.appendChild(collideBtn);
+            actions.appendChild(clueBtn);
+            panel.appendChild(actions);
+
             const metrics = Utils.create('div', { class: 'wb-entity-metrics' }, [
                 this._metric('候选总数', summary.total || 0),
                 this._metric('待复核', summary.pending || 0),
-                this._metric('已处置', summary.reviewed || 0)
+                this._metric('提及', summary.mention_count || (payload.mentions || []).length)
             ]);
             panel.appendChild(metrics);
 
+            const mentions = payload.mentions || [];
+            if (mentions.length) {
+                panel.appendChild(Utils.create('div', { class: 'wb-group-label', text: `规则提及 · ${mentions.length}` }));
+                mentions.slice(0, 40).forEach(mention => {
+                    const rec = (mention.records || [])[0] || {};
+                    const kindLabel = {
+                        tail_only: '仅尾号·不进强碰撞',
+                        luhn_failed: '校验失败·不进强碰撞'
+                    }[mention.mask_kind] || (mention.masked ? '掩码·不进强碰撞' : '可碰撞');
+                    const row = Utils.create('div', { class: 'wb-entity-record' }, [
+                        Utils.create('div', { class: 'case', text: `${mention.object_type || ''} · ${kindLabel}` }),
+                        Utils.create('div', { class: 'value', text: mention.display_name || '脱敏提及' }),
+                        Utils.create('div', { class: 'source', text: [rec.case_name || rec.case_id, rec.filename].filter(Boolean).join(' · ') })
+                    ]);
+                    if (rec.chunk_id && rec.quote_hash) {
+                        row.style.cursor = 'pointer';
+                        row.addEventListener('click', () => this._openCitation(rec));
+                    }
+                    panel.appendChild(row);
+                });
+            }
+
             const candidates = payload.candidates || [];
             if (!candidates.length) {
-                panel.appendChild(Utils.create('div', {
-                    class: 'wb-empty',
-                    text: '当前没有需要复核的实体候选'
-                }));
+                const mentionCount = summary.mention_count || mentions.length;
+                const luhnFailed = mentions.some(m => m.mask_kind === 'luhn_failed');
+                const reason = !mentionCount
+                    ? '尚未扫到可碰撞的手机号/银行卡/设备号。可先确认材料已解析，再运行确定性碰撞。'
+                    : luhnFailed
+                        ? '已扫到卡号写法，但校验位未通过（例如 …4160），或仅有尾号/掩码号。完整卡须在 A/B 两案都出现且 Luhn 通过（可用 6228480177334163）才会生成待复核候选与 R001 线索。'
+                        : '已扫到规则提及，但没有「完整强标识同时出现在 ≥2 起案件」。掩码号、仅尾号、未通过校验的卡号不会生成待复核候选。';
+                panel.appendChild(Utils.create('div', { class: 'wb-empty', text: reason }));
                 return;
             }
             candidates.forEach((candidate, index) => {
-                panel.appendChild(this._entityCandidateCard(candidate, index, status));
+                panel.appendChild(this._entityCandidateCard(candidate, index, status, version));
             });
         },
 
@@ -585,22 +791,27 @@
             ]);
         },
 
-        _entityCandidateCard(candidate, index, artifactStatus) {
+        _entityCandidateCard(candidate, index, artifactStatus, version) {
             const records = Utils.create('div', { class: 'wb-entity-records' });
             (candidate.records || []).forEach(record => {
                 const source = record.source || {};
-                records.appendChild(Utils.create('div', { class: 'wb-entity-record' }, [
+                const recEl = Utils.create('div', { class: 'wb-entity-record' }, [
                     Utils.create('div', { class: 'case', text: record.case_name || record.case_id || '案件' }),
                     Utils.create('div', {
                         class: 'value',
-                        text: record.value || record.normalized_value || '未记录'
+                        text: record.value || '脱敏标识'
                     }),
                     Utils.create('div', {
                         class: 'source',
                         text: [source.document_name, source.page_no ? `第 ${source.page_no} 页` : '']
                             .filter(Boolean).join(' · ') || '待补原文定位'
                     })
-                ]));
+                ]);
+                if (source.chunk_id && source.quote_hash) {
+                    recEl.style.cursor = 'pointer';
+                    recEl.addEventListener('click', () => this._openCitation(source));
+                }
+                records.appendChild(recEl);
             });
 
             const basis = (candidate.match_basis || []).length
@@ -651,7 +862,7 @@
                         text: label
                     });
                     button.addEventListener('click', () => {
-                        this._showEntityDecisionForm(reviewArea, candidate, decision, label);
+                        this._showEntityDecisionForm(reviewArea, candidate, decision, label, version);
                     });
                     buttons.appendChild(button);
                 });
@@ -680,7 +891,7 @@
             ]);
         },
 
-        _showEntityDecisionForm(container, candidate, decision, label) {
+        _showEntityDecisionForm(container, candidate, decision, label, version) {
             container.innerHTML = '';
             const reason = Utils.create('textarea', {
                 class: 'wb-decision-reason',
@@ -691,14 +902,14 @@
             cancel.addEventListener('click', () => this._renderPanel());
             const submit = Utils.create('button', { class: 'wb-btn wb-btn-primary', text: '确认提交' });
             submit.addEventListener('click', () => {
-                this._submitEntityDecision(candidate.candidate_id, decision, reason.value, submit);
+                this._submitEntityDecision(candidate.candidate_id, decision, reason.value, submit, version);
             });
             container.appendChild(reason);
             container.appendChild(Utils.create('div', { class: 'wb-entity-actions' }, [cancel, submit]));
             reason.focus();
         },
 
-        async _submitEntityDecision(candidateId, decision, reason, button) {
+        async _submitEntityDecision(candidateId, decision, reason, button, version) {
             if (!(reason || '').trim()) {
                 Toast.warning('请填写复核理由');
                 return;
@@ -710,7 +921,11 @@
                     {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ decision, reason: reason.trim() })
+                        body: JSON.stringify({
+                            decision,
+                            reason: reason.trim(),
+                            expected_version: version
+                        })
                     }
                 );
                 const data = await resp.json();
@@ -726,6 +941,292 @@
             } finally {
                 button.disabled = false;
             }
+        },
+
+        async _runCollision(button) {
+            button.disabled = true;
+            try {
+                const resp = await fetch(`/api/tasks/${this.task.id}/collision/run`, { method: 'POST' });
+                const data = await resp.json();
+                if (data.error_code) {
+                    Toast.error(data.message || '碰撞失败');
+                    return;
+                }
+                this.task = data.task;
+                await this.openArtifact(data.artifact.id);
+                Toast.success(`碰撞完成，候选 ${data.candidate_count || 0} 条`);
+            } catch (e) {
+                Toast.error('碰撞失败：' + e.message);
+            } finally {
+                button.disabled = false;
+            }
+        },
+
+        async _generateClues(button) {
+            button.disabled = true;
+            try {
+                const resp = await fetch(`/api/tasks/${this.task.id}/clues/generate`, { method: 'POST' });
+                const data = await resp.json();
+                if (data.error_code) {
+                    Toast.error(data.message || '线索生成失败');
+                    return;
+                }
+                this.task = data.task;
+                await this.openArtifact(data.artifact.id);
+                Toast.success(`线索生成完成 ${ (data.created || []).length } 条`);
+            } catch (e) {
+                Toast.error('线索生成失败：' + e.message);
+            } finally {
+                button.disabled = false;
+            }
+        },
+
+        async _runTimeline(button) {
+            button.disabled = true;
+            try {
+                const resp = await fetch(`/api/tasks/${this.task.id}/timeline/run`, { method: 'POST' });
+                const data = await resp.json();
+                if (data.error_code) {
+                    Toast.error(data.message || '事件抽取失败');
+                    return;
+                }
+                this.task = data.task;
+                await this.openArtifact(data.artifact.id);
+                Toast.success(`事件抽取完成 ${data.event_count || 0} 条`);
+            } catch (e) {
+                Toast.error('事件抽取失败：' + e.message);
+            } finally {
+                button.disabled = false;
+            }
+        },
+
+        async _openCitation(source) {
+            const versionId = source.document_version_id;
+            const chunkId = source.chunk_id;
+            if (!versionId || !chunkId) {
+                Toast.warning('缺少原文定位');
+                return;
+            }
+            const params = new URLSearchParams();
+            if (source.quote_hash) params.set('quote_hash', source.quote_hash);
+            if (source.quote) params.set('quote', source.quote);
+            const pane = Utils.$('#wb-cite-pane');
+            const split = Utils.$('#wb-split');
+            if (pane) {
+                pane.hidden = false;
+                pane.innerHTML = '';
+                pane.appendChild(Utils.create('div', { class: 'wb-cite-loading', text: '正在核对原文…' }));
+                if (split) split.classList.add('is-open');
+            }
+            try {
+                const resp = await fetch(
+                    `/api/materials/versions/${versionId}/chunks/${chunkId}?${params.toString()}`
+                );
+                const data = await resp.json();
+                if (data.error_code) {
+                    Toast.error(data.message || '引用失效');
+                    this._renderCitePane({
+                        error: true,
+                        title: '引用失效',
+                        text: data.message || '原文已变更或哈希不匹配，禁止展示旧内容',
+                        meta: source.filename || source.document_name || ''
+                    }, source);
+                    return;
+                }
+                this._renderCitePane({
+                    error: false,
+                    title: '原文回链（脱敏）',
+                    text: data.text || source.quote || '无文本',
+                    meta: [source.filename || source.document_name, source.page_start || source.page_no ? `第 ${source.page_start || source.page_no} 页` : '']
+                        .filter(Boolean).join(' · ')
+                }, source);
+            } catch (e) {
+                Toast.error('回链失败：' + e.message);
+                this._renderCitePane({
+                    error: true,
+                    title: '回链失败',
+                    text: e.message,
+                    meta: ''
+                }, source);
+            }
+        },
+
+        _renderCitePane(view, source) {
+            const pane = Utils.$('#wb-cite-pane');
+            const split = Utils.$('#wb-split');
+            if (!pane) return;
+            pane.hidden = false;
+            if (split) split.classList.add('is-open');
+            pane.innerHTML = '';
+            const close = Utils.create('button', { class: 'wb-btn wb-btn-ghost', text: '关闭对照' });
+            close.addEventListener('click', () => {
+                pane.hidden = true;
+                pane.innerHTML = '';
+                if (split) split.classList.remove('is-open');
+            });
+            pane.appendChild(Utils.create('div', { class: 'wb-cite-head' }, [
+                Utils.create('div', {}, [
+                    Utils.create('div', { class: 'wb-cite-kicker', text: view.error ? '核验未通过' : '左侧生成物 · 右侧原文' }),
+                    Utils.create('div', { class: 'wb-cite-title', text: view.title })
+                ]),
+                close
+            ]));
+            if (view.meta) {
+                pane.appendChild(Utils.create('div', { class: 'wb-file-meta', text: view.meta }));
+            }
+            const body = Utils.create('div', { class: `wb-cite-body${view.error ? ' is-error' : ''}` });
+            const quote = (source && source.quote) || '';
+            const text = view.text || '';
+            if (quote && text.includes(quote) && !view.error) {
+                const idx = text.indexOf(quote);
+                body.appendChild(document.createTextNode(text.slice(0, idx)));
+                body.appendChild(Utils.create('mark', { class: 'wb-cite-mark', text: quote }));
+                body.appendChild(document.createTextNode(text.slice(idx + quote.length)));
+            } else {
+                body.textContent = text;
+            }
+            pane.appendChild(body);
+        },
+
+        _renderClueSet(panel, payload) {
+            panel.appendChild(Utils.create('div', { class: 'wb-callout' }, [
+                Utils.create('span', { text: payload.boundary || '线索停留在待核验层级。' })
+            ]));
+            const summary = payload.summary || {};
+            panel.appendChild(Utils.create('div', { class: 'wb-entity-metrics' }, [
+                this._metric('线索', summary.total || 0),
+                this._metric('新生成', summary.created || 0),
+                this._metric('跳过', summary.skipped || 0)
+            ]));
+            const items = payload.items || [];
+            if (!items.length) {
+                const skipped = payload.skipped || [];
+                const skipText = skipped.length
+                    ? `本轮跳过 ${skipped.length} 条（${skipped.slice(0, 3).map(s => s.reason).join('、')}）。`
+                    : '';
+                panel.appendChild(Utils.create('div', {
+                    class: 'wb-empty',
+                    text: `尚无跨案线索。${skipText}线索来自 R001–R005：R001–R003 需完整卡号/手机号/设备号跨 ≥2 案；R004 需同账户出现在 ≥2 案的转账事件；R005 需同手机号出现在 ≥2 案的联络事件。仅有尾号、掩码号或 Luhn 失败卡号时为 0 是正常结果。`
+                }));
+                return;
+            }
+            items.forEach(item => {
+                const open = Utils.create('button', { class: 'wb-btn wb-btn-ghost', text: '打开' });
+                if (item.artifact_id) {
+                    open.addEventListener('click', () => this.openArtifact(item.artifact_id));
+                }
+                panel.appendChild(Utils.create('section', { class: 'wb-entity-card' }, [
+                    Utils.create('div', { class: 'wb-entity-card-head' }, [
+                        Utils.create('div', { class: 'wb-entity-title', text: item.title || item.rule_id || '线索' }),
+                        Utils.create('span', { class: 'wb-pill ok', text: item.rule_id || 'RULE' })
+                    ]),
+                    Utils.create('div', { class: 'wb-entity-card-body' }, [
+                        Utils.create('div', { class: 'wb-file-meta', text: `案件 ${item.case_count || ''} · chunk ${item.chunk_count || ''}` }),
+                        open
+                    ])
+                ]));
+            });
+        },
+
+        _renderClueItem(panel, payload) {
+            panel.appendChild(Utils.create('div', { class: 'wb-callout' }, [
+                Utils.create('span', { text: payload.boundary || '' })
+            ]));
+            panel.appendChild(Utils.create('div', { class: 'wb-summary-v', text: payload.title || '' }));
+            panel.appendChild(Utils.create('div', { class: 'wb-file-meta', text: payload.summary || '' }));
+            panel.appendChild(Utils.create('div', { class: 'wb-group-label', text: '涉及案件' }));
+            (payload.cases || []).forEach(c => {
+                panel.appendChild(Utils.create('div', { class: 'wb-file-meta', text: c.case_name || c.case_id }));
+            });
+            panel.appendChild(Utils.create('div', { class: 'wb-group-label', text: '证据（点击回链）' }));
+            (payload.evidence || []).forEach(ev => {
+                const row = Utils.create('div', { class: 'wb-entity-record' }, [
+                    Utils.create('div', { class: 'case', text: ev.case_name || ev.case_id || '' }),
+                    Utils.create('div', { class: 'value', text: ev.quote || '脱敏片段' }),
+                    Utils.create('div', { class: 'source', text: [ev.filename, ev.page_start ? `第 ${ev.page_start} 页` : ''].filter(Boolean).join(' · ') })
+                ]);
+                row.style.cursor = 'pointer';
+                row.addEventListener('click', () => this._openCitation(ev));
+                panel.appendChild(row);
+            });
+            if (payload.uncertainty) {
+                panel.appendChild(Utils.create('div', { class: 'wb-callout warn', text: payload.uncertainty }));
+            }
+        },
+
+        _renderRoleTimeline(panel, payload) {
+            panel.appendChild(Utils.create('div', { class: 'wb-callout' }, [
+                Utils.create('span', { text: payload.boundary || '事件仅作为后续规则事实层，不直接给出关系结论。' })
+            ]));
+            const summary = payload.summary || {};
+            const typeText = Object.entries(summary.types || {})
+                .map(([key, value]) => `${key === 'TRANSFER' ? '转账' : key === 'CONTACT' ? '联络' : key} ${value}`)
+                .join(' · ');
+            panel.appendChild(Utils.create('div', { class: 'wb-entity-metrics' }, [
+                this._metric('事件', summary.total || 0),
+                this._metric('有时间', summary.dated || 0),
+                this._metric('时间不明', summary.undated || 0)
+            ]));
+            if (typeText) {
+                panel.appendChild(Utils.create('div', { class: 'wb-file-meta', text: `${typeText} · 扫描 chunk ${summary.scanned_chunks || 0}` }));
+            }
+            const items = payload.items || [];
+            if (!items.length) {
+                panel.appendChild(Utils.create('div', {
+                    class: 'wb-empty',
+                    text: '尚未抽到可定位的转账或联络事件。材料里只有标识、没有行为描述时，时间线为空是正常结果。'
+                }));
+                return;
+            }
+
+            const dated = items.filter(item => item.time_text && item.time_precision !== 'UNKNOWN');
+            const undated = items.filter(item => !(item.time_text && item.time_precision !== 'UNKNOWN'));
+            const chart = Utils.create('div', { class: 'wb-timeline-chart' });
+            chart.appendChild(Utils.create('div', { class: 'wb-timeline-axis' }));
+
+            const renderNode = (item, unknown) => {
+                const source = item.source || {};
+                const node = Utils.create('article', {
+                    class: `wb-timeline-node${item.event_type === 'TRANSFER' ? ' is-transfer' : ' is-contact'}${unknown ? ' is-unknown' : ''}`
+                }, [
+                    Utils.create('div', { class: 'wb-timeline-dot' }),
+                    Utils.create('div', { class: 'wb-timeline-card' }, [
+                        Utils.create('div', { class: 'wb-timeline-card-head' }, [
+                            Utils.create('div', { class: 'wb-timeline-time', text: item.time_text || '时间不明' }),
+                            Utils.create('span', {
+                                class: 'wb-pill ok',
+                                text: item.event_type === 'TRANSFER' ? '转账' : '联络'
+                            })
+                        ]),
+                        Utils.create('div', { class: 'wb-timeline-case', text: item.case_name || item.case_id || '案件' }),
+                        Utils.create('div', { class: 'wb-timeline-summary', text: item.summary_text || '—' }),
+                        Utils.create('div', {
+                            class: 'wb-timeline-meta',
+                            text: [
+                                item.amount_text || '',
+                                (item.parties || []).join('；'),
+                                source.filename || '',
+                                source.page_start ? `第 ${source.page_start} 页` : ''
+                            ].filter(Boolean).join(' · ') || '点击回链原文'
+                        })
+                    ])
+                ]);
+                if (source.chunk_id && source.document_version_id) {
+                    node.style.cursor = 'pointer';
+                    node.addEventListener('click', () => this._openCitation(source));
+                }
+                return node;
+            };
+
+            if (dated.length) {
+                chart.appendChild(Utils.create('div', { class: 'wb-group-label', text: '按时间排列' }));
+                dated.forEach(item => chart.appendChild(renderNode(item, false)));
+            }
+            if (undated.length) {
+                chart.appendChild(Utils.create('div', { class: 'wb-group-label', text: '时间不明（单独分组，不补造时间）' }));
+                undated.forEach(item => chart.appendChild(renderNode(item, true)));
+            }
+            panel.appendChild(chart);
         },
 
         _materialRow(row) {
@@ -747,6 +1248,16 @@
             });
             fill.style.width = percent + '%';
 
+            const del = Utils.create('button', {
+                class: 'wb-file-del',
+                title: '删除材料',
+                text: '×'
+            });
+            del.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this._deleteMaterial(row.document_id);
+            });
+
             return Utils.create('div', { class: 'wb-file-row' }, [
                 Utils.create('div', { class: 'wb-file-type', text: ext }),
                 Utils.create('div', {}, [
@@ -760,8 +1271,37 @@
                         text: attention ? '需人工处理' : `阶段 ${Math.max(stageIndex + 1, 1)} / ${STAGE_ORDER.length}`
                     })
                 ]),
-                Utils.create('div', { class: 'wb-file-status', text: STAGE_TEXT[status] || status })
+                Utils.create('div', { class: 'wb-file-status', text: STAGE_TEXT[status] || status }),
+                del
             ]);
+        },
+
+        async _deleteMaterial(documentId) {
+            if (!documentId || !this.task) return;
+            if (!confirm('确定删除该材料？')) return;
+            try {
+                const resp = await fetch(
+                    `/api/tasks/${this.task.id}/materials/${documentId}`,
+                    { method: 'DELETE' }
+                );
+                const data = await resp.json();
+                if (data.error_code) {
+                    Toast.error(data.message || '删除失败');
+                    return;
+                }
+                Toast.success('材料已删除');
+                // 关掉已打开的该材料相关标签，再整页刷新目录与批次
+                const gone = new Set(
+                    (this.task.artifacts || [])
+                        .filter(a => a.type === 'MATERIAL_DOC' && a.ref_key === documentId)
+                        .map(a => a.id)
+                );
+                this.tabs = this.tabs.filter(t => !gone.has(t.id));
+                if (gone.has(this.activeTabId)) this.activeTabId = null;
+                await this.openTask(this.task.id, data.batch_artifact_id || null);
+            } catch (e) {
+                Toast.error('删除失败：' + e.message);
+            }
         },
 
         _sizeText(size) {
@@ -797,6 +1337,94 @@
             ]);
         },
 
+        async _executeAnalysis(button) {
+            if (!this.draftTaskId && this.task) this.draftTaskId = this.task.id;
+            if (!this.draftTaskId && !(this.task && this.task.id)) return;
+            if (button) {
+                button.disabled = true;
+                button.textContent = '执行中…';
+            }
+            const prompt = [
+                '请对本监督分析任务执行完整跨案分析：',
+                '1) 先 get_task_overview 了解案件与材料；',
+                '2) 若仍为草稿则 confirm_task_plan；',
+                '3) 刷新材料后 run_task_collision；',
+                '4) run_task_timeline 抽取转账/联络事件；',
+                '5) generate_task_clues 生成可回原文的跨案线索。',
+                '每完成一步根据观察决定是否继续；最终汇总产物并提示打开核验。',
+                '禁止输出定罪、并案、主从犯或量刑结论。'
+            ].join('');
+            try {
+                if (!window.Agent) throw new Error('智能体未就绪');
+                await Agent.process(prompt);
+                Toast.success('智能体本轮分析已结束');
+            } catch (e) {
+                Toast.error(e.message || '执行失败');
+            } finally {
+                if (button) {
+                    button.disabled = false;
+                    button.textContent = '执行分析';
+                }
+            }
+        },
+
+        async _waitMaterialsReady(maxRounds = 8) {
+            for (let i = 0; i < maxRounds; i++) {
+                const resp = await fetch(`/api/tasks/${this.task.id}/materials`);
+                const data = await resp.json();
+                const batch = (this.task.artifacts || []).find(a => a.type === 'MATERIAL_BATCH');
+                if (batch) await this.openArtifact(batch.id);
+                const overview = batch
+                    ? ((this.tabs.find(t => t.id === batch.id) || {}).data || {}).payload
+                    : null;
+                const groups = (overview && overview.groups) || [];
+                const materials = groups.flatMap(g => g.materials || []);
+                if (!materials.length) return;
+                const pending = materials.some(m => ['UPLOADED', 'PARSING'].includes(m.status));
+                if (!pending) return;
+                await Utils.sleep(1500);
+            }
+        },
+
+        _mountRunProgress(stepLabels) {
+            const messages = Utils.$('#chat-messages');
+            if (!messages || !window.Thinking) return { thinking: null, fills: [] };
+            const thinking = Thinking.create({
+                title: '执行分析',
+                defaultExpanded: false,
+                steps: stepLabels.map(text => ({ text, status: '' }))
+            });
+            const fills = [];
+            Utils.$$('.thinking-step', thinking).forEach(step => {
+                const fill = Utils.create('div', { class: 'wb-step-bar-fill' });
+                step.appendChild(Utils.create('div', { class: 'wb-step-bar' }, [fill]));
+                fills.push(fill);
+            });
+            messages.appendChild(thinking);
+            messages.scrollTop = messages.scrollHeight;
+            return { thinking, fills };
+        },
+
+        _setRunStep(run, index, status, percent) {
+            if (!run || !run.thinking || !window.Thinking) return;
+            if (status) Thinking.updateStep(run.thinking, index, status);
+            const fill = (run.fills || [])[index];
+            if (fill) {
+                fill.style.width = `${percent || 0}%`;
+                fill.classList.toggle('active', status === 'active');
+            }
+        },
+
+        _openLatest(type) {
+            const item = (this.task.artifacts || []).find(a => a.type === type);
+            if (item) this.openArtifact(item.id);
+        },
+
+        async _postJson(url) {
+            const resp = await fetch(url, { method: 'POST' });
+            return resp.json();
+        },
+
         async _uploadMaterials(caseId, files, btn) {
             if (!files || !files.length) {
                 Toast.warning('请先选择材料文件');
@@ -806,31 +1434,43 @@
             form.append('case_id', caseId);
             Array.from(files).forEach(f => form.append('files', f));
 
-            btn.disabled = true;
-            btn.textContent = '上传中…';
+            const taskId = (this.task && this.task.id) || this.draftTaskId;
+            if (!taskId) {
+                Toast.error('任务尚未创建，无法上传材料');
+                return false;
+            }
+            if (btn) {
+                btn.disabled = true;
+                btn.textContent = '上传中…';
+            }
             try {
-                const resp = await fetch(`/api/tasks/${this.task.id}/materials`, {
+                const resp = await fetch(`/api/tasks/${taskId}/materials`, {
                     method: 'POST',
                     body: form
                 });
                 const data = await resp.json();
                 if (data.error_code) {
                     Toast.error(data.message || '上传失败');
-                    return;
+                    return false;
                 }
                 this.task = data.task;
                 this._renderDirectory();
                 const batch = (this.task.artifacts || []).find(a => a.type === 'MATERIAL_BATCH');
-                if (batch) {
+                if (batch && !Utils.$('#wb-workspace').hidden) {
                     await this.openArtifact(batch.id);
                     this._postArtifactCard(batch.id, '材料接入与质量', `已接收 ${files.length} 份材料，可在此查看逐份处理进度。`);
                 }
                 Toast.success('材料已接入，正在处理');
+                this._maybeOfferRerun();
+                return true;
             } catch (e) {
                 Toast.error('上传失败：' + e.message);
+                return false;
             } finally {
-                btn.disabled = false;
-                btn.textContent = '上传到该案件';
+                if (btn) {
+                    btn.disabled = false;
+                    btn.textContent = '上传到该案件';
+                }
             }
         },
 
