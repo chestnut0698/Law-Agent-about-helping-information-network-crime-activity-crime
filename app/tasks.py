@@ -137,6 +137,16 @@ CREATE TABLE IF NOT EXISTS artifact_versions (
     created_at DATETIME NOT NULL,
     UNIQUE(artifact_id, version)
 );
+
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id VARCHAR(36) PRIMARY KEY,
+    task_id VARCHAR(36) NOT NULL,
+    role VARCHAR(16) NOT NULL,
+    content TEXT NOT NULL,
+    created_at DATETIME NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_chat_task_time ON chat_messages(task_id, created_at);
 """
 
 
@@ -827,6 +837,29 @@ class TaskService:
             payload=self.material_overview(task_id, user_id=user_id),
         )
 
+    def save_message(self, task_id: str, role: str, content: str, metadata: dict | None = None) -> dict:
+        """保存单条聊天消息到数据库"""
+        with db_session(self.db_path) as conn:
+            msg = {
+                "id": new_id(),
+                "task_id": task_id,
+                "role": role,
+                "content": content,
+                "created_at": utc_now(),
+                "metadata_json": json.dumps(metadata or {}, ensure_ascii=False),
+            }
+            _insert(conn, "chat_messages", msg)
+        return msg
+
+    def get_messages(self, task_id: str) -> list[dict]:
+        """获取某个任务的所有聊天消息（按时间升序）"""
+        with db_session(self.db_path) as conn:
+            return _rows(
+                conn,
+                "SELECT role, content, created_at FROM chat_messages "
+                "WHERE task_id = ? ORDER BY created_at ASC",
+                (task_id,),
+            )
     # ----- 内部 -----
 
     def _scope_payload(self, task_id: str) -> dict[str, Any]:

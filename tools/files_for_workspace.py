@@ -26,10 +26,10 @@ ALL_SUPPORTED = TEXT_EXTS | IMAGE_EXTS | PDF_EXTS | DOCX_EXTS | DOC_EXTS | PPTX_
 
 # ---------- 路径安全工具 ----------
 
-def _safe_resolve(conv_id: str, sub_path: str, filename: str) -> Path | None:
+def _safe_resolve(task_id: str, sub_path: str, filename: str) -> Path | None:
     """拼接并校验路径，防止穿越攻击。返回 None 表示非法。"""
     rel = Path(sub_path.strip("/").replace("\\", "/")) / filename if sub_path else Path(filename)
-    target = (WORKSPACE_DIR / conv_id / rel).resolve()
+    target = (WORKSPACE_DIR / task_id / rel).resolve()
     if not str(target).startswith(str(WORKSPACE_DIR.resolve())):
         return None
     return target
@@ -185,12 +185,12 @@ def _extract_xlsx(path: Path) -> str:
 
 # ---------- 对外工具函数 ----------
 
-def list_user_files(conv_id: str) -> str:
+def list_user_files(task_id: str) -> str:
     """
     递归列出会话目录下的所有文件（含子目录）。
     返回 JSON 字符串，每项含 name / relative_path / size / suffix。
     """
-    target = WORKSPACE_DIR / conv_id
+    target = WORKSPACE_DIR / task_id
     if not target.is_dir():
         return json.dumps({"error": f"未找到目录: {target}"}, ensure_ascii=False)
 
@@ -212,14 +212,14 @@ def list_user_files(conv_id: str) -> str:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 
-def read_any_file(conv_id: str, filename: str, sub_path: str = "") -> str:
+def read_any_file(task_id: str, filename: str, sub_path: str = "") -> str:
     """
     统一读取入口：文本/图片/PDF/Word 都返回纯文本。
     - sub_path: 可选，子目录相对路径，如 "证据/图片/"
     """
     # ★ 关键修复：定义 rel 变量
     rel = Path(sub_path) / filename if sub_path else Path(filename)
-    target = (WORKSPACE_DIR / conv_id / rel).resolve()
+    target = (WORKSPACE_DIR / task_id / rel).resolve()
 
     # 路径穿越防护
     if not str(target).startswith(str(WORKSPACE_DIR.resolve())):

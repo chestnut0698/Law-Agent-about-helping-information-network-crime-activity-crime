@@ -19,7 +19,7 @@
 
     const State = {
         // 会话状态
-        currentConversationId: 1,
+        currentTaskId: null,
         conversations: [
         ],
 

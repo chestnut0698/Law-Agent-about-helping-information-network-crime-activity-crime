@@ -6,12 +6,6 @@ from dotenv import load_dotenv
 REPO_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv()
 
-DATA_DIR = REPO_ROOT / "data" / "conversations"
-META_FILE = DATA_DIR / "conversations.json"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-WORKSPACE_DIR = REPO_ROOT / "data" / "workspace"
-WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 
 DATABASE_PATH = Path(
     os.getenv("DATABASE_PATH", str(REPO_ROOT / "data" / "database" / "law_agent.db"))
