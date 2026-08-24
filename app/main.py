@@ -3,16 +3,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import asyncio
-import json
 from agents.react_agent import *
-from pathlib import Path
 from typing import Optional
-
-from app.config import REPO_ROOT, WORKSPACE_DIR
-from agents.gateway import GatewayError, get_gateway, init_gateway_db
-from tools.files import ERROR_CODES, MaterialError, get_material_service, init_db
-from tools.entities import init_entity_db
-from tools.tasks import TaskError, get_task_service, init_task_db
+import json
+from app.config import REPO_ROOT
+from tools.files import MaterialError, get_material_service, init_db
+from app.tasks import TaskError, get_task_service, init_task_db
 
 
 app = FastAPI()
@@ -26,15 +22,6 @@ app.add_middleware(
 
 init_db()
 init_task_db()
-init_gateway_db()
-init_entity_db()
-
-
-def get_workspace(task_id: str) -> Path:
-    """任务工作区目录（兼容会话附件工具；正式卷宗走材料管线）。"""
-    path = WORKSPACE_DIR / str(task_id)
-    path.mkdir(parents=True, exist_ok=True)
-    return path
 
 
 
@@ -172,25 +159,12 @@ async def resolve_material_duplicate(
 async def read_material_chunk_api(
     version_id: str,
     chunk_id: str,
-    quote: Optional[str] = None,
-    quote_hash: Optional[str] = None,
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
     try:
-        payload = get_material_service().read_redacted_chunk(
+        return get_material_service().read_redacted_chunk(
             version_id, chunk_id=chunk_id, user_id=x_user_id
         )
-        if quote_hash:
-            from tools.entities import verify_quote_hash
-
-            if not quote or not verify_quote_hash(payload.get("text") or "", quote, quote_hash):
-                raise MaterialError(
-                    ERROR_CODES["CITATION_STALE"],
-                    "引用失效：原文已变更或哈希不匹配，禁止展示旧内容",
-                    {"chunk_id": chunk_id, "quote_hash": quote_hash},
-                )
-            payload["cite_ok"] = True
-        return payload
     except MaterialError as exc:
         return material_error_response(exc)
 
@@ -230,6 +204,12 @@ async def get_task(task_id: str):
     except TaskError as exc:
         return task_error_response(exc)
 
+@app.delete("/api/tasks/{task_id}")
+async def delete_task(task_id: str):
+    try:
+        return get_task_service().delete_task(task_id)
+    except TaskError as exc:
+        return task_error_response(exc)
 
 @app.get("/api/tasks/{task_id}/plan")
 async def task_plan_preview(task_id: str):
@@ -288,7 +268,6 @@ async def review_task_entity_candidate(task_id: str, candidate_id: str, payload:
             decision=payload.get("decision", ""),
             reason=payload.get("reason", ""),
             correction=payload.get("correction"),
-            expected_version=payload.get("expected_version"),
         )
     except TaskError as exc:
         return task_error_response(exc)
@@ -325,23 +304,6 @@ async def upload_task_materials(
                 )
             )
         return {"results": results, "task": tasks.get_task(task_id)}
-    except TaskError as exc:
-        return task_error_response(exc)
-    except MaterialError as exc:
-        return material_error_response(exc)
-
-
-@app.delete("/api/tasks/{task_id}/materials/{document_id}")
-async def delete_task_material(
-    task_id: str,
-    document_id: str,
-    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
-):
-    """删除任务内材料：逻辑删除文档，并同步目录中的 MATERIAL_DOC / MATERIAL_BATCH。"""
-    try:
-        return get_task_service().remove_material(
-            task_id, document_id, user_id=x_user_id or "system"
-        )
     except TaskError as exc:
         return task_error_response(exc)
     except MaterialError as exc:
@@ -386,220 +348,6 @@ async def apply_artifact_impact(task_id: str, artifact_id: str, payload: dict | 
     except TaskError as exc:
         return task_error_response(exc)
 
-
-
-def gateway_error_response(exc: GatewayError) -> JSONResponse:
-    status = 503 if exc.degraded else 400
-    return JSONResponse(status_code=status, content=exc.to_dict())
-
-
-@app.get("/api/agent/status")
-async def agent_status():
-    """降级状态：关闭外呼后系统仍可走确定性规则，界面据此明示。"""
-    return get_gateway().status()
-
-
-@app.get("/api/agent/runs")
-async def agent_runs(purpose: Optional[str] = None, limit: int = 50):
-    return {"runs": get_gateway().list_runs(purpose=purpose, limit=limit)}
-
-
-@app.get("/api/agent/repair-queue")
-async def agent_repair_queue(limit: int = 50):
-    return {"items": get_gateway().list_repair_queue(limit=limit)}
-
-
-@app.post("/api/tasks/{task_id}/roles/extract")
-async def task_extract_role(
-    task_id: str,
-    payload: dict | None = None,
-    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
-):
-    try:
-        body = payload or {}
-        return get_task_service().run_extraction(
-            task_id,
-            user_id=x_user_id,
-            chunk_ids=body.get("chunk_ids"),
-        )
-    except TaskError as exc:
-        return task_error_response(exc)
-
-
-@app.post("/api/tasks/{task_id}/roles/normalize")
-async def task_normalize_role(
-    task_id: str,
-    payload: dict,
-    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
-):
-    try:
-        return get_task_service().run_normalization(
-            task_id,
-            entity_a=payload.get("entity_a") or {},
-            entity_b=payload.get("entity_b") or {},
-            user_id=x_user_id,
-        )
-    except TaskError as exc:
-        return task_error_response(exc)
-
-
-@app.post("/api/tasks/{task_id}/roles/clue-wording")
-async def task_clue_wording_role(
-    task_id: str,
-    payload: dict,
-    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
-):
-    try:
-        return get_task_service().run_clue_wording(
-            task_id,
-            rule_hits=payload.get("rule_hits") or [],
-            user_id=x_user_id,
-        )
-    except TaskError as exc:
-        return task_error_response(exc)
-
-
-@app.post("/api/tasks/{task_id}/roles/verify")
-async def task_verify_role(
-    task_id: str,
-    payload: dict,
-    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
-):
-    try:
-        return get_task_service().run_output_verify(
-            task_id,
-            clue_text=payload.get("clue_text") or "",
-            evidence=payload.get("evidence") or [],
-            reverse_materials=payload.get("reverse_materials"),
-            user_id=x_user_id,
-        )
-    except TaskError as exc:
-        return task_error_response(exc)
-
-
-@app.post("/api/tasks/{task_id}/collision/run")
-async def task_run_collision(
-    task_id: str,
-    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
-):
-    try:
-        return get_task_service().run_collision(task_id, user_id=x_user_id)
-    except TaskError as exc:
-        return task_error_response(exc)
-
-
-@app.post("/api/tasks/{task_id}/clues/generate")
-async def task_generate_clues(
-    task_id: str,
-    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
-):
-    try:
-        return get_task_service().generate_clues(task_id, user_id=x_user_id)
-    except TaskError as exc:
-        return task_error_response(exc)
-
-
-@app.post("/api/tasks/{task_id}/timeline/run")
-async def task_run_role_timeline(
-    task_id: str,
-    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
-):
-    try:
-        return get_task_service().run_role_timeline(task_id, user_id=x_user_id)
-    except TaskError as exc:
-        return task_error_response(exc)
-
-
-@app.post("/api/tasks/{task_id}/agent/chat")
-async def task_agent_chat(
-    task_id: str,
-    request: Request,
-    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
-):
-    """任务级 ReAct：DeepSeek 思考并调工具，SSE 推送思考/工具/产物链接。"""
-    from agents.task_agent import TaskAgent
-
-    try:
-        get_task_service().get_task(task_id)
-    except TaskError as exc:
-        return task_error_response(exc)
-
-    data = await request.json()
-    messages = data.get("messages") or []
-    user_message = ""
-    if messages:
-        user_message = messages[-1].get("content") or ""
-    if not user_message:
-        user_message = data.get("message") or ""
-
-    agent_runner = TaskAgent(task_id, user_id=x_user_id or "system")
-
-    async def event_stream():
-        for chunk in agent_runner.chat(user_message):
-            chunk_type, chunk_data = chunk[0], chunk[1]
-            if chunk_type == "reasoning_content":
-                yield f"data: {json.dumps({'type': 'thinking', 'content': chunk_data}, ensure_ascii=False)}\n\n"
-            elif chunk_type == "tool_calls":
-                name = chunk_data.get("name") or ""
-                if name.startswith("run_task_") or name.startswith("generate_task_"):
-                    tool_type = "code"
-                elif "material" in name or "file" in name or name.startswith("list_"):
-                    tool_type = "file"
-                elif name[:3] in {"web", "sea"}:
-                    tool_type = "search"
-                else:
-                    tool_type = "code"
-                payload = {
-                    "type": "tool_call",
-                    "tool": {
-                        "type": tool_type,
-                        "name": name,
-                        "params": chunk_data.get("arguments", {}),
-                        "status": "running",
-                    },
-                }
-                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-            elif chunk_type == "tool_result":
-                payload = {
-                    "type": "tool_result",
-                    "tool": {
-                        "result": chunk_data,
-                        "status": (
-                            "error"
-                            if ("工具调用出错" in str(chunk_data) or '"ok": false' in str(chunk_data).lower())
-                            else "success"
-                        ),
-                    },
-                }
-                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-            elif chunk_type == "artifact":
-                yield f"data: {json.dumps({'type': 'artifact', **chunk_data}, ensure_ascii=False)}\n\n"
-            elif chunk_type == "content":
-                for char in chunk_data:
-                    yield f"data: {json.dumps({'type': 'text_delta', 'text': char}, ensure_ascii=False)}\n\n"
-            elif chunk_type == "plan":
-                yield f"data: {json.dumps({'type': 'plan', 'plan': chunk_data}, ensure_ascii=False)}\n\n"
-            elif chunk_type == "done":
-                yield f"data: {json.dumps({'type': 'done', 'done': chunk_data}, ensure_ascii=False)}\n\n"
-            await asyncio.sleep(0)
-        yield f"data: {json.dumps({'type': 'done'})}\n\n"
-
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
-
-
-# ---------- 静态文件服务（让前端能预览/下载）----------
-from fastapi.responses import FileResponse
-
-
-@app.get("/files/{conv_id}/{filename}")
-async def serve_file(conv_id: str, filename: str):
-    workspace = get_workspace(conv_id)
-    safe_name = Path(filename).name
-    file_path = workspace / safe_name
-    if not file_path.exists():
-        return {"error": "文件不存在"}
-    return FileResponse(file_path)
-
 @app.get("/chat/{task_id}/messages")
 async def get_chat_history(task_id: str):
     """获取任务的历史聊天记录"""
@@ -613,13 +361,23 @@ async def get_chat_history(task_id: str):
         )
     return {"messages": rows}
 
-
-
 # 前后端通信
 @app.post("/chat/{task_id}")
 async def chat(request: Request, task_id):
     data = await request.json()
     messages = data.get("messages", [])
+    # 首句注入系统提示词
+    from tools.files import db_session, _rows
+    with db_session() as conn:
+        rows = _rows(
+            conn,
+            "SELECT role, content, created_at FROM chat_messages "
+            "WHERE task_id = ? ORDER BY created_at ASC",
+            (task_id,)
+        )
+    if not rows:
+        get_task_service().save_message(task_id, "system", TASK_AGENT_PROMPT)
+
     # 查询任务详情，构建系统上下文
     task = get_task_service().get_task(task_id)
     cases_info = "\n".join(
@@ -632,13 +390,13 @@ async def chat(request: Request, task_id):
         f"包含案件：\n{cases_info}\n"
         f"你可以调用 list_case_materials(case_id) 等工具来分析材料。"
     )
-    messages.insert(0, {"role": "system", "content": system_context})
 
     # 提取最后一条用户消息
     user_message = messages[-1]["content"] if messages else ""
 
-    # 保存用户消息
-    get_task_service().save_message(task_id, "user", user_message)
+    # 保存消息
+    get_task_service().save_message(task_id, "system", system_context)
+
 
     async def event_stream():
         agent.switch_id(task_id)
@@ -701,12 +459,6 @@ async def chat(request: Request, task_id):
             # 每次 yield 后小睡，让出事件循环 → 触发真实网络 flush
             await asyncio.sleep(0)
 
-        # 保存助手回复到数据库（整轮结束后一次）
-        full_reply = "".join(assistant_content)
-        if full_reply:
-            get_task_service().save_message(task_id, "assistant", full_reply)
-
-        # 发送完成信号
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
 

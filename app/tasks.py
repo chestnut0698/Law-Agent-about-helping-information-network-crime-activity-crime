@@ -147,6 +147,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     task_id VARCHAR(36) NOT NULL,
     role VARCHAR(16) NOT NULL,
     content TEXT NOT NULL,
+    tool_call_id VARCHAR(64), 
     created_at DATETIME NOT NULL,
     metadata_json TEXT NOT NULL DEFAULT '{}'
 );
@@ -300,6 +301,28 @@ class TaskService:
             payload=self._scope_payload(task_id),
         )
         return {"task": self.get_task(task_id), "scope_artifact_id": scope["id"]}
+
+    def delete_task(self, task_id: str) -> dict:
+        with db_session() as conn:
+            # 1. 删除关联的聊天消息
+            conn.execute("DELETE FROM chat_messages WHERE task_id = ?", (task_id,))
+
+            # 2. 删除关联的案件记录
+            conn.execute("DELETE FROM task_cases WHERE task_id = ?", (task_id,))
+
+            # 3. 删除关联的产物版本
+            artifacts = _rows(conn, "SELECT id FROM artifacts WHERE task_id = ?", (task_id,))
+            for art in artifacts:
+                conn.execute("DELETE FROM artifact_versions WHERE artifact_id = ?", (art["id"],))
+
+            # 4. 删除产物本身
+            conn.execute("DELETE FROM artifacts WHERE task_id = ?", (task_id,))
+
+            # 5. 删除任务本身（表名是 supervision_tasks，不是 tasks）
+            conn.execute("DELETE FROM supervision_tasks WHERE id = ?", (task_id,))
+
+            conn.commit()
+        return {"success": True, "task_id": task_id}
 
     def list_tasks(self, limit: int = 8) -> list[dict[str, Any]]:
         """最左栏只显示最近若干个任务，更多任务走搜索抽屉。"""
@@ -1463,7 +1486,7 @@ class TaskService:
             payload=self.material_overview(task_id, user_id=user_id),
         )
 
-    def save_message(self, task_id: str, role: str, content: str, metadata: dict | None = None) -> dict:
+    def save_message(self, task_id: str, role: str, content: str, tool_call_id: str | None = None, metadata: dict | None = None) -> dict:
         """保存单条聊天消息到数据库"""
         with db_session(self.db_path) as conn:
             msg = {
@@ -1471,6 +1494,7 @@ class TaskService:
                 "task_id": task_id,
                 "role": role,
                 "content": content,
+                "tool_call_id": tool_call_id,
                 "created_at": utc_now(),
                 "metadata_json": json.dumps(metadata or {}, ensure_ascii=False),
             }

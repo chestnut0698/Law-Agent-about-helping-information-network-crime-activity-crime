@@ -4,15 +4,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(REPO_ROOT / ".env")
+load_dotenv()
 
-# 任务智能体历史与兼容会话附件仍可用；正式聊天优先落 SQLite chat_messages。
-DATA_DIR = REPO_ROOT / "data" / "conversations"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-META_FILE = DATA_DIR / "conversations.json"
-
-WORKSPACE_DIR = REPO_ROOT / "data" / "workspace"
-WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 
 DATABASE_PATH = Path(
     os.getenv("DATABASE_PATH", str(REPO_ROOT / "data" / "database" / "law_agent.db"))
@@ -33,8 +26,7 @@ REDACTION_STORAGE_DIR = Path(
 REDACTION_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
-# 远程约定进 config；允许 .env 覆盖，默认演示放行
-MATERIAL_AUTH_MODE = (os.getenv("MATERIAL_AUTH_MODE") or "allow_all").strip().lower() or "allow_all"
+MATERIAL_AUTH_MODE = "allow_all"
 OCR_TEXT_DENSITY_THRESHOLD = float(os.getenv("OCR_TEXT_DENSITY_THRESHOLD", "0.08"))
 OCR_LOW_CONFIDENCE_THRESHOLD = float(os.getenv("OCR_LOW_CONFIDENCE_THRESHOLD", "0.75"))
 OCR_MAX_PAGE_RETRIES = int(os.getenv("OCR_MAX_PAGE_RETRIES", "2"))
@@ -52,26 +44,12 @@ ALLOWED_MATERIAL_EXTENSIONS = {
 
 PLANS = [
     [
-        "1.理解用户需求",
-        "2.调用工具",
-        "3.分析工具结果",
-        "4.生成回答",
+        "理解用户需求,调用工具,生成回答",
     ],
     [
-        "1.你需要整理用户的需求，判断该调用什么工具",
-        "2.调用所需工具，尽可能多的获取所需信息",
-        "3.分析工具结果",
-        "4.此轮必须生成回答，并验证，重要信息有出处",
+        "你需要整理用户的需求，判断该调用什么工具,生成回答，并验证，重要信息有出处",
     ],
 ]
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
 
 # 默认走 DeepSeek；队友本地若只配置 NVIDIA，则自动切到 NVIDIA，互不影响。
 DEEPSEEK_KEY = os.getenv("DEEPSEEK_API_KEY")
@@ -89,6 +67,22 @@ else:
     API_KEY = None
     BASE_URL = "https://api.deepseek.com"
     MODEL_NAME = "deepseek-v4-flash"
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+PROMPT_VERSIONS = {
+    "extraction": "extract-v1",
+    "normalization":  "normalize-v1",
+    "clue_wording": "clue-v1",
+    "output_verify": "verify-v1",
+    "react_chat": "react-v1",
+    "task_react": "task-react-v1",
+}
 
 # 外呼关闭或网关不可达时进入「仅确定性规则」降级；Fake 供无外呼验证。
 DEEPSEEK_EXTERNAL_CALLS_ENABLED = _env_bool("DEEPSEEK_EXTERNAL_CALLS_ENABLED", True)
@@ -108,15 +102,6 @@ _EXTRA_MODELS = {
     if item.strip()
 }
 GATEWAY_MODEL_WHITELIST = frozenset(_DEFAULT_MODEL_WHITELIST | _EXTRA_MODELS)
-
-PROMPT_VERSIONS = {
-    "extraction": os.getenv("PROMPT_VERSION_EXTRACTION", "extract-v1"),
-    "normalization": os.getenv("PROMPT_VERSION_NORMALIZATION", "normalize-v1"),
-    "clue_wording": os.getenv("PROMPT_VERSION_CLUE", "clue-v1"),
-    "output_verify": os.getenv("PROMPT_VERSION_VERIFY", "verify-v1"),
-    "react_chat": os.getenv("PROMPT_VERSION_REACT", "react-v1"),
-    "task_react": os.getenv("PROMPT_VERSION_TASK_REACT", "task-react-v1"),
-}
 
 TASK_AGENT_MAX_ROUNDS = int(os.getenv("TASK_AGENT_MAX_ROUNDS", "12"))
 

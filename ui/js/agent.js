@@ -1,7 +1,6 @@
 /* ========================================
    agent.js — 真实后端耦合版
    从后端 SSE 流接收事件，驱动 UI
-   工作台有任务时走任务级 ReAct，否则走会话 /chat
    ======================================== */
 (function (global) {
     'use strict';
@@ -14,13 +13,6 @@
             if (options?.apiUrl) this.apiUrl = options.apiUrl;
         },
 
-        _endpoint() {
-            const taskId = global.Workbench && Workbench.task && Workbench.task.id;
-            if (taskId) return `/api/tasks/${taskId}/agent/chat`;
-            const convId = State.currentConversationId;
-            return `${this.apiUrl}/${convId}`;
-        },
-
         /**
          * 主入口：处理用户输入
          */
@@ -29,31 +21,41 @@
             const welcome = Utils.$('#welcome-screen');
             if (welcome) welcome.remove();
 
+            // 1. 渲染用户消息
             const userMsg = Message.renderUser(userInput);
             chatMessages.appendChild(userMsg);
 
+            // 2. 滚动到底部 + 显示状态栏
             this._showStatus('思考中...', 5);
             State.setAgentState('thinking');
 
+            // 3. 向后端发起流式请求
             await this._streamFromBackend(userInput);
 
+            // 4. 完成
             this._hideStatus();
             State.setAgentState('done');
             setTimeout(() => State.setAgentState('idle'), 2000);
-
-            if (global.Workbench && Workbench.task && typeof Workbench.openTask === 'function') {
-                try {
-                    await Workbench.openTask(Workbench.task.id, Workbench.activeTabId || null);
-                } catch (_) { /* ignore */ }
-            }
         },
 
+        /**
+         * 向后端发送 SSE 请求，解析事件并更新 UI
+         */
         async _streamFromBackend(userInput) {
             const chatMessages = Utils.$('#chat-messages');
+            // 从 Workbench 获取当前任务 ID，而非 State.currentConversationId
+            const taskId = global.Workbench?.task?.id || State.currentTaskId;
+            if (!taskId) {
+                console.error('No active task');
+                return;
+            }
+
+            let assistantWrap = null;
+            let assistantContent = null;
             let currentPlan = null;
 
             try {
-                const response = await fetch(this._endpoint(), {
+                const response = await fetch(`/chat/${taskId}`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ messages: [{ role: 'user', content: userInput }] })
@@ -64,17 +66,18 @@
                 const reader = response.body.getReader();
                 const decoder = new TextDecoder();
                 let buffer = '';
-                let currentThinking = null;
-                let currentToolCard = null;
-                let assistantWrap = null;
-                let assistantContent = null;
+                let currentThinking = null;   // 当前思考块 DOM
+                let currentToolCard = null;   // 当前工具卡片 DOM
 
                 while (true) {
                     const { done, value } = await reader.read();
                     if (done) break;
 
                     buffer += decoder.decode(value, { stream: true });
+
+                    // 按行分割 SSE（每行以 \n 结尾，空行表示事件结束，但后端是每行一个 data:）
                     const lines = buffer.split('\n');
+                    // 最后一行可能不完整，保留到下次
                     buffer = lines.pop();
 
                     for (const line of lines) {
@@ -90,6 +93,7 @@
                             continue;
                         }
 
+                        //console.log(event.type, event.content);
                         switch (event.type) {
                             case 'plan': {
                                 const planData = event.plan;
@@ -98,7 +102,7 @@
                                     steps: planData.steps.map((s, i) => ({
                                         title: s.title,
                                         description: s.description,
-                                        status: i === 0 ? 'running' : 'pending'
+                                        status: i === 0 ? 'running' : 'pending'  // 第一步设为 running
                                     }))
                                 });
                                 chatMessages.appendChild(currentPlan);
@@ -106,15 +110,17 @@
                                 break;
                             }
                             case 'thinking': {
+                                // 创建或更新思考块
                                 if (!currentThinking) {
                                     currentThinking = Thinking.create({
                                         title: '思考中...',
                                         steps: [{ text: event.content, status: 'active' }],
-                                        defaultExpanded: true
+                                        defaultExpanded: false
                                     });
                                     chatMessages.appendChild(currentThinking);
                                 }
                                 Thinking.appendText(currentThinking, event.content || '');
+
                                 this._updateProgress(20);
                                 break;
                             }
@@ -122,8 +128,9 @@
                             case 'tool_call': {
                                 if (currentThinking) {
                                     Thinking.setDone(currentThinking, '思考完成');
-                                    currentThinking = null;
+                                    currentThinking = null;  // 重置，避免重复调用
                                 }
+                                // 创建工具调用卡片
                                 const tool = event.tool || {};
                                 currentToolCard = ToolCall.create({
                                     type: tool.type === 'search' ? 'search' : 'code',
@@ -139,46 +146,43 @@
                             }
 
                             case 'tool_result': {
+                                // 更新工具卡片状态
                                 const tool = event.tool || {};
                                 if (currentToolCard) {
                                     const isSuccess = tool.status === 'success';
-                                    ToolCall.updateStatus(
-                                        currentToolCard,
-                                        isSuccess ? 'success' : 'error',
-                                        tool.result || ''
-                                    );
+                                    ToolCall.updateStatus(currentToolCard, isSuccess ? 'success' : 'error', tool.result || '');
                                     currentToolCard = null;
                                 }
-                                this._maybeArtifactFromToolResult(tool.result);
                                 this._updateProgress(60);
-                                break;
-                            }
-
-                            case 'artifact': {
-                                this._postArtifact(event.artifact_id, event.title, event.summary);
                                 break;
                             }
 
                             case 'text_delta': {
                                 if (currentThinking) {
                                     Thinking.setDone(currentThinking, '思考完成');
-                                    currentThinking = null;
+                                    currentThinking = null;  // 重置，避免重复调用
                                 }
+                                // 流式文本：首次需创建 AI 消息容器
                                 if (!assistantWrap) {
                                     const result = Message.renderAssistantContainer();
                                     assistantWrap = result.wrap;
                                     assistantContent = result.content;
                                     chatMessages.appendChild(assistantWrap);
                                 }
+                                // 追加文本（支持 Markdown）
                                 Message.appendDelta(assistantContent, event.text || '');
+                                // 触发滚动
                                 chatMessages.scrollTop = chatMessages.scrollHeight;
                                 break;
                             }
 
                             case 'done': {
-                                if (assistantContent && typeof Prism !== 'undefined') {
-                                    Prism.highlightAllUnder(assistantWrap);
+                                // 流结束，可做收尾
+                                if (assistantContent) {
+                                    // 触发语法高亮等
+                                    if (typeof Prism !== 'undefined') Prism.highlightAllUnder(assistantWrap);
                                 }
+                                // 更新计划：将当前 running 步骤设为 completed，下一步设为 running
                                 if (currentPlan) {
                                     const steps = currentPlan.querySelectorAll('.plan-step');
                                     let foundRunning = false;
@@ -192,49 +196,28 @@
                                         }
                                     });
                                 }
-                                assistantWrap = null;
-                                assistantContent = null;
-                                this._updateProgress(90);
+
+                                this._updateProgress(60);
                                 break;
                             }
 
                             default:
+                                // 忽略未知事件类型
                                 break;
                         }
                     }
                 }
+
             } catch (err) {
                 console.error('Agent stream error:', err);
+                // 显示错误消息
                 const { wrap, content } = Message.renderAssistantContainer();
                 chatMessages.appendChild(wrap);
                 content.innerHTML = `<div class="message-error">⚠️ 请求失败：${err.message}</div>`;
             }
         },
 
-        _maybeArtifactFromToolResult(raw) {
-            if (!raw || typeof raw !== 'string') return;
-            try {
-                const data = JSON.parse(raw);
-                if (data && data.artifact_id && data.ok !== false) {
-                    this._postArtifact(
-                        data.artifact_id,
-                        data.title || data.artifact_type,
-                        data.message || ''
-                    );
-                }
-            } catch (_) { /* ignore */ }
-        },
-
-        _postArtifact(artifactId, title, summary) {
-            if (!artifactId) return;
-            if (global.Workbench && typeof Workbench._postArtifactCard === 'function') {
-                Workbench._postArtifactCard(
-                    artifactId,
-                    title || '产物',
-                    summary || '点击打开中间预览'
-                );
-            }
-        },
+        /* ========== UI 辅助 ========== */
 
         _showStatus(text, progress) {
             const bar = Utils.$('#status-bar');

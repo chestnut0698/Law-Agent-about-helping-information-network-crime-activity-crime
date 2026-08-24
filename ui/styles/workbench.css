@@ -210,6 +210,7 @@ body,
     margin-top: 4px;
     padding: 0 4px;
     flex: 0 0 auto;
+    position: relative;
 }
 
 .wb-task-list {
@@ -256,6 +257,7 @@ body,
     cursor: pointer;
     flex: 0 0 auto;
     text-align: left;
+    position: relative
 }
 
 .wb-task-chip-abbr {
@@ -293,6 +295,31 @@ body,
 }
 
 .wb-task-chip.active .wb-task-chip-name { color: var(--wb-accent-strong); }
+
+.wb-task-del {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    width: 16px;
+    height: 16px;
+    line-height: 14px;
+    text-align: center;
+    font-size: 14px;
+    color: var(--text-muted, #999);
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s;
+    border-radius: 50%;
+}
+
+.wb-task-chip:hover .wb-task-del {
+    opacity: 1;
+}
+
+.wb-task-del:hover {
+    color: #fff;
+    background: var(--danger, #e74c3c);
+}
 
 .wb-rail-footer {
     display: flex;

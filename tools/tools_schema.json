@@ -244,41 +244,6 @@
   {
     "type": "function",
     "function": {
-      "name": "list_user_files",
-      "description": "递归列出当前会话目录下的所有文件（含子目录），返回文件名、相对路径、大小和后缀。",
-      "parameters": {
-        "type": "object",
-        "properties": {},
-        "required": []
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
-      "name": "read_any_file",
-      "description": "统一读取文件内容：文本文件直接返回文本，图片文件进行OCR返回文字，PDF文件提取文本（扫描页自动OCR）。支持子目录，通过 sub_path 参数指定。",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "filename": {
-            "type": "string",
-            "description": "文件名"
-          },
-          "sub_path": {
-            "type": "string",
-            "description": "可选，子目录相对路径，如 '证据/图片' 或 'subdir1/subdir2'，留空则读取根目录"
-          }
-        },
-        "required": [
-          "filename"
-        ]
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
       "name": "get_task_overview",
       "description": "查看当前监督分析任务的范围、案件、材料进度与已有产物清单。跨案分析开始前应先调用。",
       "parameters": {

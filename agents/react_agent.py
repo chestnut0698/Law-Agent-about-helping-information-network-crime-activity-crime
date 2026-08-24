@@ -1,12 +1,12 @@
 from agents.base_agent import *
-from agents.gateway import GatewayError
 from app.config import *
-from tools.tools import WORKSPACE_ONLY_TOOLS, tool_functions
 import inspect
 import json
+from tools.tools import *
 from pathlib import Path
+from app.tasks import get_task_service
 
-# ReAct（Reason + Act）：推理与工具调用交替；历史按 task_id 落 SQLite。
+# ReAct（Reason + Act）模式的核心思想——让 AI 交替进行"推理（Reason）"和"行动（Act）"，并通过观察（Observation）来驱动下一步。
 class ReactAgent(BaseAgent):
     def __init__(self, task_id=0):
         super().__init__()
@@ -22,8 +22,6 @@ class ReactAgent(BaseAgent):
             sig = inspect.signature(fn)
             if "task_id" in sig.parameters:
                 result = fn(**args, task_id=self.task_id)
-            elif "conv_id" in sig.parameters:
-                result = fn(**args, conv_id=self.task_id)
             else:
                 result = fn(**args)
             if data["function_name"] in WORKSPACE_ONLY_TOOLS:
@@ -37,23 +35,41 @@ class ReactAgent(BaseAgent):
         return result
 
     def switch_id(self, task_id):
-        if self.task_id == task_id and len(self.messages) > 1:
+        if self.task_id == task_id:
             return
 
-        from tools.tasks import get_task_service
-
-        rows = get_task_service().get_messages(task_id)
-        self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        # 直接从数据库加载新 task_id 的历史消息
+        from tools.files import db_session, _rows
+        with db_session() as conn:
+            rows = _rows(
+                conn,
+                "SELECT role, content, created_at FROM chat_messages "
+                "WHERE task_id = ? ORDER BY created_at ASC",
+                (task_id,)
+            )
+        self.messages = []
         for row in rows:
-            if row.get("role") in {"user", "assistant", "system", "tool"}:
-                self.messages.append({"role": row["role"], "content": row["content"]})
+            msg = {"role": row["role"], "content": row["content"]}
+            if row.get("tool_call_id"):
+                msg["tool_call_id"] = row["tool_call_id"]
+            if row.get("metadata_json"):
+                try:
+                    meta = json.loads(row.get("metadata_json"))
+                    if meta:
+                        msg["tool_calls"] = meta
+                except:
+                    pass
+            self.messages.append(msg)
+
         self.task_id = task_id
 
     def chat(self, user_input):
         """
         流式对话：添加用户消息 → 获取流式响应 → 逐块 yield 回复内容
+        自动将最终完整回复追加到历史中
         """
         self.messages.append({"role": "user", "content": user_input})
+
 
         plan_steps = []
         if PLANS:
@@ -80,17 +96,7 @@ class ReactAgent(BaseAgent):
                 }
             )
             while 1:
-                try:
-                    stream = self.llm_call()
-                except GatewayError as exc:
-                    notice = (
-                        "当前处于仅确定性规则模式，模型对话暂不可用。"
-                        if exc.degraded
-                        else f"模型网关错误：{exc.message}"
-                    )
-                    yield ("content", notice)
-                    self.messages.append({"role": "assistant", "content": notice})
-                    break
+                stream = self.llm_call()
 
                 collected_content = ""
                 tool_calls_buffer = {}
@@ -157,4 +163,35 @@ class ReactAgent(BaseAgent):
                     )
                     self.messages += messages_tool_return
 
+            # 在循环结束后，保存消息到数据库
+            self.save_messages_to_db()
             yield ("done", {})
+
+    def save_messages_to_db(self):
+        """将 self.messages 中未持久化的消息保存到数据库"""
+        task_service = get_task_service()
+        existing = task_service.get_messages(self.task_id)
+
+        # 使用 (role, content, tool_call_id) 三元组去重
+        existing_set = {
+            (m["role"], m["content"], m.get("tool_call_id", ""))
+            for m in existing
+        }
+
+        for msg in self.messages:
+            # 跳过系统消息（可选）
+            if msg["role"] == "system":
+                continue
+
+            key = (msg["role"], msg["content"], msg.get("tool_call_id", ""))
+            if key not in existing_set:
+                # 保存完整消息，包括 tool_call_id 和 tool_calls
+                task_service.save_message(
+                    self.task_id,
+                    msg["role"],
+                    msg["content"],
+                    tool_call_id=msg.get("tool_call_id"),
+                    metadata={"tool_calls": msg.get("tool_calls")} if msg.get("tool_calls") else None,
+
+                )
+                existing_set.add(key)

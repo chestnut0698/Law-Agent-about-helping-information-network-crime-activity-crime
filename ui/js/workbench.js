@@ -56,6 +56,7 @@
             if (!list) return;
             list.innerHTML = '';
             if (history) history.innerHTML = '';
+
             const tasks = this.tasks || [];
             const recent = tasks.slice(0, 5);
             const older = tasks.slice(5);
@@ -83,6 +84,42 @@
                 Utils.create('span', { class: 'wb-task-chip-name', text: task.title || '未命名任务' })
             ]);
             chip.addEventListener('click', () => this.openTask(task.id));
+
+            // ★ 添加删除按钮
+            const delBtn = Utils.create('span', {
+                class: 'wb-task-del',
+                text: '×',
+                title: '删除任务'
+            });
+            delBtn.addEventListener('click', async (e) => {
+                e.stopPropagation();
+                if (!confirm(`确定删除任务「${task.title}」？\n该任务下的所有材料也将一并删除。`)) return;
+                try {
+                    const resp = await fetch(`/api/tasks/${task.id}`, { method: 'DELETE' });
+                    const data = await resp.json();
+                    if (data.error_code) {
+                        Toast.error(data.message || '删除失败');
+                        return;
+                    }
+                    Toast.success('任务已删除');
+                    // 如果删除的是草稿任务，重置 draftTaskId
+                    if (this.draftTaskId === task.id) {
+                        this.draftTaskId = null;
+                    }
+
+                    if (this.task && this.task.id === task.id) {
+                        this.task = null;
+                        State.currentTaskId = null;
+                        Utils.$('#wb-workspace').hidden = true;
+                        this.showStart();
+                    }
+                    await this.loadTasks();
+                } catch (err) {
+                    Toast.error('删除失败：' + err.message);
+                }
+            });
+            chip.appendChild(delBtn);
+
             return chip;
         },
 
@@ -222,11 +259,11 @@
             const cases = Utils.$$('.wb-case-row input[type="text"]')
                 .map(i => i.value.trim())
                 .filter(Boolean)
-                .map(name => ({ name }));
+                .map(name => ({ name }));  // 返回对象数组
             return {
                 title: (Utils.$('#wb-title') || {}).value || '',
                 purpose: (Utils.$('#wb-purpose') || {}).value || '',
-                authorized_until: (Utils.$('#wb-until') || {}).value || '',
+                authorized_until: (Utils.$('#wb-until') || {}).value || '',  // 字段名改为 authorized_until
                 cases
             };
         },
@@ -259,7 +296,7 @@
                 button.textContent = '正在生成计划…';
             }
             try {
-                const editing = Boolean(this.draftTaskId);
+                const editing = this.draftTaskId && this.tasks.some(t => t.id === this.draftTaskId);
                 const url = editing ? `/api/tasks/${this.draftTaskId}/scope` : '/api/tasks';
                 const resp = await fetch(url, {
                     method: editing ? 'PATCH' : 'POST',
@@ -273,6 +310,10 @@
                 }
                 this.draftTaskId = data.task.id;
                 this.task = data.task;
+
+                this.tasks.unshift(data.task);
+                this._renderRail();
+
                 await this._uploadStartFiles(data.task);
                 await this._transitionToDraftWorkspace(
                     data.task.id,
@@ -398,15 +439,12 @@
 
         /** 每个任务绑定自己的智能体会话：聊天历史随任务走，而不是随一次性对话 */
         async _bindConversation(task) {
-            State.taskBoundConversation = true;
-            State.currentConversationId = task.id;
-            if (!State.conversations.find(c => c.id === task.id)) {
-                State.conversations.unshift({ id: task.id, title: task.title, time: '刚刚' });
-            }
+            // 直接从数据库加载该任务的历史聊天记录
             const messages = Utils.$('#chat-messages');
             if (messages) messages.innerHTML = '';
+
             try {
-                const response = await fetch(`/conversations/${task.id}/messages`);
+                const response = await fetch(`/chat/${task.id}/messages`);
                 const data = await response.json();
                 (data.messages || []).forEach(msg => {
                     if (!messages) return;
@@ -419,7 +457,7 @@
                     }
                 });
             } catch (_) {
-                // 新任务还没有聊天消息时保持空白，由计划卡接管首屏。
+                // 新任务还没有聊天消息时保持空白
             }
         },
 
@@ -1511,6 +1549,8 @@
             messages.appendChild(card);
             messages.scrollTop = messages.scrollHeight;
         }
+
+
     };
 
     global.Workbench = Workbench;

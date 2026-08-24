@@ -62,37 +62,17 @@
             const text = this.textarea.value.trim();
             if (!text || State.agentState === 'thinking' || State.agentState === 'working') return;
 
-            // 先上传待发送的文件
-            const uploadedFiles = await FileUpload.uploadPending();
-
-
-            if (!State.currentConversationId || !State.conversations.find(c => c.id === State.currentConversationId)) {
-                // 静默创建一个新对话（不弹出 toast）
-                await Sidebar._createNewConversation(true);
-                // 注意：_createNewConversation 是 async 的，会更新 State
+            // 新架构：必须有当前任务才能发送消息
+            const taskId = global.Workbench?.task?.id || State.currentTaskId;
+            if (!taskId) {
+                Toast.warning('请先打开一个监督分析任务');
+                return;
             }
+
             // 清空输入
             this.textarea.value = '';
             this.textarea.style.height = 'auto';
             this.sendBtn.disabled = true;
-
-            // 更新会话标题（取前 20 字）
-            const conv = State.conversations.find(c => c.id === State.currentConversationId);
-            if (conv && conv.title === '新对话') {
-                const newTitle = text.length > 20 ? text.slice(0, 20) + '...' : text;
-                try {
-                    await fetch(`/conversations/${conv.id}`, {
-                        method: 'PATCH',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ title: newTitle })
-                    });
-                    conv.title = newTitle;
-                    conv.time = '刚刚';
-                    Sidebar._renderConversationList();  // 刷新侧边栏
-                } catch (e) {
-                    console.warn('Failed to rename conversation:', e);
-                }
-            }
 
             // 调用 Agent 处理
             try {

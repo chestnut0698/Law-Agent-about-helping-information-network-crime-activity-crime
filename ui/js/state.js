@@ -20,14 +20,6 @@
     const State = {
         // 会话/任务：工作台以 task_id 为主；兼容旧字段名 currentConversationId
         currentTaskId: null,
-        get currentConversationId() {
-            return this.currentTaskId;
-        },
-        set currentConversationId(value) {
-            this.currentTaskId = value;
-        },
-        conversations: [
-        ],
 
         // 模型
         currentModel: 'deepseek-v4-flash',
@@ -44,32 +36,9 @@
         theme: safeStorage.getItem('agent-theme')
             || (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'),
         sidebarCollapsed: false,
-        taskBoundConversation: false,
 
-        // 消息列表（当前会话）
-        get messages() {
-            const conv = this.conversations.find(c => c.id === this.currentConversationId);
-            return conv ? conv.messages : [];
-        },
 
         // 工具方法
-        addMessage(role, content, extra) {
-            const msg = {
-                id: Date.now() + Math.random(),
-                role,
-                content,
-                timestamp: new Date().toISOString(),
-                ...extra
-            };
-            this.messages.push(msg);
-            return msg;
-        },
-
-        updateMessage(id, updates) {
-            const msg = this.messages.find(m => m.id === id);
-            if (msg) Object.assign(msg, updates);
-        },
-
         setAgentState(state) {
             this.agentState = state;
             Events.emit('agent:state-change', state);
