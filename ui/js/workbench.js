@@ -1386,10 +1386,40 @@
             const refresh = Utils.create('button', { class: 'wb-btn wb-btn-ghost', text: '刷新进度' });
             refresh.addEventListener('click', () => this._refreshBatch());
 
-            return Utils.create('div', { class: 'wb-upload-box' }, [
+            const box = Utils.create('div', { class: 'wb-upload-box' }, [
                 Utils.create('span', { class: 'wb-file-meta', text: '材料必须归属案件：' }),
                 select, input, btn, refresh
             ]);
+
+            // 拖拽上传支持
+            let dragCounter = 0;
+            box.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                box.classList.add('wb-upload-dragover');
+            });
+            box.addEventListener('dragleave', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                dragCounter--;
+                if (dragCounter <= 0) {
+                    dragCounter = 0;
+                    box.classList.remove('wb-upload-dragover');
+                }
+            });
+            box.addEventListener('drop', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                box.classList.remove('wb-upload-dragover');
+                dragCounter = 0;
+                const files = e.dataTransfer.files;
+                if (files && files.length > 0) {
+                    // 拖拽文件自动上传到当前选中的案件
+                    this._uploadMaterials(select.value, files, null);
+                }
+            });
+
+            return box;
         },
 
         async _executeAnalysis(button) {
