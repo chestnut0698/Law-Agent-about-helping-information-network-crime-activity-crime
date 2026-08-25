@@ -130,15 +130,28 @@ async def material_delete_impact(
         return material_error_response(exc)
 
 
-@app.delete("/api/materials/documents/{document_id}")
+@app.delete("/api/tasks/{task_id}/materials/{document_id}")
 async def delete_material(
-    document_id: str,
-    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+        task_id: str,
+        document_id: str,
+        x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
     try:
-        return get_material_service().logical_delete(document_id, user_id=x_user_id)
+        # 1. 软删除材料
+        result = get_material_service().logical_delete(document_id, user_id=x_user_id)
+
+        # 2. ★ 刷新材料批次（重新生成 MATERIAL_BATCH 产物）
+        batch = get_task_service().refresh_material_batch(task_id, user_id=x_user_id)
+
+        return {
+            "status": "DELETED",
+            "batch_artifact_id": batch["id"],  # 前端会用这个 ID 打开新批次
+            **result
+        }
     except MaterialError as exc:
         return material_error_response(exc)
+    except TaskError as exc:
+        return task_error_response(exc)
 
 
 @app.post("/api/materials/documents/{document_id}/duplicate")
@@ -375,8 +388,6 @@ async def chat(request: Request, task_id):
             "WHERE task_id = ? ORDER BY created_at ASC",
             (task_id,)
         )
-    if not rows:
-        get_task_service().save_message(task_id, "system", TASK_AGENT_PROMPT)
 
     # 查询任务详情，构建系统上下文
     task = get_task_service().get_task(task_id)
@@ -394,8 +405,10 @@ async def chat(request: Request, task_id):
     # 提取最后一条用户消息
     user_message = messages[-1]["content"] if messages else ""
 
-    # 保存消息
-    get_task_service().save_message(task_id, "system", system_context)
+    # 保存消息,只在第一句添加
+    if not rows:
+        get_task_service().save_message(task_id, "system", TASK_AGENT_PROMPT)
+        get_task_service().save_message(task_id, "system", f"监督目的：{task['purpose']}\n")
 
 
     async def event_stream():

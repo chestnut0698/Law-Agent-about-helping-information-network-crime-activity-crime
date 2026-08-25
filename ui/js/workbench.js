@@ -402,9 +402,8 @@
             this._renderContext();
             this._renderDirectory();
             this._syncRailCollapseAvailability();
+            this._renderPanel();
 
-            const target = artifactId || this._defaultArtifactId();
-            if (target) await this.openArtifact(target);
             if (task.status === 'SCOPE_DRAFT') {
                 this.draftTaskId = task.id;
                 const planResp = await fetch(`/api/tasks/${task.id}/plan`);
@@ -646,7 +645,25 @@
             panel.innerHTML = '';
             const tab = this.tabs.find(t => t.id === this.activeTabId);
             if (!tab) {
-                panel.appendChild(Utils.create('div', { class: 'wb-empty', text: '从左侧任务目录打开一个产物' }));
+                if (!this.task) {
+                    panel.appendChild(Utils.create('div', { class: 'wb-empty', text: '从左侧任务目录打开一个产物' }));
+                    return;
+                }
+                const batch = (this.task.artifacts || []).find(a => a.type === 'MATERIAL_BATCH');
+                if (batch) {
+                    panel.appendChild(Utils.create('div', { class: 'wb-empty', text: '加载材料批次…' }));
+                    fetch(`/api/tasks/${this.task.id}/artifacts/${batch.id}`)
+                        .then(r => r.json())
+                        .then(data => {
+                            panel.innerHTML = '';
+                            if (data.payload) {
+                                this._renderMaterialBatch(panel, data.payload);
+                            }
+                        })
+                        .catch(() => {});
+                } else {
+                    panel.appendChild(this._uploadBox());
+                }
                 return;
             }
             const { artifact, payload, version, status } = tab.data;

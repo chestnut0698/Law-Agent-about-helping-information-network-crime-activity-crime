@@ -43,7 +43,7 @@ class ReactAgent(BaseAgent):
         with db_session() as conn:
             rows = _rows(
                 conn,
-                "SELECT role, content, created_at FROM chat_messages "
+                "SELECT role, content, tool_call_id, metadata_json FROM chat_messages "
                 "WHERE task_id = ? ORDER BY created_at ASC",
                 (task_id,)
             )
