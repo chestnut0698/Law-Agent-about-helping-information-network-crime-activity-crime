@@ -129,6 +129,37 @@ async def material_delete_impact(
     except MaterialError as exc:
         return material_error_response(exc)
 
+@app.get("/api/materials/{document_id}/preview")
+async def preview_material(
+    document_id: str,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    from tools.files import db_session, _rows
+
+    with db_session() as conn:
+        rows = _rows(conn, """
+            SELECT c.text_redacted, c.ordinal
+            FROM document_chunks c
+            JOIN document_versions v ON v.id = c.document_version_id
+            JOIN documents d ON d.id = v.document_id
+            WHERE d.id = ?
+              AND d.deleted_at IS NULL
+              AND v.is_current = 1
+              AND v.is_active = 1
+              AND c.is_active = 1
+              AND IFNULL(c.stale, 0) = 0
+            ORDER BY c.ordinal
+        """, (document_id,))
+
+        full_text = "\n".join(row['text_redacted'] or '' for row in rows)
+
+        return JSONResponse(content={
+            'ok': True,
+            'document_id': document_id,
+            'text': full_text,
+            'chunk_count': len(rows)
+        })
+
 
 @app.delete("/api/tasks/{task_id}/materials/{document_id}")
 async def delete_material(

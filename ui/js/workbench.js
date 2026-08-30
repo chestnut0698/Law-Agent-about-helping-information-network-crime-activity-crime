@@ -712,6 +712,7 @@
             else if (artifact.type === 'CLUE_SET') this._renderClueSet(main, payload);
             else if (artifact.type === 'CLUE_ITEM') this._renderClueItem(main, payload);
             else if (artifact.type === 'ROLE_TIMELINE') this._renderRoleTimeline(main, payload);
+            else if (artifact.type === 'MATERIAL_DOC') this._renderMaterialDoc(main, artifact, payload);
             else this._renderGeneric(main, payload);
         },
 
@@ -1284,7 +1285,58 @@
             panel.appendChild(chart);
         },
 
+        async _renderMaterialDoc(panel, artifact, payload) {
+            // 从 artifact 或 payload 中获取 document_id
+            const documentId = artifact.ref_key || (payload && payload.document_id);
+            if (!documentId) {
+                panel.appendChild(Utils.create('div', { class: 'wb-empty', text: '缺少材料标识，无法加载内容' }));
+                return;
+            }
+
+            // 显示加载状态
+            const loading = Utils.create('div', { class: 'wb-empty', text: '正在加载脱敏内容…' });
+            panel.appendChild(loading);
+
+            try {
+                const resp = await fetch(`/api/materials/${documentId}/preview`);
+                const data = await resp.json();
+
+                panel.removeChild(loading);
+
+                if (!data.ok) {
+                    panel.appendChild(Utils.create('div', { class: 'wb-callout warn', text: data.error || '获取内容失败' }));
+                    return;
+                }
+
+                // 显示文件名和元信息
+                const head = Utils.create('div', { class: 'wb-panel-head' }, [
+                    Utils.create('div', { class: 'wb-panel-sub', text: `脱敏全文 · ${data.chunk_count} 个片段` })
+                ]);
+                panel.appendChild(head);
+
+                // 脱敏文本主体
+                const pre = Utils.create('pre', {
+                    style: 'white-space: pre-wrap; word-break: break-word; padding: 16px; background: #f8f9fa; border-radius: 6px; font-size: 13px; line-height: 1.7; max-height: calc(100vh - 250px); overflow-y: auto; margin-top: 12px;'
+                });
+                pre.textContent = data.text;
+                panel.appendChild(pre);
+
+                // 底部提示
+                panel.appendChild(Utils.create('div', {
+                    class: 'wb-file-meta',
+                    text: '以上内容已脱敏，与智能体看到的一致。',
+                    style: 'margin-top: 8px; text-align: right;'
+                }));
+
+            } catch (err) {
+                panel.removeChild(loading);
+                panel.appendChild(Utils.create('div', { class: 'wb-callout warn', text: '网络错误：' + err.message }));
+            }
+        },
+
         _materialRow(row) {
+            const docId = row.document_id;
+
             const status = row.status || 'UPLOADED';
             const attention = ATTENTION.includes(status);
             const stageIndex = STAGE_ORDER.indexOf(status);
@@ -1310,10 +1362,10 @@
             });
             del.addEventListener('click', (e) => {
                 e.stopPropagation();
-                this._deleteMaterial(row.document_id);
+                this._deleteMaterial(docId);
             });
 
-            return Utils.create('div', { class: 'wb-file-row' }, [
+            const rowEl = Utils.create('div', { class: 'wb-file-row' }, [
                 Utils.create('div', { class: 'wb-file-type', text: ext }),
                 Utils.create('div', {}, [
                     Utils.create('div', { class: 'wb-file-name', text: row.filename || '未命名' }),
@@ -1329,6 +1381,21 @@
                 Utils.create('div', { class: 'wb-file-status', text: STAGE_TEXT[status] || status }),
                 del
             ]);
+
+            rowEl.style.cursor = 'pointer';
+            rowEl.addEventListener('click', (e) => {
+                if (e.target.closest('.wb-file-del')) return;
+                const docArtifact = (this.task.artifacts || []).find(
+                    a => a.type === 'MATERIAL_DOC' && a.ref_key === docId
+                );
+                if (docArtifact) {
+                    this.openArtifact(docArtifact.id);
+                } else {
+                    Toast.warning('该材料尚未生成独立产物视图');
+                }
+            });
+
+            return rowEl
         },
 
         async _deleteMaterial(documentId) {
