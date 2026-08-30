@@ -1,4 +1,4 @@
-from tools.files import redact_text
+from app.files import redact_text
 
 
 SAMPLE = """

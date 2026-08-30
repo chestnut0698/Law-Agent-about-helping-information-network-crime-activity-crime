@@ -7,7 +7,7 @@ from agents.react_agent import *
 from typing import Optional
 import json
 from app.config import REPO_ROOT
-from tools.files import MaterialError, get_material_service, init_db
+from app.files import MaterialError, get_material_service, init_db
 from app.tasks import TaskError, get_task_service, init_task_db
 
 
@@ -20,6 +20,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 数据库初始化
 init_db()
 init_task_db()
 
@@ -134,7 +135,7 @@ async def preview_material(
     document_id: str,
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
-    from tools.files import db_session, _rows
+    from app.files import db_session, _rows
 
     with db_session() as conn:
         rows = _rows(conn, """
@@ -395,7 +396,7 @@ async def apply_artifact_impact(task_id: str, artifact_id: str, payload: dict | 
 @app.get("/chat/{task_id}/messages")
 async def get_chat_history(task_id: str):
     """获取任务的历史聊天记录"""
-    from tools.files import db_session, _rows
+    from app.files import db_session, _rows
     with db_session() as conn:
         rows = _rows(
             conn,
@@ -411,7 +412,7 @@ async def chat(request: Request, task_id):
     data = await request.json()
     messages = data.get("messages", [])
     # 首句注入系统提示词
-    from tools.files import db_session, _rows
+    from app.files import db_session, _rows
     with db_session() as conn:
         rows = _rows(
             conn,

@@ -9,7 +9,7 @@ from conftest import (
     make_text_pdf,
     make_txt,
 )
-from tools.files import (
+from app.files import (
     ERROR_CODES,
     FallbackOCREngine,
     MaterialError,
@@ -130,7 +130,7 @@ def test_unsupported_type(svc, tmp_path):
 
 
 def test_agent_tools_redacted_only(svc, tmp_path, monkeypatch):
-    from tools import files as material_files
+    from app import files as material_files
 
     monkeypatch.setattr(material_files, "_default_service", svc)
     p = make_txt(tmp_path / "t.txt", "嫌疑人手机13812345678")

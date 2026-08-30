@@ -1,7 +1,6 @@
 from agents.base_agent import *
 from app.config import *
 import inspect
-import json
 from tools.tools import *
 from pathlib import Path
 from app.tasks import get_task_service
@@ -39,7 +38,7 @@ class ReactAgent(BaseAgent):
             return
 
         # 直接从数据库加载新 task_id 的历史消息
-        from tools.files import db_session, _rows
+        from app.files import db_session, _rows
         with db_session() as conn:
             rows = _rows(
                 conn,

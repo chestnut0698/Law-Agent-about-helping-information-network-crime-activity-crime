@@ -7,40 +7,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv()
 
 
-DATABASE_PATH = Path(
-    os.getenv("DATABASE_PATH", str(REPO_ROOT / "data" / "database" / "law_agent.db"))
-)
+DATABASE_PATH = Path(str(REPO_ROOT / "data" / "database" / "law_agent.db"))
 DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-MATERIAL_STORAGE_DIR = Path(
-    os.getenv("MATERIAL_STORAGE_DIR", str(REPO_ROOT / "data" / "storage" / "materials"))
-)
+MATERIAL_STORAGE_DIR = Path(str(REPO_ROOT / "data" / "storage" / "materials"))
 MATERIAL_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
-REDACTION_STORAGE_DIR = Path(
-    os.getenv(
-        "REDACTION_STORAGE_DIR",
-        str(REPO_ROOT / "data" / "storage" / "redaction_maps"),
-    )
-)
+REDACTION_STORAGE_DIR = Path(str(REPO_ROOT / "data" / "storage" / "redaction_maps"))
 REDACTION_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
-MATERIAL_AUTH_MODE = "allow_all"
-OCR_TEXT_DENSITY_THRESHOLD = float(os.getenv("OCR_TEXT_DENSITY_THRESHOLD", "0.08"))
-OCR_LOW_CONFIDENCE_THRESHOLD = float(os.getenv("OCR_LOW_CONFIDENCE_THRESHOLD", "0.75"))
-OCR_MAX_PAGE_RETRIES = int(os.getenv("OCR_MAX_PAGE_RETRIES", "2"))
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "800"))
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "120"))
-PARSER_VERSION = os.getenv("PARSER_VERSION", "stage3-v1")
-ALLOWED_MATERIAL_EXTENSIONS = {
-    ".pdf",
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".docx",
-    ".txt",
-}
 
 PLANS = [
     [
@@ -61,7 +36,7 @@ if DEEPSEEK_KEY:
     MODEL_NAME = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
 elif NVIDIA_KEY:
     API_KEY = NVIDIA_KEY
-    BASE_URL = os.getenv("LLM_BASE_URL", "https://integrate.api.nvidia.com/v1")
+    BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
     MODEL_NAME = os.getenv("MODEL_NAME", "meta/muse-glimmer-30b")
 else:
     API_KEY = None
@@ -117,14 +92,13 @@ SYSTEM_PROMPT = """你是链证智析的受控助手，只协助查阅已脱敏�
 请勿将案件ID等类似代码输出到对话当中，回答应当适用于普通用户。
 """
 
-TASK_AGENT_PROMPT = """你是「链证智析」监督分析任务智能体，当前绑定任务 ID：{task_id}。
-你通过 DeepSeek 自主思考并调用工具完成跨案分析；不要假设前端会替你跑流水线。
-请勿将案件ID等类似代码输出到对话当中，回答应当适用于普通用户。
+TASK_AGENT_PROMPT = """你是「链证智析」监督分析任务智能体，你应当自主思考并调用工具完成跨案分析；不要假设前端会替你跑流水线。
+请勿将案件ID等类似长串代码输出到对话当中，回答应当适用于普通大众用户。
 
 
 1. 先想清楚缺什么信息，再调工具；根据观察决定下一步。
 2. 完整跨案分析通常需要：概览 →（必要时确认计划）→ 碰撞 → 时间线 → 线索，但你可按材料状态调整顺序或跳过。
-3. 工具返回含 artifact_id 时，在最终回答中明确提示用户打开该产物核验。
+3. 工具返回含 artifact_id 时，在最终回答中明确提示用户打开该产物核验，但是不用返回id数值。
 4. 碰撞/规则内部的 Luhn、掩码排除、quote_hash 校验由工具保证；你不要编造标识或原文。
 
 硬性边界：

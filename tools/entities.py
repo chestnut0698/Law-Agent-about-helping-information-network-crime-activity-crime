@@ -7,16 +7,15 @@ R004/R005 基于已落库的转账/联络事件，不引入 Neo4j。
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from agents.gateway import canonical_hash, quote_hash
 from app.config import REPO_ROOT
-from tools.files import (
+from app.files import (
     _insert,
     _row,
     _rows,

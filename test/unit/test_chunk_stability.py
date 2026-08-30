@@ -1,4 +1,4 @@
-from tools.files import build_chunks
+from app.files import build_chunks
 
 
 def test_chunk_ids_stable_across_runs():
