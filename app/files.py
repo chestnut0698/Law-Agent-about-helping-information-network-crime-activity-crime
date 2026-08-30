@@ -18,9 +18,40 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional, Protocol
+from prikit import PDFAnonymizer
+from presidio_analyzer import AnalyzerEngine
+from presidio_analyzer.nlp_engine import NlpEngineProvider
+from presidio_analyzer import RecognizerResult
 
 from app.config import DATABASE_PATH,MATERIAL_STORAGE_DIR,REDACTION_STORAGE_DIR
 
+
+# PriKit/Presidio 实体类型 → 内部 sens_type 映射
+PRIKIT_ENTITY_MAP = {
+    "PERSON": "name",
+    "PHONE_NUMBER": "phone",
+    "ID": "id_card",
+    "CREDIT_CARD": "bank_card",
+    "LOCATION": "address",
+    "EMAIL_ADDRESS": "email",
+    "IP_ADDRESS": "ip",
+    "URL": "url",
+    "DATE_TIME": "datetime",
+    "NRP": "nrp",
+    "CRYPTO": "crypto",
+    "IBAN_CODE": "iban",
+}
+
+# 各实体类型的置信度阈值
+CONFIDENCE_THRESHOLD = {
+    "name": 0.6,       # NLP 识别，阈值低一些
+    "address": 0.6,
+    "phone": 0.85,     # 正则为主，阈值高
+    "id_card": 0.9,
+    "bank_card": 0.9,
+    "email": 0.9,
+    "ip": 0.9,
+}
 # 允许上传的材料文件扩展名列表
 ALLOWED_MATERIAL_EXTENSIONS = {
     ".pdf",
@@ -235,13 +266,21 @@ CREATE TABLE IF NOT EXISTS material_audit_events (
     created_at DATETIME NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS entity_global_map (
+    fingerprint VARCHAR(64) PRIMARY KEY,
+    anonymous_id VARCHAR(48) NOT NULL UNIQUE,
+    sens_type VARCHAR(24) NOT NULL,
+    task_id VARCHAR(36) NOT NULL DEFAULT '',
+    first_seen_at DATETIME NOT NULL,
+    last_seen_at DATETIME NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_documents_case ON documents(case_id);
 CREATE INDEX IF NOT EXISTS idx_versions_document ON document_versions(document_id);
 CREATE INDEX IF NOT EXISTS idx_pages_version ON document_pages(document_version_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_version ON document_chunks(document_version_id);
 CREATE INDEX IF NOT EXISTS idx_redaction_version ON redaction_items(document_version_id);
 """
-
 
 def new_id() -> str:
     return str(uuid.uuid4())
@@ -256,7 +295,6 @@ def get_connection(db_path=None) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
-
 
 def init_db(db_path=None) -> None:
     """建表并补齐旧库缺失的列，可重复执行。"""
@@ -474,41 +512,103 @@ def _default_auth():
     mode = (MATERIAL_AUTH_MODE or "").strip().lower() or "allow_all"
     return allow_all_auth if mode == "allow_all" else deny_all_auth
 
+class GlobalEntityMapper:
+    """全局实体映射器：指纹 → 匿名ID（单向，不可逆）。"""
+
+    def __init__(self, db_path=None, salt: str = "default-salt-change-me"):
+        self.db_path = db_path
+        self.salt = salt
+
+    def _fingerprint(self, original: str) -> str:
+        return hashlib.sha256(f"{original}{self.salt}".encode()).hexdigest()
+
+    def _new_anonymous_id(self, sens_type: str) -> str:
+        short_uuid = uuid.uuid4().hex[:8]
+        return f"{sens_type.upper()}_{short_uuid}"
+
+    def delete_by_task_id(self, task_id: str) -> int:
+        """删除指定任务的所有实体映射记录，返回删除的行数。"""
+        conn = get_connection(self.db_path)
+        try:
+            cursor = conn.execute(
+                "DELETE FROM entity_global_map WHERE task_id = ?",
+                (task_id,)
+            )
+            conn.commit()
+            return cursor.rowcount
+        finally:
+            conn.close()
+
+    def get_or_create(self, original: str, sens_type: str, task_id: str = "") -> str:
+        fp = self._fingerprint(original)
+        conn = get_connection(self.db_path)
+        try:
+            row = conn.execute(
+                "SELECT anonymous_id FROM entity_global_map WHERE fingerprint = ?",
+                (fp,)
+            ).fetchone()
+            if row:
+                # 更新 last_seen_at，同时确保 task_id 被记录（如果原来为空则补充）
+                conn.execute(
+                    "UPDATE entity_global_map SET last_seen_at = ?, task_id = COALESCE(NULLIF(task_id,''), ?) WHERE fingerprint = ?",
+                    (utc_now(), task_id, fp)
+                )
+                conn.commit()
+                return row[0]
+
+            anon_id = self._new_anonymous_id(sens_type)
+            now = utc_now()
+            conn.execute(
+                "INSERT INTO entity_global_map (fingerprint, anonymous_id, sens_type, task_id, first_seen_at, last_seen_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (fp, anon_id, sens_type, task_id, now, now)
+            )
+            conn.commit()
+            return anon_id
+        finally:
+            conn.close()
+
 
 # ---------- 敏感信息检测与脱敏 ----------
 
 REDACTION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    (
-        "id_card",
-        re.compile(
-            r"(?<!\d)([1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])"
-            r"(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx])(?!\d)"
-        ),
-    ),
+    # 身份证（不变）
+    ("id_card", re.compile(
+        r"(?<!\d)([1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])"
+        r"(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx])(?!\d)"
+    )),
+    # 银行卡：去掉18位排除，匹配15~19位纯数字或带分隔符的格式
     ("bank_card", re.compile(
         r"(?<!\d)("
-        r"[1-9]\d{15,18}"
+        r"[1-9]\d{14,18}"                      # 纯数字15~19位
         r"|"
-        r"[1-9]\d{3}(?:[\s\-_.／/]+\d{4}){2,3}(?:[\s\-_.／/]+\d{1,4})?"
+        r"[1-9]\d{3}(?:[\s\-_.／/]+\d{4}){2,3}(?:[\s\-_.／/]+\d{1,4})?"  # 带分隔符
         r")(?!\d)"
     )),
+    # 手机号（不变）
     ("phone", re.compile(r"(?<!\d)(1[3-9]\d{9})(?!\d)")),
+    # IMEI（不变）
     ("imei", re.compile(r"(?<!\d)(\d{15})(?!\d)")),
+    # IP（不变）
     ("ip", re.compile(r"(?<!\d)((?:\d{1,3}\.){3}\d{1,3})(?!\d)")),
-    (
-        "account",
-        re.compile(r"(?i)(?:账号|帐户|账户|user(?:name)?|login)[:：\s]*([A-Za-z0-9_.-]{4,32})"),
-    ),
-    (
-        "address",
-        re.compile(
-            r"([\u4e00-\u9fff]{2,10}(?:省|市|自治区|特别行政区))?"
-            r"[\u4e00-\u9fff]{1,10}(?:市|州|盟)?"
-            r"[\u4e00-\u9fff]{1,12}(?:区|县|旗)"
-            r"[\u4e00-\u9fff0-9\-号弄幢栋单元室楼]{0,30}"
-        ),
-    ),
-    ("name", re.compile(r"(?:姓名|被告人|嫌疑人|当事人)[:：\s]*([\u4e00-\u9fff·]{2,4})")),
+    # 账号（不变）
+    ("account", re.compile(r"(?i)(?:账号|帐户|账户|user(?:name)?|login)[:：\s]*([A-Za-z0-9_.-]{4,32})")),
+    # 地址（不变）
+    ("address", re.compile(
+        r"([\u4e00-\u9fff]{2,10}(?:省|市|自治区|特别行政区))?"
+        r"[\u4e00-\u9fff]{1,10}(?:市|州|盟)?"
+        r"[\u4e00-\u9fff]{1,12}(?:区|县|旗)"
+        r"[\u4e00-\u9fff0-9\-号弄幢栋单元室楼]{0,30}"
+    )),
+    # 姓名：扩充关键词前缀，并增加独立人名匹配（2~4个汉字，前后非汉字或标点）
+    ("name", re.compile(
+    r"(?:"
+    r"(?:姓名|被告人|嫌疑人|当事人|原告|被告|证人|辩护人|被害人|申诉人|被申诉人|法定代表人|负责人|联系人)"
+    r"[:：\s]*([\u4e00-\u9fff·]{2,4})"
+    r"|"
+    r"(?<![^\s,，。；：、\(\)（）])([\u4e00-\u9fff·]{2,4})(?![^\s,，。；：、\(\)（）])"
+    r")"
+    )),
 ]
 
 _UNREDACTED_PATTERNS = [
@@ -521,6 +621,7 @@ _UNREDACTED_PATTERNS = [
 ]
 
 
+
 @dataclass
 class RedactionHit:
     sens_type: str
@@ -530,56 +631,245 @@ class RedactionHit:
     placeholder: str
 
 
-def redact_text(text: str) -> tuple[str, list[RedactionHit]]:
-    """返回脱敏文本与命中项；原值映射由 save_redaction_map 单独保管。"""
-    hits: list[RedactionHit] = []
-    for sensitive_type, pattern in REDACTION_PATTERNS:
-        for match in pattern.finditer(text):
-            if match.lastindex:
-                start, end, original = match.start(1), match.end(1), match.group(1)
-            else:
-                start, end, original = match.start(), match.end(), match.group(0)
-            if sensitive_type == "bank_card":
-                digits = re.sub(r"\D", "", original)
-                if len(digits) == 18:
-                    continue
-            hits.append(RedactionHit(sensitive_type, start, end, original, placeholder=""))
+def merge_person_spans(text: str, person_results: list) -> list:
+    """
+    合并相邻/重叠的 PERSON 实体，过滤单字名，去除尾部动词，去除头部动词。
+    """
+    if not person_results:
+        return []
 
-    hits.sort(key=lambda hit: (hit.start, -(hit.end - hit.start)))
-    accepted: list[RedactionHit] = []
-    counters: dict[str, int] = {}
-    occupied_until = -1
-    for hit in hits:
-        if hit.start < occupied_until:
-            continue
-        counters[hit.sens_type] = counters.get(hit.sens_type, 0) + 1
-        hit.placeholder = f"[{hit.sens_type.upper()}_{counters[hit.sens_type]}]"
-        accepted.append(hit)
-        occupied_until = hit.end
+    # ----- 常量定义 -----
+    MERGE_SEPARATORS = set("，,、；;。.！!？?：:""''（）()【】[]《》<>／/\\\t\n\r ")
+    MERGE_STOP_WORDS = {"的", "和", "与", "及", "或", "以及", "及其", "暨"}
+    VERB_PREFIXES = set("受被让给为由将把向对与同跟从在到予以用拿借凭靠沿顺朝往冲离除比")
+    VERB_SUFFIXES = ["说", "道", "讲", "问", "答"]
+    # ------------------
 
-    redacted = text
-    for hit in sorted(accepted, key=lambda item: item.start, reverse=True):
-        redacted = redacted[: hit.start] + hit.placeholder + redacted[hit.end :]
-    return redacted, accepted
+    merged = []
+    current = person_results[0]
 
+    for r in person_results[1:]:
+        gap = text[current.end : r.start]
+        clean_gap = (gap == "") or (
+            not any(ch in MERGE_SEPARATORS for ch in gap) and
+            not any(w in gap for w in MERGE_STOP_WORDS)
+        )
+        if clean_gap:
+            # 检查第二个实体的第一个字符是否是动词，若是则禁止合并
+            second_first_char = text[r.start:r.start+1]
+            if second_first_char in VERB_PREFIXES:
+                merged.append(current)
+                current = r
+                continue
+            # 正常合并
+            new_start = min(current.start, r.start)
+            new_end = max(current.end, r.end)
+            new_score = max(current.score, r.score)
+            current = RecognizerResult(
+                entity_type="PERSON",
+                start=new_start,
+                end=new_end,
+                score=new_score
+            )
+        else:
+            merged.append(current)
+            current = r
+    merged.append(current)
 
-def save_redaction_map(version_id: str, items: list[dict[str, Any]], root=None) -> str:
-    """原值与替换值的对照单独落盘，不进入分析载荷、日志或模型请求。"""
-    directory = Path(root or REDACTION_STORAGE_DIR) / version_id
-    directory.mkdir(parents=True, exist_ok=True)
-    map_id = new_id()
-    payload = {"map_id": map_id, "document_version_id": version_id, "items": items}
-    (directory / f"{map_id}.json").write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    # 过滤单字名
+    merged = [r for r in merged if (r.end - r.start) >= 2]
+
+    # 去除尾部动词
+    filtered = []
+    for r in merged:
+        name = text[r.start:r.end]
+        while len(name) >= 2 and name[-1] in VERB_SUFFIXES:
+            name = name[:-1]
+        if name != text[r.start:r.end]:
+            r = RecognizerResult(
+                entity_type="PERSON",
+                start=r.start,
+                end=r.start + len(name),
+                score=r.score
+            )
+        filtered.append(r)
+
+    # 去除头部动词（兜底）
+    trimmed = []
+    for r in filtered:
+        name = text[r.start:r.end]
+        trim_count = 0
+        while len(name) >= 2 and name[0] in VERB_PREFIXES:
+            name = name[1:]
+            trim_count += 1
+        if trim_count > 0 and len(name) >= 2:
+            r = RecognizerResult(
+                entity_type="PERSON",
+                start=r.start + trim_count,
+                end=r.end,
+                score=r.score
+            )
+        trimmed.append(r)
+    return trimmed
+
+def mask_phone_number(phone: str) -> str:
+    """
+    对手机号进行掩码处理：保留前3位和后4位，中间用 * 填充。
+    如果长度不足11位或不是纯数字，则返回原字符串（不处理）。
+    """
+    # 去除可能的 +86、空格、横线等前缀（简单处理）
+    cleaned = phone.replace("+86", "").replace("-", "").replace(" ", "")
+    if cleaned.isdigit() and len(cleaned) == 11:
+        return cleaned[:3] + "****" + cleaned[-4:]
+    # 对于其他格式（如座机、短号），不做掩码，直接返回原字符串（或可改用占位符）
+    return phone
+
+def redact_text(
+    text: str,
+    mapper: GlobalEntityMapper,
+    analyzer: AnalyzerEngine
+) -> Tuple[str, List[RedactionHit]]:
+    """
+    对文本进行脱敏处理，返回脱敏后的文本和命中的脱敏记录列表。
+    支持：人名、手机号（掩码）、银行卡号、身份证号、地址等（不含时间）。
+    """
+    # 1. 使用 Presidio 分析器识别实体（排除 DATE_TIME）
+    results = analyzer.analyze(
+        text=text,
+        language="zh",
+        entities=[
+            "PERSON", "LOCATION",
+            "PHONE_NUMBER", "CREDIT_CARD", "ID", "EMAIL_ADDRESS", "URL"
+        ],
+        score_threshold=0.8  # 提高阈值，过滤低分结果
     )
-    return map_id
 
+    # 2. 分离 PERSON 和其他实体
+    person_results = [r for r in results if r.entity_type == "PERSON"]
+    other_results = [r for r in results if r.entity_type != "PERSON"]
 
-def load_redaction_map(version_id: str, map_id: str, root=None) -> Optional[dict[str, Any]]:
-    path = Path(root or REDACTION_STORAGE_DIR) / version_id / f"{map_id}.json"
-    if not path.exists():
-        return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    # 3. 处理 PERSON 实体（合并、过滤、别名等）
+    person_results.sort(key=lambda r: (r.start, r.end))
+    person_results = merge_person_spans(text, person_results)
+
+    # 4. 提取所有需要替换的实体（包括 PERSON 和其他）
+    all_entities = {}  # text -> placeholder
+
+    # 4a. 处理 PERSON
+    for r in person_results:
+        name = text[r.start:r.end]
+        if name not in all_entities:
+            placeholder = mapper.get_or_create(name, "name")
+            all_entities[name] = placeholder
+
+    # ---- 基于“往后读一位”的合并（仅用于 PERSON） ----
+    VERB_PREFIXES = set("受被让给为由将把向对与同跟从在到予以用拿借凭靠沿顺朝往冲离除比")
+    sorted_names = sorted(all_entities.keys(), key=len, reverse=True)
+    alias_map = {}
+    for short_name in sorted_names:
+        if len(short_name) < 2:
+            continue
+        candidates = [
+            ln for ln in sorted_names
+            if len(ln) > len(short_name) and ln.startswith(short_name)
+        ]
+        if not candidates:
+            continue
+        short_positions = []
+        pos = 0
+        while True:
+            pos = text.find(short_name, pos)
+            if pos == -1:
+                break
+            short_positions.append(pos)
+            pos += 1
+        found = False
+        for long_name in candidates:
+            remaining = long_name[len(short_name):]
+            if remaining and remaining[0] in VERB_PREFIXES:
+                continue
+            for sp in short_positions:
+                next_start = sp + len(short_name)
+                if (next_start + len(remaining) <= len(text) and
+                        text[next_start:next_start + len(remaining)] == remaining):
+                    after_end = next_start + len(remaining)
+                    if after_end < len(text):
+                        next_char = text[after_end]
+                        if '\u4e00' <= next_char <= '\u9fff':
+                            continue
+                    alias_map[short_name] = long_name
+                    print(f"  🔗 '{short_name}' 在位置 {sp} 后紧跟 '{remaining}' → 合并到 '{long_name}'")
+                    found = True
+                    break
+            if found:
+                break
+        if not found:
+            print(f"  ✖ '{short_name}' 在所有出现位置后均未匹配到任何长名字 → 保持独立")
+
+    # 应用别名映射
+    for short_name, long_name in alias_map.items():
+        all_entities[short_name] = all_entities[long_name]
+
+    # 4b. 处理其他实体（手机号、银行卡号、身份证号、地址等）
+    for r in other_results:
+        raw_text = text[r.start:r.end]
+        if raw_text in all_entities:
+            continue
+        entity_type = r.entity_type
+
+        if entity_type == "PHONE_NUMBER":
+            # 手机号：生成掩码字符串作为占位符
+            masked = mask_phone_number(raw_text)
+            # 如果掩码结果与原字符串相同（非11位手机号），则使用默认占位符
+            if masked == raw_text:
+                placeholder = mapper.get_or_create(raw_text, "phone")
+            else:
+                # 直接使用掩码字符串作为占位符，并确保相同号码映射到相同掩码
+                # 注意：如果多个不同号码掩码后相同（极小概率），这里会合并，但一般不会
+                placeholder = masked
+                # 同时也存入 mapper 以便追踪（可选）
+                # mapper.get_or_create(raw_text, "phone")  # 如果不需要追踪可以不调用
+        else:
+            # 其他实体（银行卡、身份证、地址等）使用 mapper 生成占位符
+            placeholder = mapper.get_or_create(raw_text, entity_type.lower())
+
+        all_entities[raw_text] = placeholder
+
+    # 调试打印
+    print(f"\n=== 识别出的唯一实体（共 {len(all_entities)} 个）===")
+    for txt, ph in all_entities.items():
+        print(f"  '{txt}' -> {ph}")
+    print("=========================\n")
+
+    # 5. 构建替换映射：按长度降序排序，避免短文本被提前替换
+    replace_list = sorted(all_entities.items(), key=lambda x: -len(x[0]))
+
+    # 6. 执行全局替换
+    redacted_text = text
+    hits = []
+    for original, placeholder in replace_list:
+        import re
+        pattern = re.compile(re.escape(original))
+        last_end = 0
+        new_text_parts = []
+        for match in pattern.finditer(redacted_text):
+            start = match.start()
+            end = match.end()
+            hit = RedactionHit(
+                sens_type="PERSON",  # 可根据需要细化，此处保持统一
+                start=start,
+                end=end,
+                original=original,
+                placeholder=placeholder
+            )
+            hits.append(hit)
+            new_text_parts.append(redacted_text[last_end:start])
+            new_text_parts.append(placeholder)
+            last_end = end
+        new_text_parts.append(redacted_text[last_end:])
+        redacted_text = ''.join(new_text_parts)
+
+    return redacted_text, hits
 
 
 # ---------- 解析与页级 OCR ----------
@@ -1040,11 +1330,65 @@ def build_chunks(
 class MaterialService:
     """案件卷宗上传后的处理入口：版本、解析、质量、修正、删除与安全读取。"""
 
-    def __init__(self, db_path=None, auth_check=None, redaction_dir=None):
+    def __init__(self, db_path=None, auth_check=None,
+                 mapper_salt=None):
         self.db_path = db_path
         self.auth_check = auth_check or _default_auth()
-        self.redaction_dir = Path(redaction_dir or REDACTION_STORAGE_DIR)
+        self.mapper = GlobalEntityMapper(db_path=db_path, salt=mapper_salt or "change-me")
+
+        # 直接初始化 PriKit/Presidio AnalyzerEngine
+        self.analyzer = self._init_analyzer()
+
         init_db(self.db_path)
+
+    def _init_analyzer(self) -> AnalyzerEngine | None:
+        try:
+            from presidio_analyzer import AnalyzerEngine, PatternRecognizer, Pattern
+            from presidio_analyzer.nlp_engine import NlpEngineProvider
+
+            configuration = {
+                "nlp_engine_name": "spacy",
+                "models": [{"lang_code": "zh", "model_name": "zh_core_web_trf"}],
+            }
+            provider = NlpEngineProvider(nlp_configuration=configuration)
+            nlp_engine = provider.create_engine()
+            analyzer = AnalyzerEngine(nlp_engine=nlp_engine)
+
+            # ---- 新增：中文姓名专用识别器 ----
+            # 匹配"姓名/被告人/原告/受害人..."等上下文后的 2-4 个汉字
+            chinese_name_pattern = Pattern(
+                name="chinese_name_pattern",
+                # 2-4 个汉字，支持中间有 ·（少数民族姓名）
+                regex=r"(?:姓名|被告人|嫌疑人|当事人|原告|被告|证人|辩护人|被害人|申诉人|被申诉人|法定代表人|负责人|联系人|申请人|被申请人)[:：\s]*([\u4e00-\u9fa5·]{2,4})",
+                score=0.9,
+            )
+            chinese_name_recognizer = PatternRecognizer(
+                supported_entity="PERSON",
+                name="chinese_name_recognizer",
+                patterns=[chinese_name_pattern],
+                # context 词能进一步提升 score
+                context=["姓名", "被告人", "原告", "被告", "证人", "受害人", "当事人"],
+            )
+            analyzer.registry.add_recognizer(chinese_name_recognizer)
+
+            # ---- 新增：纯姓名兜底（无上下文时，2-3 字中文串）----
+            # 这个 score 低一些，避免误伤普通词语
+            bare_name_pattern = Pattern(
+                name="bare_chinese_name_pattern",
+                regex=r"(?<![\u4e00-\u9fa5])([\u4e00-\u9fa5]{2,3})(?![\u4e00-\u9fa5])",
+                score=0.4,
+            )
+            bare_name_recognizer = PatternRecognizer(
+                supported_entity="PERSON",
+                name="bare_chinese_name_recognizer",
+                patterns=[bare_name_pattern],
+            )
+            analyzer.registry.add_recognizer(bare_name_recognizer)
+
+            return analyzer
+        except Exception as e:
+            print(f"⚠️ AnalyzerEngine 初始化失败，将使用正则降级: {e}")
+            return None
 
     def _authorize(self, user_id: str | None, case_id: str | None, action: str) -> None:
         allowed, reason = self.auth_check(user_id, case_id, action)
@@ -1354,22 +1698,11 @@ class MaterialService:
         status = derive_version_status(pages)
         chunks = build_chunks(version_id, pages)
 
-        map_items: list[dict[str, Any]] = []
         redaction_rows: list[dict[str, Any]] = []
         for chunk in chunks:
-            redacted, hits = redact_text(chunk["text_raw"])
+            redacted, hits = redact_text(chunk["text_raw"], self.mapper, self.analyzer)
             chunk["text_redacted"] = redacted
             for hit in hits:
-                map_items.append(
-                    {
-                        "chunk_id": chunk["id"],
-                        "sens_type": hit.sens_type,
-                        "start": hit.start,
-                        "end": hit.end,
-                        "original": hit.original,
-                        "placeholder": hit.placeholder,
-                    }
-                )
                 redaction_rows.append(
                     {
                         "id": new_id(),
@@ -1384,9 +1717,8 @@ class MaterialService:
                     }
                 )
 
-        map_id = save_redaction_map(version_id, map_items, root=self.redaction_dir)
         for row in redaction_rows:
-            row["map_ref"] = map_id
+            row["map_ref"] = ""
 
         with db_session(self.db_path) as conn:
             for page in pages:

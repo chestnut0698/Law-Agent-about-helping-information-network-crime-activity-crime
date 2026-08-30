@@ -14,7 +14,7 @@
 | Python | **3.11+**（技术规划约定；低于 3.11 未验证） |
 | 包管理 | 建议使用虚拟环境（`venv`） |
 | 浏览器 | 现代 Chromium / Firefox / Edge 即可 |
-| 模型 API | 至少配置 **DeepSeek** 或 **NVIDIA** 其一（见下文） |
+| 模型 API | 配置 **DeepSeek** |
 
 当前阶段**不依赖** Neo4j、Redis 等外部服务；`.env.example` 里的 Neo4j 项留给后续图谱阶段，本地演示可留空。
 
@@ -42,7 +42,7 @@ OCR 重依赖默认注释掉，需要时自行取消注释安装：
 
 ---
 
-## 快速启动（队友同步）
+## 快速启动
 
 在仓库根目录执行：
 
@@ -73,18 +73,10 @@ cp .env.example .env          # Windows 可用 copy .env.example .env
 编辑 `.env` 时至少注意这几项：
 
 ```env
-# 本地演示材料上传必须改为 allow_all（默认 deny_all 会拒绝）
-MATERIAL_AUTH_MODE=allow_all
-
 # 推荐：默认模型链路 DeepSeek
 DEEPSEEK_API_KEY=你的密钥
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-v4-flash
-
-# 可选：未配置 DEEPSEEK_API_KEY 时自动走 NVIDIA
-# NVIDIA_API_KEY=
-# LLM_BASE_URL=https://integrate.api.nvidia.com/v1
-# MODEL_NAME=meta/muse-glimmer-30b
 ```
 
 启动服务（仍在仓库根目录、虚拟环境已激活）：
@@ -107,12 +99,8 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 
 | 变量 | 含义 | 本地建议 |
 | --- | --- | --- |
-| `MATERIAL_AUTH_MODE` | 材料授权桩：`deny_all` / `allow_all` | 演示上传用 `allow_all` |
 | `DEEPSEEK_API_KEY` | DeepSeek 密钥 | 有则优先使用 |
 | `DEEPSEEK_MODEL` | 模型名 | 默认 `deepseek-v4-flash` |
-| `NVIDIA_API_KEY` | NVIDIA 密钥 | 仅无 DeepSeek 时生效 |
-| `MAX_UPLOAD_BYTES` | 单文件上限 | 默认 50MB |
-| `DATABASE_PATH` 等 | SQLite / 材料存储路径 | 省略则落在 `data/` 下 |
 
 密钥、真实 `.env` **不要提交**。NVIDIA 探针保留在 `test/test.py`，给只用 NVIDIA 的队友本地排查用。
 

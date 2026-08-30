@@ -10,8 +10,11 @@
 
 from __future__ import annotations
 
-import json
+import json, os
 from typing import Any, Optional
+
+from pathlib import Path
+from app.config import MATERIAL_STORAGE_DIR, REDACTION_STORAGE_DIR
 
 from app.files import (
     MaterialError,
@@ -304,6 +307,51 @@ class TaskService:
 
     def delete_task(self, task_id: str) -> dict:
         with db_session() as conn:
+            docs = _rows(conn, """
+                        SELECT DISTINCT dv.storage_path, d.id AS document_id
+                        FROM document_versions dv
+                        JOIN documents d ON d.id = dv.document_id
+                        JOIN task_cases tc ON tc.case_id = d.case_id
+                        WHERE tc.task_id = ?
+                          AND d.deleted_at IS NULL
+                    """, (task_id,))
+
+            dirs_to_cleanup = set()
+
+            for doc in docs:
+                # 删除原始文件
+                storage_path = doc['storage_path']
+                if storage_path and os.path.exists(storage_path):
+                    try:
+                        os.remove(storage_path)
+                        dirs_to_cleanup.add(os.path.dirname(storage_path))
+
+                    except OSError as e:
+                        print(f"Warning: failed to delete file {storage_path}: {e}")
+            root_dirs = {
+                str(Path(MATERIAL_STORAGE_DIR).resolve()),
+                str(Path(REDACTION_STORAGE_DIR).resolve()),
+            }
+            for dir_path in sorted(dirs_to_cleanup, key=len, reverse=True):
+                # 从最深层开始清理
+                current = Path(dir_path).resolve()
+                while True:
+                    if not current.exists():
+                        break
+                    # 检查是否到达根目录（停止条件）
+                    if str(current) in root_dirs:
+                        break
+                    # 检查目录是否为空（仅包含 . 和 ..）
+                    if any(current.iterdir()):
+                        break  # 非空目录，停止向上
+                    try:
+                        current.rmdir()
+                        print(f"Removed empty directory: {current}")
+                        # 继续向上检查父目录
+                        current = current.parent
+                    except OSError as e:
+                        print(f"Warning: failed to remove directory {current}: {e}")
+                        break
             # 1. 删除关联的聊天消息
             conn.execute("DELETE FROM chat_messages WHERE task_id = ?", (task_id,))
 
@@ -322,6 +370,10 @@ class TaskService:
             conn.execute("DELETE FROM supervision_tasks WHERE id = ?", (task_id,))
 
             conn.commit()
+
+        from app.files import GlobalEntityMapper  # 确保导入
+        mapper = GlobalEntityMapper(db_path=self.db_path)
+        mapper.delete_by_task_id(task_id)
         return {"success": True, "task_id": task_id}
 
     def list_tasks(self, limit: int = 8) -> list[dict[str, Any]]:
