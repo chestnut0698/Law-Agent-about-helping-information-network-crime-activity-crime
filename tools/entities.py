@@ -23,6 +23,7 @@ from app.files import (
     redact_text,
     utc_now,
     new_id,
+    get_global_mapper
 )
 
 EXTRACTOR_VERSION = "stage5-rule-v2"
@@ -264,26 +265,33 @@ def public_surface(surface_raw: str) -> str:
 
 
 def redacted_quote(chunk: dict[str, Any], start: int, end: int) -> tuple[str, str]:
-    """从整段脱敏文本中切窗口，避免窗口重脱敏导致占位符序号错位。"""
-    raw = chunk.get("text_raw") or ""
-    target = chunk.get("text_redacted") or ""
+    """从整段脱敏文本中切窗口，避免窗口重脱敏导致占位符序号错位。
+
+    前提：chunk 中必须已包含 'text_redacted' 和 '_hits' 字段，
+          这些由上层预处理（extract_task_mentions）在事务外填充。
+    """
+    target = chunk.get("text_redacted")
     if not target:
-        target, _ = redact_text(raw)
-    _, hits = redact_text(raw)
-    placeholder = None
+        # 容错：如果没有预脱敏，则直接返回原始文本片段
+        raw = chunk.get("text_raw") or ""
+        snippet = raw[start:end]
+        return snippet, quote_hash(snippet)
+
+    # 优先尝试精确匹配占位符（根据 start/end）
+    hits = chunk.get("_hits") or []
     for hit in hits:
         if hit.start == start and hit.end == end:
             placeholder = hit.placeholder
-            break
-    if placeholder and placeholder in target:
-        idx = target.find(placeholder)
-        lo = max(0, idx - 16)
-        hi = min(len(target), idx + len(placeholder) + 16)
-        snippet = target[lo:hi]
-        return snippet, quote_hash(snippet)
-    surface = raw[start:end]
-    shown = public_surface(surface)
-    return shown, quote_hash(shown)
+            idx = target.find(placeholder)
+            if idx != -1:
+                lo = max(0, idx - 16)
+                hi = min(len(target), idx + len(placeholder) + 16)
+                snippet = target[lo:hi]
+                return snippet, quote_hash(snippet)
+
+    # 没有精确匹配，直接截取脱敏文本中的对应区间
+    snippet = target[start:end]
+    return snippet, quote_hash(snippet)
 
 
 def is_excluded(object_type: str, normalized: str, exclusions: dict[str, Any]) -> bool:
@@ -615,21 +623,50 @@ def persist_mentions(
 
 def extract_task_mentions(task_id: str, case_ids: list[str], db_path=None) -> dict[str, Any]:
     init_entity_db(db_path)
-    inserted = 0
-    scanned = 0
+
+    # ---- 第一步：获取所有 chunks（事务外） ----
     with db_session(db_path) as conn:
         chunks = list_task_raw_chunks(conn, case_ids)
-        scanned = len(chunks)
+    scanned = len(chunks)
+
+    # ---- 第二步：预处理所有 chunks（事务外） ----
+    mapper = get_global_mapper()
+    for chunk in chunks:
+        raw = chunk.get("text_raw") or ""
+        redacted, hits = redact_text(raw)  # 纯脱敏，不写数据库
+        # 将临时占位符替换为持久化占位符（写入 entity_global_map）
+        for hit in hits:
+            persistent_placeholder = mapper.get_or_create(
+                original=hit.original,
+                sens_type=hit.sens_type,
+                task_id=task_id
+            )
+            hit.placeholder = persistent_placeholder
+        # 缓存结果到 chunk 中
+        chunk["text_redacted"] = redacted
+        chunk["_hits"] = hits
+
+    # ---- 第三步：事务内持久化 mentions ----
+    inserted = 0
+    with db_session(db_path) as conn:
         for chunk in chunks:
-            hits = extract_rule_mentions(chunk.get("text_raw") or "")
-            inserted += persist_mentions(conn, task_id=task_id, chunk=chunk, hits=hits)
+            # extract_rule_mentions 不涉及脱敏，可以安全在事务内调用
+            rule_hits = extract_rule_mentions(chunk.get("text_raw") or "")
+            # persist_mentions 内部调用 redacted_quote，现在会使用 chunk 中缓存的脱敏数据
+            inserted += persist_mentions(conn, task_id=task_id, chunk=chunk, hits=rule_hits)
+
         mentions = _rows(
             conn,
             "SELECT * FROM entity_mentions WHERE task_id = ? ORDER BY created_at",
             (task_id,),
         )
-    return {"inserted": inserted, "scanned_chunks": scanned, "mention_count": len(mentions), "mentions": mentions}
 
+    return {
+        "inserted": inserted,
+        "scanned_chunks": scanned,
+        "mention_count": len(mentions),
+        "mentions": mentions,
+    }
 
 def persist_events(conn, *, task_id: str, chunk: dict[str, Any], hits: list[dict[str, Any]]) -> int:
     inserted = 0

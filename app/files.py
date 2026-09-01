@@ -282,6 +282,30 @@ CREATE INDEX IF NOT EXISTS idx_chunks_version ON document_chunks(document_versio
 CREATE INDEX IF NOT EXISTS idx_redaction_version ON redaction_items(document_version_id);
 """
 
+_global_mapper_instance: GlobalEntityMapper | None = None
+_global_analyzer_instance: AnalyzerEngine | None = None
+
+
+def get_global_mapper(db_path=None, salt: str = "default-salt-change-me") -> GlobalEntityMapper:
+    global _global_mapper_instance
+    if _global_mapper_instance is None:
+        _global_mapper_instance = GlobalEntityMapper(db_path=db_path, salt=salt)
+    return _global_mapper_instance
+
+
+def get_global_analyzer() -> AnalyzerEngine:
+    global _global_analyzer_instance
+    if _global_analyzer_instance is None:
+        configuration = {
+            "nlp_engine_name": "spacy",
+            "models": [{"lang_code": "zh", "model_name": "zh_core_web_trf"}],
+        }
+        provider = NlpEngineProvider(nlp_configuration=configuration)
+        nlp_engine = provider.create_engine()
+        _global_analyzer_instance = AnalyzerEngine(nlp_engine=nlp_engine)
+    return _global_analyzer_instance
+
+
 def new_id() -> str:
     return str(uuid.uuid4())
 
@@ -724,14 +748,24 @@ def mask_phone_number(phone: str) -> str:
     # 对于其他格式（如座机、短号），不做掩码，直接返回原字符串（或可改用占位符）
     return phone
 
+def _generate_placeholder(sens_type: str) -> str:
+    """生成一个临时的占位符，不持久化到数据库。"""
+    short_uuid = uuid.uuid4().hex[:8]
+    return f"{sens_type.upper()}_{short_uuid}"
+
 def redact_text(
     text: str,
-    mapper: GlobalEntityMapper,
-    analyzer: AnalyzerEngine
+    document_version_id: str = None,
+    chunk_id: str = None,
 ) -> Tuple[str, List[RedactionHit]]:
+
+    mapper = get_global_mapper()
+    analyzer = get_global_analyzer()
+
     """
     对文本进行脱敏处理，返回脱敏后的文本和命中的脱敏记录列表。
     支持：人名、手机号（掩码）、银行卡号、身份证号、地址等（不含时间）。
+    每次替换都会写入 redaction_items 表，用于人工核对。
     """
     # 1. 使用 Presidio 分析器识别实体（排除 DATE_TIME）
     results = analyzer.analyze(
@@ -741,7 +775,7 @@ def redact_text(
             "PERSON", "LOCATION",
             "PHONE_NUMBER", "CREDIT_CARD", "ID", "EMAIL_ADDRESS", "URL"
         ],
-        score_threshold=0.8  # 提高阈值，过滤低分结果
+        score_threshold=0.8
     )
 
     # 2. 分离 PERSON 和其他实体
@@ -753,14 +787,14 @@ def redact_text(
     person_results = merge_person_spans(text, person_results)
 
     # 4. 提取所有需要替换的实体（包括 PERSON 和其他）
-    all_entities = {}  # text -> placeholder
+    all_entities = {}  # text -> (placeholder, entity_type)
 
     # 4a. 处理 PERSON
     for r in person_results:
         name = text[r.start:r.end]
         if name not in all_entities:
-            placeholder = mapper.get_or_create(name, "name")
-            all_entities[name] = placeholder
+            placeholder = _generate_placeholder("NAME")   # 对于 PERSON
+            all_entities[name] = (placeholder, "PERSON")
 
     # ---- 基于“往后读一位”的合并（仅用于 PERSON） ----
     VERB_PREFIXES = set("受被让给为由将把向对与同跟从在到予以用拿借凭靠沿顺朝往冲离除比")
@@ -806,9 +840,10 @@ def redact_text(
         if not found:
             print(f"  ✖ '{short_name}' 在所有出现位置后均未匹配到任何长名字 → 保持独立")
 
-    # 应用别名映射
+    # 应用别名映射（共享 placeholder 和 entity_type）
     for short_name, long_name in alias_map.items():
-        all_entities[short_name] = all_entities[long_name]
+        placeholder, etype = all_entities[long_name]
+        all_entities[short_name] = (placeholder, etype)
 
     # 4b. 处理其他实体（手机号、银行卡号、身份证号、地址等）
     for r in other_results:
@@ -818,51 +853,61 @@ def redact_text(
         entity_type = r.entity_type
 
         if entity_type == "PHONE_NUMBER":
-            # 手机号：生成掩码字符串作为占位符
             masked = mask_phone_number(raw_text)
-            # 如果掩码结果与原字符串相同（非11位手机号），则使用默认占位符
             if masked == raw_text:
                 placeholder = mapper.get_or_create(raw_text, "phone")
             else:
-                # 直接使用掩码字符串作为占位符，并确保相同号码映射到相同掩码
-                # 注意：如果多个不同号码掩码后相同（极小概率），这里会合并，但一般不会
                 placeholder = masked
-                # 同时也存入 mapper 以便追踪（可选）
-                # mapper.get_or_create(raw_text, "phone")  # 如果不需要追踪可以不调用
         else:
-            # 其他实体（银行卡、身份证、地址等）使用 mapper 生成占位符
-            placeholder = mapper.get_or_create(raw_text, entity_type.lower())
+            placeholder = _generate_placeholder(entity_type)  # 对于其他实体placeholder = mapper.get_or_create(raw_text, entity_type.lower())
 
-        all_entities[raw_text] = placeholder
-
-    # 调试打印
-    print(f"\n=== 识别出的唯一实体（共 {len(all_entities)} 个）===")
-    for txt, ph in all_entities.items():
-        print(f"  '{txt}' -> {ph}")
-    print("=========================\n")
+        all_entities[raw_text] = (placeholder, entity_type)
 
     # 5. 构建替换映射：按长度降序排序，避免短文本被提前替换
     replace_list = sorted(all_entities.items(), key=lambda x: -len(x[0]))
 
-    # 6. 执行全局替换
+    # 6. 执行全局替换，同时写入 redaction_items
     redacted_text = text
     hits = []
-    for original, placeholder in replace_list:
-        import re
+    for original, (placeholder, entity_type) in replace_list:
         pattern = re.compile(re.escape(original))
         last_end = 0
         new_text_parts = []
         for match in pattern.finditer(redacted_text):
             start = match.start()
             end = match.end()
+            # 记录命中信息
             hit = RedactionHit(
-                sens_type="PERSON",  # 可根据需要细化，此处保持统一
+                sens_type=entity_type,
                 start=start,
                 end=end,
                 original=original,
                 placeholder=placeholder
             )
             hits.append(hit)
+
+            # 写入 redaction_items 表（持久化替换记录）
+            if document_version_id:
+                # 计算 map_ref：如果 placeholder 是通过 mapper 生成的，则有 fingerprint；否则为空
+                if entity_type == "PERSON" or (entity_type != "PHONE_NUMBER" and placeholder.startswith(entity_type.upper())):
+                    # 通过 mapper 生成的占位符，可以计算 fingerprint
+                    fp = mapper._fingerprint(original)
+                else:
+                    fp = ""  # 手机号掩码等，没有映射记录
+                conn = get_connection(mapper.db_path)
+                try:
+                    conn.execute(
+                        "INSERT INTO redaction_items "
+                        "(id, document_version_id, chunk_id, sens_type, start_offset, end_offset, placeholder, map_ref, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+                        (uuid.uuid4().hex, document_version_id, chunk_id or "",
+                         entity_type, start, end, placeholder, fp)
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+
+            # 拼接替换后的文本
             new_text_parts.append(redacted_text[last_end:start])
             new_text_parts.append(placeholder)
             last_end = end
@@ -1334,10 +1379,6 @@ class MaterialService:
                  mapper_salt=None):
         self.db_path = db_path
         self.auth_check = auth_check or _default_auth()
-        self.mapper = GlobalEntityMapper(db_path=db_path, salt=mapper_salt or "change-me")
-
-        # 直接初始化 PriKit/Presidio AnalyzerEngine
-        self.analyzer = self._init_analyzer()
 
         init_db(self.db_path)
 
@@ -1698,24 +1739,31 @@ class MaterialService:
         status = derive_version_status(pages)
         chunks = build_chunks(version_id, pages)
 
+        # 第一步：对所有 chunk 进行脱敏（不写数据库）
+        mapper = get_global_mapper()  # 在事务外获取 mapper
         redaction_rows: list[dict[str, Any]] = []
         for chunk in chunks:
-            redacted, hits = redact_text(chunk["text_raw"], self.mapper, self.analyzer)
+            redacted, hits = redact_text(chunk["text_raw"])
             chunk["text_redacted"] = redacted
             for hit in hits:
-                redaction_rows.append(
-                    {
-                        "id": new_id(),
-                        "document_version_id": version_id,
-                        "chunk_id": chunk["id"],
-                        "sens_type": hit.sens_type,
-                        "start_offset": hit.start,
-                        "end_offset": hit.end,
-                        "placeholder": hit.placeholder,
-                        "map_ref": "",
-                        "created_at": utc_now(),
-                    }
+                # 将临时占位符替换为持久化的全局 ID
+                persistent_placeholder = mapper.get_or_create(
+                    original=hit.original,
+                    sens_type=hit.sens_type,
+                    task_id=""  # 可根据需要传递 task_id
                 )
+                map_ref = mapper._fingerprint(hit.original)  # 指纹作为 map_ref
+                redaction_rows.append({
+                    "id": new_id(),
+                    "document_version_id": version_id,
+                    "chunk_id": chunk["id"],
+                    "sens_type": hit.sens_type,
+                    "start_offset": hit.start,
+                    "end_offset": hit.end,
+                    "placeholder": persistent_placeholder,
+                    "map_ref": map_ref,
+                    "created_at": utc_now(),
+                })
 
         for row in redaction_rows:
             row["map_ref"] = ""
@@ -1745,9 +1793,7 @@ class MaterialService:
                     },
                 )
             replace_chunks(conn, version_id, chunks)
-            conn.execute(
-                "DELETE FROM redaction_items WHERE document_version_id = ?", (version_id,)
-            )
+
             for row in redaction_rows:
                 _insert(conn, "redaction_items", row)
 
