@@ -772,8 +772,7 @@ def redact_text(
         text=text,
         language="zh",
         entities=[
-            "PERSON", "LOCATION",
-            "PHONE_NUMBER", "CREDIT_CARD", "ID", "EMAIL_ADDRESS", "URL"
+            "PERSON", "PHONE_NUMBER", "CREDIT_CARD", "ID", "EMAIL_ADDRESS", "URL"
         ],
         score_threshold=0.8
     )
@@ -832,13 +831,10 @@ def redact_text(
                         if '\u4e00' <= next_char <= '\u9fff':
                             continue
                     alias_map[short_name] = long_name
-                    print(f"  🔗 '{short_name}' 在位置 {sp} 后紧跟 '{remaining}' → 合并到 '{long_name}'")
                     found = True
                     break
             if found:
                 break
-        if not found:
-            print(f"  ✖ '{short_name}' 在所有出现位置后均未匹配到任何长名字 → 保持独立")
 
     # 应用别名映射（共享 placeholder 和 entity_type）
     for short_name, long_name in alias_map.items():

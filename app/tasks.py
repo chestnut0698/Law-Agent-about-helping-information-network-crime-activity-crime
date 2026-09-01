@@ -1548,7 +1548,7 @@ class TaskService:
                 "content": content,
                 "tool_call_id": tool_call_id,
                 "created_at": utc_now(),
-                "metadata_json": json.dumps(metadata or {}, ensure_ascii=False),
+                "metadata_json": json.dumps(metadata or {}, ensure_ascii=False),  # 注意：列表也会被正确序列化
             }
             _insert(conn, "chat_messages", msg)
         return msg

@@ -190,7 +190,7 @@ class ReactAgent(BaseAgent):
                     msg["role"],
                     msg["content"],
                     tool_call_id=msg.get("tool_call_id"),
-                    metadata={"tool_calls": msg.get("tool_calls")} if msg.get("tool_calls") else None,
+                    metadata=msg.get("tool_calls") if msg.get("tool_calls") else None,
 
                 )
                 existing_set.add(key)
