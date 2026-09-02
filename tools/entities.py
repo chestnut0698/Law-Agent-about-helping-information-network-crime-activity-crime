@@ -10,11 +10,9 @@ from __future__ import annotations
 import json
 import re
 from collections import defaultdict
-from pathlib import Path
 from typing import Any
-
 from agents.gateway import canonical_hash, quote_hash
-from app.config import REPO_ROOT
+
 from app.files import (
     _insert,
     _row,
@@ -23,13 +21,14 @@ from app.files import (
     redact_text,
     utc_now,
     new_id,
-    get_global_mapper
+    get_global_mapper,
+    GlobalEntityMapper,
 )
 
 EXTRACTOR_VERSION = "stage5-rule-v2"
 EVENT_EXTRACTOR_VERSION = "stage5-event-v1"
-STRONG_TYPES = ("PHONE", "ACCOUNT", "DEVICE", "ID_CARD")
-RULE_TYPE_MAP = {"ACCOUNT": "R001", "PHONE": "R002", "DEVICE": "R003"}
+STRONG_TYPES = ("PHONE", "ACCOUNT", "DEVICE", "ID_CARD", "NAME")
+RULE_TYPE_MAP = {"ACCOUNT": "R001", "PHONE": "R002", "DEVICE": "R003", "NAME": "R006"}
 LEGAL_BOUNDARY = (
     "疑似漏犯漏罪关联线索（待核验）。禁止作为定罪、并案、主从犯或量刑依据。"
 )
@@ -117,7 +116,6 @@ CREATE INDEX IF NOT EXISTS idx_event_mentions_task
 ON event_mentions(task_id, event_type, time_text);
 """
 
-
 def init_entity_db(db_path=None) -> None:
     with db_session(db_path) as conn:
         conn.executescript(ENTITY_SCHEMA_SQL)
@@ -125,35 +123,20 @@ def init_entity_db(db_path=None) -> None:
 
 # ---------- 配置 ----------
 
-def _load_yaml(path: Path, default: dict) -> dict:
-    if not path.exists():
-        return default
-    try:
-        import yaml
-    except ImportError:
-        return default
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    return data if isinstance(data, dict) else default
-
-
 def load_exclusions() -> dict[str, Any]:
-    return _load_yaml(
-        REPO_ROOT / "config" / "rules" / "exclusions.yaml",
-        {
-            "version": "exclusions-v1",
-            "phones": ["10086", "10010", "10000", "110", "13800138000"],
-            "bank_accounts": [],
-            "devices": [],
-            "id_cards": [],
-            "ips": ["127.0.0.1", "0.0.0.0"],
-        },
-    )
+    return {
+        "version": "exclusions-v1",
+        "phones": ["10086", "10010", "10000", "110", "13800138000"],
+        "bank_accounts": [],
+        "devices": [],
+        "id_cards": [],
+        "ips": ["127.0.0.1", "0.0.0.0"],
+        "names": [],
+    }
 
 
 def load_rules() -> dict[str, Any]:
-    return _load_yaml(
-        REPO_ROOT / "config" / "rules" / "rules.yaml",
-        {
+    return  {
             "version": "rules-v2",
             "rules": [
                 {"id": "R001", "version": "v1", "object_type": "ACCOUNT", "label": "同一银行账户/卡跨案出现", "evidence_mode": "DIRECT_MATERIAL"},
@@ -162,15 +145,11 @@ def load_rules() -> dict[str, Any]:
                 {"id": "R004", "version": "v1", "object_type": "TRANSFER_ACCOUNT", "label": "资金路径交叉（同账户转账活动跨案）", "evidence_mode": "RULE_INFERRED", "event_type": "TRANSFER", "party_type": "ACCOUNT"},
                 {"id": "R005", "version": "v1", "object_type": "CONTACT_PHONE", "label": "共同联系人（同手机号联络事件跨案）", "evidence_mode": "RULE_INFERRED", "event_type": "CONTACT", "party_type": "PHONE"},
             ],
-        },
-    )
+        }
 
 
 def load_ocr_pairs() -> list[tuple[str, str]]:
-    data = _load_yaml(
-        REPO_ROOT / "config" / "normalization" / "ocr_confusables.yaml",
-        {"version": "norm-v1", "pairs": [["0", "O"], ["1", "l"], ["8", "B"]]},
-    )
+    data = {"version": "norm-v1", "pairs": [["0", "O"], ["1", "l"], ["8", "B"]]}
     pairs = []
     for item in data.get("pairs") or []:
         if isinstance(item, (list, tuple)) and len(item) == 2:
@@ -219,16 +198,6 @@ def to_halfwidth(text: str) -> str:
             chars.append(ch)
     return "".join(chars)
 
-
-def strip_separators(text: str) -> str:
-    return re.sub(r"[\s\-_.／/]", "", to_halfwidth(text or ""))
-
-
-def mask_info(surface: str) -> dict[str, Any]:
-    positions = [i for i, ch in enumerate(surface or "") if ch in "*＊xX"]
-    return {"masked": bool(positions), "positions": positions}
-
-
 def possible_forms(normalized: str) -> list[str]:
     """OCR 混淆只生成标注候选，不替换原文。"""
     if not normalized:
@@ -246,7 +215,7 @@ def possible_forms(normalized: str) -> list[str]:
 
 
 def normalize_identifier(object_type: str, surface: str) -> str:
-    compact = strip_separators(surface)
+    compact = re.sub(r"[\s\-_.／/]", "", to_halfwidth(surface))
     if object_type == "PHONE":
         digits = re.sub(r"\D", "", compact)
         if digits.startswith("86") and len(digits) == 13:
@@ -256,13 +225,17 @@ def normalize_identifier(object_type: str, surface: str) -> str:
         return re.sub(r"\D", "", compact).upper()
     if object_type == "IP":
         return compact
+    if object_type == "NAME":
+        return compact.strip()
     return compact
 
 
 def public_surface(surface_raw: str) -> str:
-    redacted, _ = redact_text(surface_raw or "")
-    return redacted
-
+    """仅用于展示的轻量脱敏，不涉及数据库操作，避免锁冲突。"""
+    if not surface_raw:
+        return ""
+    text = surface_raw
+    return text
 
 def redacted_quote(chunk: dict[str, Any], start: int, end: int) -> tuple[str, str]:
     """从整段脱敏文本中切窗口，避免窗口重脱敏导致占位符序号错位。
@@ -301,6 +274,7 @@ def is_excluded(object_type: str, normalized: str, exclusions: dict[str, Any]) -
         "DEVICE": "devices",
         "ID_CARD": "id_cards",
         "IP": "ips",
+        "NAME": "names",
     }
     values = {str(item) for item in (exclusions.get(buckets.get(object_type, ""), []) or [])}
     return normalized in values
@@ -351,9 +325,17 @@ _CONTACT_KEYWORDS = (
     ("短信", "SMS"),
     ("聊天", "CHAT"),
 )
+_NAME_RE = re.compile(
+    r"(?:"
+    r"(?:姓名|被告人|嫌疑人|当事人|原告|被告|证人|辩护人|被害人|申诉人|被申诉人|法定代表人|负责人|联系人)"
+    r"[:：\s]*([\u4e00-\u9fff·]{2,4})"
+    r"|"
+    r"(?<![^\s,，。；：、\(\)（）])([\u4e00-\u9fff·]{2,4})(?![^\s,，。；：、\(\)（）])"
+    r")"
+)
+_NAME_PLACEHOLDER_RE = re.compile(r"(?:NAME|PERSON)_[a-f0-9]{8}")
 
-
-def extract_rule_mentions(text: str) -> list[dict[str, Any]]:
+def extract_rule_mentions(text: str, mapper: GlobalEntityMapper | None = None) -> list[dict[str, Any]]:
     """从原文抽取强标识。部分掩码会入表但不参与碰撞。"""
     found: list[dict[str, Any]] = []
     occupied: list[tuple[int, int]] = []
@@ -426,12 +408,38 @@ def extract_rule_mentions(text: str) -> list[dict[str, Any]]:
         if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
             if take(match.start(1), match.end(1)):
                 found.append(_mention_hit("IP", raw, match.start(1), match.end(1)))
+    # 明文姓名
+    for match in _NAME_RE.finditer(text or ""):
+        raw = match.group(1) or match.group(2)
+        start_pos = match.start(1) if match.group(1) else match.start(2)
+        end_pos = match.end(1) if match.group(1) else match.end(2)
+        if raw and take(start_pos, end_pos):
+            found.append(_mention_hit("NAME", raw, start_pos, end_pos))
+
+    # 匿名姓名（占位符）：从已脱敏文本中反查 fingerprint 作为碰撞键
+    for match in _NAME_PLACEHOLDER_RE.finditer(text or ""):
+        raw = match.group(0)
+        if take(match.start(0), match.end(0)):
+            hit = _mention_hit("NAME", raw, match.start(0), match.end(0))
+            hit["mask_info"] = {"masked": True, "positions": list(range(len(raw))), "kind": "placeholder"}
+            hit["possible_forms"] = []
+            if mapper:
+                fp = mapper.get_fingerprint_by_anonymous_id(raw)
+                if fp:
+                    hit["normalized_value"] = fp
+                else:
+                    hit["normalized_value"] = ""
+            else:
+                hit["normalized_value"] = ""
+            found.append(hit)
+
     return found
 
 
 def _mention_hit(object_type: str, surface: str, start: int, end: int) -> dict[str, Any]:
     normalized = normalize_identifier(object_type, surface)
-    info = mask_info(surface)
+    positions = [i for i, ch in enumerate(surface or "") if ch in "*＊xX"]
+    info = {"masked": bool(positions), "positions": positions}
     return {
         "object_type": object_type,
         "surface_raw": surface,
@@ -464,8 +472,8 @@ def _event_channel(sentence: str) -> str:
 def _event_parties(sentence: str) -> list[str]:
     parties: list[str] = []
     for hit in extract_rule_mentions(sentence or ""):
-        if hit["object_type"] in {"ACCOUNT", "PHONE"}:
-            parties.append(public_surface(hit["surface_raw"]))
+        if hit["object_type"] in {"ACCOUNT", "PHONE", "NAME"}:
+            parties.append(hit["surface_raw"]) # 直接使用原文
     seen = set()
     deduped = []
     for item in parties:
@@ -569,11 +577,16 @@ def persist_mentions(
     inserted = 0
     now = utc_now()
     for hit in hits:
-        quote, qhash = redacted_quote(
-            chunk,
-            int(hit["char_start"]),
-            int(hit["char_end"]),
-        )
+        for hit in hits:
+            if hit.get("quote_redacted") and hit.get("quote_hash"):
+                quote = hit["quote_redacted"]
+                qhash = hit["quote_hash"]
+            else:
+                quote, qhash = redacted_quote(
+                    chunk,
+                    int(hit["char_start"]),
+                    int(hit["char_end"]),
+                )
         payload_hash = canonical_hash(
             {
                 "type": hit["object_type"],
@@ -650,10 +663,33 @@ def extract_task_mentions(task_id: str, case_ids: list[str], db_path=None) -> di
     inserted = 0
     with db_session(db_path) as conn:
         for chunk in chunks:
-            # extract_rule_mentions 不涉及脱敏，可以安全在事务内调用
-            rule_hits = extract_rule_mentions(chunk.get("text_raw") or "")
-            # persist_mentions 内部调用 redacted_quote，现在会使用 chunk 中缓存的脱敏数据
-            inserted += persist_mentions(conn, task_id=task_id, chunk=chunk, hits=rule_hits)
+            # 明文 + 已脱敏占位符
+            rule_hits = extract_rule_mentions(chunk.get("text_raw") or "", mapper=mapper)
+
+            # 从脱敏 hits 中生成 NAME mentions（覆盖匿名姓名）
+            name_hits = []
+            for hit in chunk.get("_hits", []):
+                if hit.sens_type == "PERSON":
+                    normalized = normalize_identifier("NAME", hit.original)
+                    # 预计算 quote，避免 redacted_quote 因位置偏移出错
+                    placeholder = hit.placeholder or ""
+                    quote = placeholder
+                    qhash = quote_hash(quote)
+                    name_hits.append({
+                        "object_type": "NAME",
+                        "surface_raw": hit.original,
+                        "normalized_value": normalized,
+                        "mask_info": {"masked": True, "kind": "redacted", "placeholder": placeholder},
+                        "possible_forms": [],
+                        "char_start": hit.start,
+                        "char_end": hit.end,
+                        "producer": "REDACTION",
+                        "quote_redacted": quote,
+                        "quote_hash": qhash,
+                    })
+
+            all_hits = rule_hits + name_hits
+            inserted += persist_mentions(conn, task_id=task_id, chunk=chunk, hits=all_hits)
 
         mentions = _rows(
             conn,
@@ -869,6 +905,7 @@ def collide_mentions(
             "ACCOUNT": "同一银行账户/卡跨案出现",
             "DEVICE": "同一设备标识跨案出现",
             "ID_CARD": "同一身份证件号跨案出现",
+            "NAME": "同一姓名跨案出现",
         }.get(object_type, object_type)
         candidates.append(
             {

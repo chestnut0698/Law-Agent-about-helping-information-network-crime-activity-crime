@@ -592,6 +592,22 @@ class GlobalEntityMapper:
         finally:
             conn.close()
 
+    def get_fingerprint(self, original: str) -> str:
+        """根据原始值计算 fingerprint（不写入数据库）。"""
+        return self._fingerprint(original)
+
+    def get_fingerprint_by_anonymous_id(self, anonymous_id: str) -> str | None:
+        """通过匿名占位符反查 fingerprint。"""
+        conn = get_connection(self.db_path)
+        try:
+            row = conn.execute(
+                "SELECT fingerprint FROM entity_global_map WHERE anonymous_id = ?",
+                (anonymous_id,)
+            ).fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+
 
 # ---------- 敏感信息检测与脱敏 ----------
 
@@ -758,15 +774,20 @@ def redact_text(
     document_version_id: str = None,
     chunk_id: str = None,
 ) -> Tuple[str, List[RedactionHit]]:
+    """
+    对文本进行脱敏处理，返回脱敏后的文本和命中的脱敏记录列表。
 
+    核心保证：同一原始值始终映射到同一占位符（通过 entity_global_map）。
+    不直接写入 redaction_items，由调用方（如 _persist_pages）统一持久化。
+
+    支持：人名、手机号（掩码）、银行卡号、身份证号、地址等（不含时间）。
+    """
     mapper = get_global_mapper()
     analyzer = get_global_analyzer()
 
-    """
-    对文本进行脱敏处理，返回脱敏后的文本和命中的脱敏记录列表。
-    支持：人名、手机号（掩码）、银行卡号、身份证号、地址等（不含时间）。
-    每次替换都会写入 redaction_items 表，用于人工核对。
-    """
+    if not text:
+        return text, []
+
     # 1. 使用 Presidio 分析器识别实体（排除 DATE_TIME）
     results = analyzer.analyze(
         text=text,
@@ -781,24 +802,27 @@ def redact_text(
     person_results = [r for r in results if r.entity_type == "PERSON"]
     other_results = [r for r in results if r.entity_type != "PERSON"]
 
-    # 3. 处理 PERSON 实体（合并、过滤、别名等）
+    # 3. 处理 PERSON 实体（合并、过滤、别名等）—— 保持原有逻辑不变
     person_results.sort(key=lambda r: (r.start, r.end))
     person_results = merge_person_spans(text, person_results)
 
-    # 4. 提取所有需要替换的实体（包括 PERSON 和其他）
-    all_entities = {}  # text -> (placeholder, entity_type)
+    # 4. 收集所有实体区间（start, end, original, entity_type）
+    spans: list[tuple[int, int, str, str]] = []
 
-    # 4a. 处理 PERSON
+    # 4a. PERSON
     for r in person_results:
-        name = text[r.start:r.end]
-        if name not in all_entities:
-            placeholder = _generate_placeholder("NAME")   # 对于 PERSON
-            all_entities[name] = (placeholder, "PERSON")
+        spans.append((r.start, r.end, text[r.start:r.end], "PERSON"))
 
-    # ---- 基于“往后读一位”的合并（仅用于 PERSON） ----
+    # ---- 基于"往后读一位"的别名合并（仅用于 PERSON）—— 保持原有逻辑 ----
     VERB_PREFIXES = set("受被让给为由将把向对与同跟从在到予以用拿借凭靠沿顺朝往冲离除比")
-    sorted_names = sorted(all_entities.keys(), key=len, reverse=True)
-    alias_map = {}
+    # 按原始文本分组
+    name_spans: dict[str, list[tuple[int, int]]] = {}
+    for s, e, name, etype in spans:
+        if etype == "PERSON":
+            name_spans.setdefault(name, []).append((s, e))
+
+    sorted_names = sorted(name_spans.keys(), key=len, reverse=True)
+    alias_map: dict[str, str] = {}
     for short_name in sorted_names:
         if len(short_name) < 2:
             continue
@@ -808,21 +832,14 @@ def redact_text(
         ]
         if not candidates:
             continue
-        short_positions = []
-        pos = 0
-        while True:
-            pos = text.find(short_name, pos)
-            if pos == -1:
-                break
-            short_positions.append(pos)
-            pos += 1
+        short_positions = name_spans[short_name]
         found = False
         for long_name in candidates:
             remaining = long_name[len(short_name):]
             if remaining and remaining[0] in VERB_PREFIXES:
                 continue
-            for sp in short_positions:
-                next_start = sp + len(short_name)
+            for sp_start, sp_end in short_positions:
+                next_start = sp_end
                 if (next_start + len(remaining) <= len(text) and
                         text[next_start:next_start + len(remaining)] == remaining):
                     after_end = next_start + len(remaining)
@@ -836,80 +853,75 @@ def redact_text(
             if found:
                 break
 
-    # 应用别名映射（共享 placeholder 和 entity_type）
-    for short_name, long_name in alias_map.items():
-        placeholder, etype = all_entities[long_name]
-        all_entities[short_name] = (placeholder, etype)
-
-    # 4b. 处理其他实体（手机号、银行卡号、身份证号、地址等）
-    for r in other_results:
-        raw_text = text[r.start:r.end]
-        if raw_text in all_entities:
+    # 应用别名映射：短名共享长名的 placeholder
+    # 将短名的所有 span 替换为长名的合并后 span
+    new_spans = []
+    merged_short = set()
+    for s, e, name, etype in spans:
+        if etype == "PERSON" and name in alias_map:
+            merged_short.add(name)
             continue
-        entity_type = r.entity_type
+        new_spans.append((s, e, name, etype))
 
-        if entity_type == "PHONE_NUMBER":
-            masked = mask_phone_number(raw_text)
-            if masked == raw_text:
-                placeholder = mapper.get_or_create(raw_text, "phone")
-            else:
-                placeholder = masked
-        else:
-            placeholder = _generate_placeholder(entity_type)  # 对于其他实体placeholder = mapper.get_or_create(raw_text, entity_type.lower())
+    for short_name, long_name in alias_map.items():
+        for sp_start, sp_end in name_spans[short_name]:
+            remaining = long_name[len(short_name):]
+            next_start = sp_end
+            if (next_start + len(remaining) <= len(text) and
+                    text[next_start:next_start + len(remaining)] == remaining):
+                new_spans.append((sp_start, next_start + len(remaining), long_name, "PERSON"))
 
-        all_entities[raw_text] = (placeholder, entity_type)
+    # 去重
+    seen = set()
+    unique_spans = []
+    for span in new_spans:
+        key = (span[0], span[1], span[2], span[3])
+        if key not in seen:
+            seen.add(key)
+            unique_spans.append(span)
+    spans = unique_spans
 
-    # 5. 构建替换映射：按长度降序排序，避免短文本被提前替换
-    replace_list = sorted(all_entities.items(), key=lambda x: -len(x[0]))
+    # 4b. 其他实体
+    for r in other_results:
+        spans.append((r.start, r.end, text[r.start:r.end], r.entity_type))
 
-    # 6. 执行全局替换，同时写入 redaction_items
+    # 5. 合并重叠区间（优先保留长的、先出现的）
+    spans.sort(key=lambda x: (x[0], -(x[1] - x[0])))
+    merged_spans: list[tuple[int, int, str, str]] = []
+    last_end = -1
+    for start, end, original, entity_type in spans:
+        if start < last_end:
+            continue  # 重叠，跳过
+        merged_spans.append((start, end, original, entity_type))
+        last_end = end
+
+    # 6. 生成持久化占位符并从后往前替换
     redacted_text = text
     hits = []
-    for original, (placeholder, entity_type) in replace_list:
-        pattern = re.compile(re.escape(original))
-        last_end = 0
-        new_text_parts = []
-        for match in pattern.finditer(redacted_text):
-            start = match.start()
-            end = match.end()
-            # 记录命中信息
-            hit = RedactionHit(
-                sens_type=entity_type,
-                start=start,
-                end=end,
-                original=original,
-                placeholder=placeholder
-            )
-            hits.append(hit)
+    for start, end, original, entity_type in reversed(merged_spans):
+        # 生成持久化占位符（同一原始值始终同一占位符）
+        if entity_type == "PERSON":
+            placeholder = mapper.get_or_create(original, "PERSON")
+        elif entity_type == "PHONE_NUMBER":
+            masked = mask_phone_number(original)
+            placeholder = masked if masked != original else mapper.get_or_create(original, "phone")
+        else:
+            placeholder = mapper.get_or_create(original, entity_type.lower())
 
-            # 写入 redaction_items 表（持久化替换记录）
-            if document_version_id:
-                # 计算 map_ref：如果 placeholder 是通过 mapper 生成的，则有 fingerprint；否则为空
-                if entity_type == "PERSON" or (entity_type != "PHONE_NUMBER" and placeholder.startswith(entity_type.upper())):
-                    # 通过 mapper 生成的占位符，可以计算 fingerprint
-                    fp = mapper._fingerprint(original)
-                else:
-                    fp = ""  # 手机号掩码等，没有映射记录
-                conn = get_connection(mapper.db_path)
-                try:
-                    conn.execute(
-                        "INSERT INTO redaction_items "
-                        "(id, document_version_id, chunk_id, sens_type, start_offset, end_offset, placeholder, map_ref, created_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
-                        (uuid.uuid4().hex, document_version_id, chunk_id or "",
-                         entity_type, start, end, placeholder, fp)
-                    )
-                    conn.commit()
-                finally:
-                    conn.close()
+        # 替换
+        redacted_text = redacted_text[:start] + placeholder + redacted_text[end:]
 
-            # 拼接替换后的文本
-            new_text_parts.append(redacted_text[last_end:start])
-            new_text_parts.append(placeholder)
-            last_end = end
-        new_text_parts.append(redacted_text[last_end:])
-        redacted_text = ''.join(new_text_parts)
+        # 记录
+        hits.append(RedactionHit(
+            sens_type=entity_type,
+            start=start,
+            end=end,
+            original=original,
+            placeholder=placeholder
+        ))
 
+    # 按 start 排序返回
+    hits.sort(key=lambda h: h.start)
     return redacted_text, hits
 
 
@@ -1735,20 +1747,14 @@ class MaterialService:
         status = derive_version_status(pages)
         chunks = build_chunks(version_id, pages)
 
-        # 第一步：对所有 chunk 进行脱敏（不写数据库）
-        mapper = get_global_mapper()  # 在事务外获取 mapper
+        # 第一步：对所有 chunk 进行脱敏
+        # redact_text 已返回持久化占位符（通过 entity_global_map），无需二次转换
         redaction_rows: list[dict[str, Any]] = []
         for chunk in chunks:
             redacted, hits = redact_text(chunk["text_raw"])
             chunk["text_redacted"] = redacted
+            chunk["_hits"] = hits  # 缓存 hits 供后续碰撞使用
             for hit in hits:
-                # 将临时占位符替换为持久化的全局 ID
-                persistent_placeholder = mapper.get_or_create(
-                    original=hit.original,
-                    sens_type=hit.sens_type,
-                    task_id=""  # 可根据需要传递 task_id
-                )
-                map_ref = mapper._fingerprint(hit.original)  # 指纹作为 map_ref
                 redaction_rows.append({
                     "id": new_id(),
                     "document_version_id": version_id,
@@ -1756,13 +1762,10 @@ class MaterialService:
                     "sens_type": hit.sens_type,
                     "start_offset": hit.start,
                     "end_offset": hit.end,
-                    "placeholder": persistent_placeholder,
-                    "map_ref": map_ref,
+                    "placeholder": hit.placeholder,
+                    "map_ref": get_global_mapper()._fingerprint(hit.original),
                     "created_at": utc_now(),
                 })
-
-        for row in redaction_rows:
-            row["map_ref"] = ""
 
         with db_session(self.db_path) as conn:
             for page in pages:
@@ -1788,6 +1791,10 @@ class MaterialService:
                         "error_message": page.get("error_message"),
                     },
                 )
+
+            # 清理临时字段，避免插入数据库时报错
+            for chunk in chunks:
+                chunk.pop("_hits", None)
             replace_chunks(conn, version_id, chunks)
 
             for row in redaction_rows:
@@ -2200,5 +2207,4 @@ def get_material_service() -> MaterialService:
 def set_material_service(service: MaterialService | None) -> None:
     global _default_service
     _default_service = service
-
 

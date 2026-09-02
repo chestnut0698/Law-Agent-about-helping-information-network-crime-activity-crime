@@ -1091,7 +1091,7 @@
                 }
                 this._renderCitePane({
                     error: false,
-                    title: '原文回链（脱敏）',
+                    title: '原文回链',
                     text: data.text || source.quote || '无文本',
                     meta: [source.filename || source.document_name, source.page_start || source.page_no ? `第 ${source.page_start || source.page_no} 页` : '']
                         .filter(Boolean).join(' · ')

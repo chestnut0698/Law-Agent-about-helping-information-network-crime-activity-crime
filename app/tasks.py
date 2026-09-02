@@ -980,19 +980,15 @@ class TaskService:
         *,
         chunk_ids: list[str] | None = None,
     ) -> dict[str, Any]:
-        from agents.gateway import GatewayError
         from agents.structured_roles import run_extraction
         from app.config import PROMPT_VERSIONS
 
         chunks = self.list_gated_chunks(task_id, user_id, chunk_ids=chunk_ids)
-        try:
-            result = run_extraction(
-                chunks,
-                task_id=task_id,
-                approval_id=f"task:{task_id}",
-            )
-        except GatewayError as exc:
-            raise TaskError(exc.code, exc.message, details=exc.to_dict()) from exc
+        result = run_extraction(
+            chunks,
+            task_id=task_id,
+            approval_id=f"task:{task_id}",
+        )
 
         mentions = []
         chunk_meta = {item["chunk_id"]: item for item in chunks}
@@ -1072,19 +1068,15 @@ class TaskService:
         entity_b: dict[str, Any],
         user_id: str | None = None,
     ) -> dict[str, Any]:
-        from agents.gateway import GatewayError
         from agents.structured_roles import run_normalization
 
         self.get_task(task_id)
-        try:
-            result = run_normalization(
-                entity_a,
-                entity_b,
-                task_id=task_id,
-                approval_id=f"task:{task_id}",
-            )
-        except GatewayError as exc:
-            raise TaskError(exc.code, exc.message, details=exc.to_dict()) from exc
+        result = run_normalization(
+            entity_a,
+            entity_b,
+            task_id=task_id,
+            approval_id=f"task:{task_id}",
+        )
 
         records_a = entity_a.get("records") or entity_a.get("sources") or []
         records_b = entity_b.get("records") or entity_b.get("sources") or []
@@ -1119,18 +1111,15 @@ class TaskService:
         rule_hits: list[dict[str, Any]],
         user_id: str | None = None,
     ) -> dict[str, Any]:
-        from agents.gateway import GatewayError
         from agents.structured_roles import run_clue_wording
 
         self.get_task(task_id)
-        try:
-            result = run_clue_wording(
-                rule_hits,
-                task_id=task_id,
-                approval_id=f"task:{task_id}",
-            )
-        except GatewayError as exc:
-            raise TaskError(exc.code, exc.message, details=exc.to_dict()) from exc
+
+        result = run_clue_wording(
+            rule_hits,
+            task_id=task_id,
+            approval_id=f"task:{task_id}",
+        )
         return result
 
     def run_output_verify(
@@ -1141,20 +1130,16 @@ class TaskService:
         reverse_materials: list[dict[str, Any]] | None = None,
         user_id: str | None = None,
     ) -> dict[str, Any]:
-        from agents.gateway import GatewayError
         from agents.structured_roles import run_output_verify
 
         self.get_task(task_id)
-        try:
-            return run_output_verify(
-                clue_text,
-                evidence,
-                reverse_materials,
-                task_id=task_id,
-                approval_id=f"task:{task_id}",
-            )
-        except GatewayError as exc:
-            raise TaskError(exc.code, exc.message, details=exc.to_dict()) from exc
+        return run_output_verify(
+            clue_text,
+            evidence,
+            reverse_materials,
+            task_id=task_id,
+            approval_id=f"task:{task_id}",
+        )
 
     def run_collision(
         self,
@@ -1245,7 +1230,6 @@ class TaskService:
         user_id: str | None = None,
     ) -> dict[str, Any]:
         """R001–R005 命中 → 线索表述 → 独立校核 → 通过者落 CLUE 产物。"""
-        from agents.gateway import GatewayError
         from agents.structured_roles import run_clue_wording, run_output_verify
         from tools.entities import LEGAL_BOUNDARY, collect_rule_hits
 
@@ -1285,27 +1269,22 @@ class TaskService:
             if len(case_ids) < 2 or len(chunk_ids) < 2:
                 skipped.append({"fingerprint": fingerprint, "reason": "below_cross_case_threshold"})
                 continue
-            try:
-                wording = run_clue_wording(
-                    [hit],
-                    task_id=task_id,
-                    approval_id=f"task:{task_id}",
-                )
-            except GatewayError as exc:
-                skipped.append({"fingerprint": fingerprint, "reason": exc.code})
-                continue
+
+            wording = run_clue_wording(
+                [hit],
+                task_id=task_id,
+                approval_id=f"task:{task_id}",
+            )
+
             output = wording.get("output") or {}
             clue_text = f"{output.get('title') or ''}\n{output.get('summary') or ''}"
-            try:
-                verified = run_output_verify(
-                    clue_text,
-                    evidence,
-                    task_id=task_id,
-                    approval_id=f"task:{task_id}",
-                )
-            except GatewayError as exc:
-                skipped.append({"fingerprint": fingerprint, "reason": exc.code})
-                continue
+            verified = run_output_verify(
+                clue_text,
+                evidence,
+                task_id=task_id,
+                approval_id=f"task:{task_id}",
+            )
+
             verdict = verified.get("output") or {}
             if not verdict.get("passed", True) or verdict.get("over_bound"):
                 skipped.append({"fingerprint": fingerprint, "reason": "verify_rejected"})
