@@ -304,12 +304,64 @@
   {
     "type": "function",
     "function": {
-      "name": "generate_task_clues",
-      "description": "根据 R001–R005 规则命中生成跨案线索产物（CLUE_SET），含线索表述与输出校核。",
+      "name": "write_ai_clues",
+      "description": "将 AI 自主生成的跨案关联线索写入工作台。调用前应确保已阅读 ENTITY_CANDIDATE_SET 和 ROLE_TIMELINE 产物。线索需包含标题、摘要和至少一条证据引用（chunk_id + quote_hash）。",
       "parameters": {
         "type": "object",
-        "properties": {},
-        "required": []
+        "properties": {
+          "clues": {
+            "type": "array",
+            "description": "线索列表",
+            "items": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "string",
+                  "description": "线索标题，一句话概括"
+                },
+                "summary": {
+                  "type": "string",
+                  "description": "线索摘要，尽量详实，不超过 600 字"
+                },
+                "evidence": {
+                  "type": "array",
+                  "description": "支撑证据列表",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "chunk_id": {"type": "string", "description": "材料片段 ID"},
+                      "quote": {"type": "string", "description": "脱敏原文片段"},
+                      "quote_hash": {"type": "string", "description": "quote 的 SHA-256 哈希"},
+                      "page_start": {"type": "integer", "description": "起始页码"},
+                      "page_end": {"type": "integer", "description": "结束页码"},
+                      "document_version_id": {"type": "string", "description": "文档版本 ID"}
+                    },
+                    "required": ["chunk_id", "quote_hash"]
+                  }
+                }
+              },
+              "required": ["title", "summary", "evidence"]
+            }
+          }
+        },
+        "required": ["clues"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "read_artifact",
+      "description": "读取指定产物的完整内容。先通过 get_task_overview 获得 artifact_id，再用此工具读取 ENTITY_CANDIDATE_SET 或 ROLE_TIMELINE 的详细数据。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "artifact_id": {
+            "type": "string",
+            "description": "产物 ID，从 get_task_overview 返回的 artifacts 列表中获取"
+          }
+        },
+        "required": ["artifact_id"]
       }
     }
   }

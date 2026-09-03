@@ -144,6 +144,7 @@ def load_rules() -> dict[str, Any]:
                 {"id": "R003", "version": "v1", "object_type": "DEVICE", "label": "同一设备标识跨案出现", "evidence_mode": "DIRECT_MATERIAL"},
                 {"id": "R004", "version": "v1", "object_type": "TRANSFER_ACCOUNT", "label": "资金路径交叉（同账户转账活动跨案）", "evidence_mode": "RULE_INFERRED", "event_type": "TRANSFER", "party_type": "ACCOUNT"},
                 {"id": "R005", "version": "v1", "object_type": "CONTACT_PHONE", "label": "共同联系人（同手机号联络事件跨案）", "evidence_mode": "RULE_INFERRED", "event_type": "CONTACT", "party_type": "PHONE"},
+                {"id": "R006", "version": "v1", "object_type": "NAME", "label": "同一姓名跨案出现","evidence_mode": "DIRECT_MATERIAL"},
             ],
         }
 
@@ -1158,15 +1159,21 @@ def collect_rule_hits(
     """R001–R003（强标识提及）+ R004/R005（事件层），输出脱敏证据。"""
     init_entity_db(db_path)
     collision = extract_and_collide(task_id, cases, db_path=db_path)
-    rules = {item["object_type"]: item for item in (load_rules().get("rules") or [])}
+    all_rules = load_rules().get("rules") or []
+    # 按 object_type 索引，只取 DIRECT_MATERIAL 类型的规则
+    rules_by_type = {
+        item["object_type"]: item
+        for item in all_rules
+        if item.get("evidence_mode") == "DIRECT_MATERIAL"
+    }
     hits = []
     now = utc_now()
     with db_session(db_path) as conn:
         for candidate in collision["candidates"]:
             object_type = candidate["entity_type"]
-            spec = rules.get(object_type)
-            if not spec or spec.get("id") not in {"R001", "R002", "R003"}:
-                continue
+            spec = rules_by_type.get(object_type)
+            if not spec:
+                continue   # 不是 DIRECT_MATERIAL 的候选（如事件层规则）跳过
             evidence = []
             chunk_ids = []
             for record in candidate.get("records") or []:

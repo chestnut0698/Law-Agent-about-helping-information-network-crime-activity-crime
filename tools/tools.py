@@ -24,5 +24,6 @@ tool_functions = {
     "refresh_task_materials": refresh_task_materials,
     "run_task_collision": run_task_collision,
     "run_task_timeline": run_task_timeline,
-    "generate_task_clues": generate_task_clues,
+    "write_ai_clues": write_ai_clues,
+    "read_artifact": read_artifact,
 }

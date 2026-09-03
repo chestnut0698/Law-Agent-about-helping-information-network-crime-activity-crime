@@ -121,7 +121,7 @@ def run_task_timeline(task_id: str, user_id: str | None = None) -> str:
 
 
 def generate_task_clues(task_id: str, user_id: str | None = None) -> str:
-    """根据 R001–R005 规则命中生成跨案线索产物（含表述与校核）。"""
+    """根据 R001–R006 规则命中生成跨案线索产物（含表述与校核）。"""
     try:
         result = get_task_service().generate_clues(task_id, user_id=user_id or "system")
         return _tool_json(
@@ -133,5 +133,37 @@ def generate_task_clues(task_id: str, user_id: str | None = None) -> str:
                 hit_count=result.get("hit_count"),
             )
         )
+    except TaskError as exc:
+        return _tool_json(exc.to_dict())
+
+def write_ai_clues(task_id: str, clues: list[dict[str, Any]], user_id: str | None = None) -> str:
+    try:
+        result = get_task_service().write_ai_clues(task_id, clues, user_id=user_id or "system")
+        return _tool_json({
+            "ok": True,
+            "artifact_id": result["artifact"]["id"] if result.get("artifact") else None,
+            "clue_count": result["clue_count"],
+            "message": f"成功写入 {result['clue_count']} 条线索",
+        })
+    except TaskError as exc:
+        return _tool_json(exc.to_dict())
+
+def read_artifact(task_id: str, artifact_id: str, user_id: str | None = None) -> str:
+    """
+    读取指定产物的完整内容（含 payload）。
+    用于 AI 分析 ENTITY_CANDIDATE_SET 或 ROLE_TIMELINE 的详细数据。
+    """
+    try:
+        service = get_task_service()
+        result = service.get_artifact(task_id, artifact_id)
+        return _tool_json({
+            "ok": True,
+            "artifact_id": artifact_id,
+            "type": result["artifact"]["type"],
+            "title": result["artifact"]["title"],
+            "status": result["artifact"]["status"],
+            "version": result["version"],
+            "payload": result["payload"],  # 核心数据
+        })
     except TaskError as exc:
         return _tool_json(exc.to_dict())

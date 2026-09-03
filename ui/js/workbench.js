@@ -1497,14 +1497,14 @@
                 button.textContent = '执行中…';
             }
             const prompt = [
-                '请对本监督分析任务执行完整跨案分析：',
-                '1) 先 get_task_overview 了解案件与材料；',
-                '2) 若仍为草稿则 confirm_task_plan；',
-                '3) 刷新材料后 run_task_collision；',
-                '4) run_task_timeline 抽取转账/联络事件；',
-                '5) generate_task_clues 生成可回原文的跨案线索。',
+                '请对本监督分析任务执行完整跨案分析：\n',
+                '(1) 先 get_task_overview 了解案件与材料；\n',
+                '(2) 若仍为草稿则 confirm_task_plan；\n',
+                '(3) 刷新材料后 run_task_collision；\n',
+                '(4) run_task_timeline 抽取转账/联络事件；\n',
+                '(5) write_ai_clues 生成可回原文的跨案线索。\n',
                 '每完成一步根据观察决定是否继续；最终汇总产物并提示打开核验。',
-                '禁止输出定罪、并案、主从犯或量刑结论。'
+                '禁止输出定罪、并案、主从犯或量刑结论。\n'
             ].join('');
             try {
                 if (!window.Agent) throw new Error('智能体未就绪');

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json, os
 from typing import Any, Optional
-
+import hashlib
 from pathlib import Path
 from app.config import MATERIAL_STORAGE_DIR, REDACTION_STORAGE_DIR
 
@@ -1104,6 +1104,124 @@ class TaskService:
             run_id=result.get("run_id"),
         )
         return {**saved, "run_id": result.get("run_id"), "degraded": bool(result.get("degraded"))}
+
+    def write_ai_clues(
+            self,
+            task_id: str,
+            clues: list[dict[str, Any]],  # 注意：clues 是列表，不是字典
+            user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        AI 通过工具调用写入线索。clues 格式：
+        [
+            {
+                "title": "线索标题",
+                "summary": "线索描述（200字内）",
+                "evidence": [
+                    {
+                        "chunk_id": "xxx",
+                        "quote": "脱敏原文片段",
+                        "quote_hash": "sha256",
+                        "page_start": 1,
+                        "page_end": 1,
+                        "document_version_id": "xxx"
+                    }
+                ]
+            }
+        ]
+        """
+        task = self.get_task(task_id)
+        if task["status"] == "SCOPE_DRAFT":
+            raise TaskError(TASK_ERROR_CODES["STATE_CONFLICT"], "计划尚未确认")
+
+        if not clues:
+            return {"artifact": None, "clue_count": 0, "message": "没有线索可写入"}
+
+        # 校验每条线索
+        item_ids = []
+        for idx, clue in enumerate(clues):
+            title = clue.get("title", "").strip()
+            summary = clue.get("summary", "").strip()
+            evidence = clue.get("evidence", [])
+
+            if not title:
+                raise TaskError(TASK_ERROR_CODES["INVALID_SCOPE"], f"第 {idx + 1} 条线索缺少 title")
+            if not summary:
+                raise TaskError(TASK_ERROR_CODES["INVALID_SCOPE"], f"第 {idx + 1} 条线索缺少 summary")
+            if not evidence:
+                raise TaskError(TASK_ERROR_CODES["INVALID_SCOPE"], f"第 {idx + 1} 条线索至少需要一条 evidence")
+
+            # 校验每条 evidence
+            for ev in evidence:
+                if not ev.get("chunk_id"):
+                    raise TaskError(TASK_ERROR_CODES["INVALID_SCOPE"], f"第 {idx + 1} 条线索的 evidence 缺少 chunk_id")
+                if not ev.get("quote_hash"):
+                    raise TaskError(TASK_ERROR_CODES["INVALID_SCOPE"],
+                                    f"第 {idx + 1} 条线索的 evidence 缺少 quote_hash")
+
+            # 生成唯一的 ref_key（不使用 canonical_hash）
+            hash_input = f"{title}{summary}".encode("utf-8")
+            short_hash = hashlib.sha256(hash_input).hexdigest()[:16]
+            ref_key = f"ai-clue:{short_hash}"
+
+            # 创建独立的 CLUE_ITEM 产物
+            clue_item = self.write_artifact(
+                task_id=task_id,
+                type="CLUE_ITEM",
+                title=title,
+                ref_key=ref_key,
+                status="VALID",
+                parent_ids=[],  # 稍后由 CLUE_SET 统一关联
+                payload={
+                    "title": title,
+                    "summary": summary,
+                    "evidence": evidence,
+                    "producer": "AI_AGENT",
+                    "rule_id": "AI_CLUE",
+                },
+                input_snapshot={"clue_index": idx},
+            )
+            item_ids.append(clue_item["id"])
+
+        # 获取批次作为父产物
+        batch = self.find_artifact(task_id, "MATERIAL_BATCH", "batch")
+
+        # 创建 CLUE_SET 产物，items 中携带 artifact_id
+        clue_set_payload = {
+            "summary": {
+                "total": len(item_ids),
+                "producer": "AI_AGENT",
+            },
+            "items": [
+                {
+                    "artifact_id": aid,
+                    "title": clue["title"],  # 可直接取第一条，但最好遍历
+                    "rule_id": "AI_CLUE",
+                    "case_count": len(clue.get("evidence", [])),
+                    "chunk_count": len(clue.get("evidence", [])),
+                }
+                for aid, clue in zip(item_ids, clues)
+            ],
+            "boundary": "AI 生成的待核验关联线索，不代表系统已认定为同一实体或共同犯罪。",
+        }
+
+        artifact = self.write_artifact(
+            task_id=task_id,
+            type="CLUE_SET",
+            title="AI 生成的跨案线索",
+            ref_key="ai-clues",  # 固定 ref_key，确保覆盖旧版本
+            status="VALID" if item_ids else "DRAFT",
+            parent_ids=[batch["id"]] if batch else [],
+            payload=clue_set_payload,
+            input_snapshot={"clue_count": len(item_ids)},
+        )
+
+        return {
+            "artifact": artifact,
+            "clue_count": len(item_ids),
+            "task": self.get_task(task_id),
+        }
+
 
     def run_clue_wording(
         self,
