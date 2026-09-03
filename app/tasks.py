@@ -398,6 +398,7 @@ class TaskService:
             return tasks
 
     def get_task(self, task_id: str) -> dict[str, Any]:
+        self._sync_material_doc_artifacts(task_id)
         with db_session(self.db_path) as conn:
             task = _row(conn, "SELECT * FROM supervision_tasks WHERE id = ?", (task_id,))
             if not task:
@@ -415,8 +416,9 @@ class TaskService:
 
         for artifact in artifacts:
             artifact["parent_ids"] = json.loads(artifact["parent_ids_json"] or "[]")
+        live_doc_ids = self._live_document_ids(task_id)
         task["artifacts"] = artifacts
-        task["directory"] = self._build_directory(artifacts)
+        task["directory"] = self._build_directory(artifacts, live_doc_ids=live_doc_ids)
         return task
 
     def confirm_plan(self, task_id: str, user_id: str | None = None) -> dict[str, Any]:
@@ -1319,6 +1321,7 @@ class TaskService:
         return {"groups": groups, "totals": totals}
 
     def refresh_material_batch(self, task_id: str, user_id: str | None = None) -> dict[str, Any]:
+        self._sync_material_doc_artifacts(task_id)
         scope = self.find_artifact(task_id, "TASK_SCOPE", "scope")
         return self.write_artifact(
             task_id=task_id,
@@ -1368,14 +1371,62 @@ class TaskService:
             "cases": cases,
         }
 
-    def _build_directory(self, artifacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _live_document_ids(self, task_id: str) -> set[str]:
+        with db_session(self.db_path) as conn:
+            rows = _rows(
+                conn,
+                """
+                SELECT d.id FROM documents d
+                JOIN task_cases tc ON tc.case_id = d.case_id
+                WHERE tc.task_id = ? AND d.deleted_at IS NULL
+                """,
+                (task_id,),
+            )
+        return {row["id"] for row in rows}
+
+    def _sync_material_doc_artifacts(self, task_id: str) -> None:
+        """已删材料对应的 MATERIAL_DOC 作废，保证任务目录与批次清单一致。"""
+        live = self._live_document_ids(task_id)
+        with db_session(self.db_path) as conn:
+            stale = _rows(
+                conn,
+                """
+                SELECT * FROM artifacts
+                WHERE task_id = ? AND type = 'MATERIAL_DOC' AND status != 'INVALID'
+                """,
+                (task_id,),
+            )
+        for art in stale:
+            doc_id = art.get("ref_key")
+            if doc_id and doc_id not in live:
+                self.write_artifact(
+                    task_id=task_id,
+                    type="MATERIAL_DOC",
+                    title=art.get("title") or "材料",
+                    ref_key=doc_id,
+                    status="INVALID",
+                    payload={
+                        "document_id": doc_id,
+                        "status": "DELETED",
+                        "deleted": True,
+                    },
+                )
+
+    def _build_directory(
+        self,
+        artifacts: list[dict[str, Any]],
+        live_doc_ids: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
         directory = []
         for group in DIRECTORY_GROUPS:
-            items = [
-                a
-                for a in artifacts
-                if a["type"] in group["types"] and a.get("status") != "INVALID"
-            ]
+            items = []
+            for a in artifacts:
+                if a["type"] not in group["types"] or a.get("status") == "INVALID":
+                    continue
+                if a["type"] == "MATERIAL_DOC" and live_doc_ids is not None:
+                    if a.get("ref_key") not in live_doc_ids:
+                        continue
+                items.append(a)
             directory.append(
                 {
                     "key": group["key"],

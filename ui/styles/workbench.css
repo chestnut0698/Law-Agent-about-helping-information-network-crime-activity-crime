@@ -124,34 +124,59 @@ body,
 }
 
 .wb-rail.collapsed {
-    width: 0;
-    flex-basis: 0;
-    padding: 0;
+    flex: 0 0 56px;
+    width: 56px;
+    min-width: 56px;
+    max-width: 56px;
+    padding: 12px 6px;
     overflow: hidden;
-    border-right: none;
+    align-items: center;
+    border-right: 1px solid var(--border-color);
+    box-shadow: 1px 0 0 var(--border-light);
 }
 
-.wb-rail-expand {
-    position: fixed;
-    top: 12px;
-    left: 6px;
-    z-index: 200;
-    width: 28px;
-    height: 28px;
-    border: 1px solid var(--border-color);
-    border-radius: 8px;
-    background: var(--bg-primary);
-    color: var(--text-secondary);
-    cursor: pointer;
+.wb-rail.collapsed .wb-rail-label,
+.wb-rail.collapsed .wb-task-chip-name,
+.wb-rail.collapsed .wb-task-del,
+.wb-rail.collapsed .wb-rail-empty {
+    display: none !important;
+}
+
+.wb-rail.collapsed .wb-task-list,
+.wb-rail.collapsed .wb-task-history {
+    align-items: center;
+}
+
+.wb-rail.collapsed .wb-rail-top {
+    flex-direction: column;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 6px;
+    width: 100%;
+}
+
+.wb-rail.collapsed .wb-task-chip {
+    width: 36px;
+    min-height: 36px;
+    padding: 0;
+    justify-content: center;
+}
+
+.wb-rail.collapsed .wb-task-chip-abbr {
+    margin: 0;
+}
+
+.wb-rail.collapsed .wb-rail-footer {
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    margin-top: auto;
+}
+
+.wb-rail.collapsed #wb-collapse-rail {
     display: none;
-    place-items: center;
 }
-
-.wb-rail-expand svg { width: 15px; height: 15px; }
-.wb-rail-expand:hover { background: var(--bg-hover); color: var(--text-primary); }
-.wb-rail.collapsed ~ .wb-rail-expand,
-.wb-rail.collapsed + .wb-start ~ .wb-rail-expand,
-.wb-rail.collapsed + .wb-workspace ~ .wb-rail-expand { display: grid; }
 
 .wb-rail-top {
     display: flex;
@@ -195,7 +220,7 @@ body,
     transition: background var(--transition-fast), color var(--transition-fast);
 }
 
-.wb-rail-btn svg { width: 17px; height: 17px; }
+.wb-rail-btn svg { width: 17px; height: 17px; transition: transform 200ms ease; }
 .wb-rail-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
 
 .wb-rail-primary {
@@ -354,6 +379,7 @@ body,
     padding: 44px 32px 60px;
     display: flex;
     justify-content: center;
+    position: relative;
     background:
         radial-gradient(circle at top left, var(--wb-accent-pale), transparent 45%),
         var(--bg-secondary);
@@ -611,6 +637,7 @@ body,
 
 /* 任务目录 */
 .wb-dir {
+    position: relative;
     background: var(--bg-primary);
     border-right: 1px solid var(--border-color);
     overflow: hidden;
@@ -620,7 +647,47 @@ body,
     flex-direction: column;
 }
 
-.wb-dir-head { padding: 14px 14px 10px; border-bottom: 1px solid var(--border-color); flex: 0 0 auto; }
+.wb-dir-head {
+    position: relative;
+    padding: 12px 12px 10px;
+    border-bottom: 1px solid var(--border-color);
+    flex: 0 0 auto;
+}
+
+.wb-dir-head-text {
+    min-width: 0;
+}
+
+/* 默认不显示、不占位。侧栏收起后，鼠标移到当前页左侧标题区才悬浮出来 */
+.wb-dir-expand-rail {
+    display: none !important;
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    z-index: 20;
+}
+
+.wb-page-expand-host {
+    display: none;
+}
+
+#sidebar.collapsed ~ #wb-start .wb-page-expand-host {
+    display: block;
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 244px;
+    height: 56px;
+    z-index: 15;
+}
+
+#sidebar.collapsed ~ #wb-workspace #wb-dir-head:hover .wb-dir-expand-rail,
+#sidebar.collapsed ~ #wb-workspace .wb-dir-expand-rail:hover,
+#sidebar.collapsed ~ #wb-start .wb-page-expand-host:hover .wb-dir-expand-rail,
+#sidebar.collapsed ~ #wb-start .wb-dir-expand-rail:hover {
+    display: grid !important;
+}
+
 .wb-dir-title { font-size: 13px; font-weight: 650; }
 .wb-dir-meta { font-size: 11px; color: var(--text-muted); margin-top: 3px; }
 .wb-dir-body { padding: 8px; flex: 1 1 auto; min-height: 0; overflow-y: auto; }
@@ -845,19 +912,30 @@ body,
     margin: 18px 0 2px;
 }
 
-/* 材料进度行 */
+/* 材料进度行：右侧 × 始终钉住，窄栏时压缩文件名和进度，不把删除挤出可视区 */
 .wb-file-row {
-    display: grid;
-    grid-template-columns: 40px minmax(150px, 1fr) 180px 92px 30px;
-    gap: 12px;
+    display: flex;
     align-items: center;
+    gap: 10px;
     padding: 12px 0;
     border-bottom: 1px solid var(--border-color);
+    min-width: 0;
+}
+
+.wb-file-row > :nth-child(2) {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.wb-file-row > :nth-child(3) {
+    flex: 0 1 140px;
+    min-width: 64px;
 }
 
 .wb-file-type {
     width: 36px;
     height: 30px;
+    flex: 0 0 36px;
     border-radius: 6px;
     background: var(--bg-secondary);
     color: var(--text-secondary);
@@ -880,16 +958,24 @@ body,
 .wb-progress-fill { height: 100%; background: var(--wb-accent); transition: width var(--transition-normal); }
 .wb-progress-fill.warn { background: var(--wb-danger); }
 .wb-file-stage { font-size: 11px; color: var(--text-muted); margin-top: 5px; }
-.wb-file-status { font-size: 12px; text-align: right; color: var(--text-secondary); }
+.wb-file-status {
+    font-size: 12px;
+    text-align: right;
+    color: var(--text-secondary);
+    flex: 0 0 auto;
+    white-space: nowrap;
+}
 
 .wb-file-del {
     width: 26px;
     height: 26px;
+    flex: 0 0 26px;
     border: none;
     border-radius: 6px;
     background: transparent;
     color: var(--text-muted);
-    font-size: 16px;
+    font-size: 18px;
+    line-height: 1;
     cursor: pointer;
     display: grid;
     place-items: center;
@@ -1324,4 +1410,19 @@ body,
     margin-top: 8px;
     font-size: 11px;
     color: var(--text-muted);
+}
+
+/* 材料抽取预览：只换主题色，排版与字号保持原样 */
+.wb-doc-preview {
+    white-space: pre-wrap;
+    word-break: break-word;
+    padding: 16px;
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    border-radius: 6px;
+    font-size: 13px;
+    line-height: 1.7;
+    max-height: calc(100vh - 250px);
+    overflow-y: auto;
+    margin-top: 12px;
 }

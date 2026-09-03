@@ -168,16 +168,14 @@ async def delete_material(
         x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
     try:
-        # 1. 软删除材料
-        result = get_material_service().logical_delete(document_id, user_id=x_user_id)
-
-        # 2. ★ 刷新材料批次（重新生成 MATERIAL_BATCH 产物）
-        batch = get_task_service().refresh_material_batch(task_id, user_id=x_user_id)
-
+        result = get_task_service().remove_material(
+            task_id, document_id, user_id=x_user_id
+        )
         return {
             "status": "DELETED",
-            "batch_artifact_id": batch["id"],  # 前端会用这个 ID 打开新批次
-            **result
+            "batch_artifact_id": result["batch_artifact_id"],
+            "task": result["task"],
+            "document_id": result["document_id"],
         }
     except MaterialError as exc:
         return material_error_response(exc)

@@ -14,7 +14,7 @@
     <link rel="stylesheet" href="styles/toast.css">
     <link rel="stylesheet" href="styles/markdown.css">
     <link rel="stylesheet" href="styles/responsive.css">
-    <link rel="stylesheet" href="styles/workbench.css">
+    <link rel="stylesheet" href="styles/workbench.css?v=20260903-filedel">
     <script>
         // 在样式生效前定妥主题，避免深色模式下首帧闪白
         (function () {
@@ -76,14 +76,16 @@
         </div>
 
     </aside>
-    <button class="wb-rail-expand" id="wb-expand-rail" title="展开侧栏">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M9 18l6-6-6-6"/>
-        </svg>
-    </button>
 
     <!-- 状态 A：对话式任务启动（保留范围选项，可按案件上传） -->
     <section class="wb-start" id="wb-start">
+        <div class="wb-page-expand-host" id="wb-start-expand-host">
+            <button class="wb-rail-btn wb-dir-expand-rail" id="wb-expand-rail-start" title="展开侧栏" type="button" tabindex="-1">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M9 18l6-6-6-6"/>
+                </svg>
+            </button>
+        </div>
         <div class="wb-start-inner wb-start-chat">
             <header class="wb-start-head">
                 <div class="wb-brand wb-brand-lg">链证</div>
@@ -143,9 +145,16 @@
     <section class="wb-workspace" id="wb-workspace" hidden>
         <!-- 任务目录：业务对象清单，可收起 -->
         <nav class="wb-dir" id="wb-dir">
-            <div class="wb-dir-head">
-                <div class="wb-dir-title" id="wb-dir-title">监督分析任务</div>
-                <div class="wb-dir-meta" id="wb-dir-meta"></div>
+            <div class="wb-dir-head" id="wb-dir-head">
+                <div class="wb-dir-head-text">
+                    <div class="wb-dir-title" id="wb-dir-title">监督分析任务</div>
+                    <div class="wb-dir-meta" id="wb-dir-meta"></div>
+                </div>
+                <button class="wb-rail-btn wb-dir-expand-rail" id="wb-expand-rail" title="展开侧栏" type="button" tabindex="-1">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M9 18l6-6-6-6"/>
+                    </svg>
+                </button>
             </div>
             <div class="wb-dir-body" id="wb-dir-body"></div>
         </nav>
@@ -153,12 +162,6 @@
         <!-- 中间产物工作区 -->
         <div class="wb-center">
             <header class="wb-topbar">
-                <button class="wb-icon-btn" id="wb-toggle-rail" title="收起 / 展开全局任务栏">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <rect x="3" y="4" width="6" height="16" rx="1.5"/>
-                        <path d="M13 8h8M13 12h8M13 16h5"/>
-                    </svg>
-                </button>
                 <div class="wb-topbar-context" id="wb-topbar-context"></div>
                 <button class="wb-icon-btn" id="wb-toggle-agent" title="收起 / 展开智能体">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -273,7 +276,7 @@
 <script src="js/sidebar.js"></script>
 <script src="js/input.js"></script>
 <script src="js/theme.js"></script>
-<script src="js/workbench.js"></script>
+<script src="js/workbench.js?v=20260903-filedel"></script>
 <script src="js/main.js"></script>
 </body>
 </html>

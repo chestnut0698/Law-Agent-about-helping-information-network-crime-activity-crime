@@ -42,8 +42,9 @@
                 const main = Utils.$('.main-content');
                 if (Utils.isMobile()) {
                     sidebar.classList.toggle('mobile-open', !collapsed);
-                } else {
+                } else if (sidebar) {
                     sidebar.classList.toggle('collapsed', collapsed);
+                    State.sidebarCollapsed = collapsed;
                     if (main) main.style.marginLeft = collapsed ? '0' : '';
                 }
             });

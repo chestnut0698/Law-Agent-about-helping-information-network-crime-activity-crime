@@ -72,7 +72,6 @@
                     older.forEach(task => history.appendChild(this._taskChip(task, true)));
                 }
             }
-            this._syncRailCollapseAvailability();
         },
 
         _taskChip(task, compact) {
@@ -123,18 +122,12 @@
             return chip;
         },
 
-        _syncRailCollapseAvailability() {
-            const railBtn = Utils.$('#wb-toggle-rail');
-            const workspace = Utils.$('#wb-workspace');
-            const canCollapse = workspace && !workspace.hidden;
-            if (railBtn) {
-                railBtn.hidden = !canCollapse;
-                railBtn.disabled = !canCollapse;
-            }
-            if (!canCollapse && State.sidebarCollapsed) {
-                State.sidebarCollapsed = false;
-                Events.emit('sidebar:toggle', false);
-            }
+        _setRailCollapsed(collapsed) {
+            State.sidebarCollapsed = collapsed;
+            const app = Utils.$('#wb-app');
+            const rail = Utils.$('#sidebar');
+            if (app) app.classList.toggle('rail-collapsed', collapsed);
+            if (rail) rail.classList.toggle('collapsed', collapsed);
         },
 
         // ---------- 状态 A：范围设置 ----------
@@ -149,17 +142,15 @@
                 this._addCaseRow('案件 B');
             }
             this._checkScope();
-            this._syncRailCollapseAvailability();
         },
 
         _bindShell() {
             const collapseBtn = Utils.$('#wb-collapse-rail');
-            const expandBtn = Utils.$('#wb-expand-rail');
             if (collapseBtn) collapseBtn.addEventListener('click', () => {
-                Utils.$('#sidebar').classList.add('collapsed');
+                this._setRailCollapsed(true);
             });
-            if (expandBtn) expandBtn.addEventListener('click', () => {
-                Utils.$('#sidebar').classList.remove('collapsed');
+            Utils.$$('.wb-dir-expand-rail').forEach((btn) => {
+                btn.addEventListener('click', () => this._setRailCollapsed(false));
             });
 
             const newTask = Utils.$('#wb-new-task');
@@ -176,16 +167,6 @@
                 if (list) list.innerHTML = '';
                 this._renderRail();
                 this.showStart();
-            });
-
-            // 仅当工作台（含文件目录）出现时，才允许收起最左侧全局栏
-            const railBtn = Utils.$('#wb-toggle-rail');
-            if (railBtn) railBtn.addEventListener('click', () => {
-                if (Utils.$('#wb-workspace').hidden) {
-                    Toast.info('进入工作台后才可收起左侧栏');
-                    return;
-                }
-                State.toggleSidebar();
             });
 
             const agentBtn = Utils.$('#wb-toggle-agent');
@@ -401,7 +382,6 @@
             this._renderRail();
             this._renderContext();
             this._renderDirectory();
-            this._syncRailCollapseAvailability();
             this._renderPanel();
 
             if (task.status === 'SCOPE_DRAFT') {
@@ -412,6 +392,9 @@
                 this.draftTaskId = task.id;
                 this._maybeOfferRerun();
             }
+
+            const targetId = artifactId || this._defaultArtifactId();
+            if (targetId) await this.openArtifact(targetId);
         },
 
         _maybeOfferRerun() {
@@ -759,15 +742,16 @@
             }));
 
             (payload.groups || []).forEach(group => {
+                const materials = (group.materials || []).filter(m => m.status !== 'DELETED');
                 panel.appendChild(Utils.create('div', {
                     class: 'wb-group-label',
-                    text: `${group.case_name} · ${group.materials.length} 份材料`
+                    text: `${group.case_name} · ${materials.length} 份材料`
                 }));
 
-                if (!group.materials.length) {
+                if (!materials.length) {
                     panel.appendChild(Utils.create('div', { class: 'wb-dir-empty', text: '尚未上传材料' }));
                 }
-                group.materials.forEach(row => panel.appendChild(this._materialRow(row)));
+                materials.forEach(row => panel.appendChild(this._materialRow(row)));
             });
 
             panel.appendChild(this._uploadBox(payload));
@@ -1314,10 +1298,8 @@
                 ]);
                 panel.appendChild(head);
 
-                // 脱敏文本主体
-                const pre = Utils.create('pre', {
-                    style: 'white-space: pre-wrap; word-break: break-word; padding: 16px; background: #f8f9fa; border-radius: 6px; font-size: 13px; line-height: 1.7; max-height: calc(100vh - 250px); overflow-y: auto; margin-top: 12px;'
-                });
+                // 脱敏文本主体：字体与排版保持原样，颜色走主题变量
+                const pre = Utils.create('pre', { class: 'wb-doc-preview' });
                 pre.textContent = data.text;
                 panel.appendChild(pre);
 
@@ -1356,11 +1338,13 @@
             fill.style.width = percent + '%';
 
             const del = Utils.create('button', {
+                type: 'button',
                 class: 'wb-file-del',
                 title: '删除材料',
                 text: '×'
             });
             del.addEventListener('click', (e) => {
+                e.preventDefault();
                 e.stopPropagation();
                 this._deleteMaterial(docId);
             });
@@ -1400,7 +1384,6 @@
 
         async _deleteMaterial(documentId) {
             if (!documentId || !this.task) return;
-            if (!confirm('确定删除该材料？')) return;
             try {
                 const resp = await fetch(
                     `/api/tasks/${this.task.id}/materials/${documentId}`,
@@ -1412,7 +1395,6 @@
                     return;
                 }
                 Toast.success('材料已删除');
-                // 关掉已打开的该材料相关标签，再整页刷新目录与批次
                 const gone = new Set(
                     (this.task.artifacts || [])
                         .filter(a => a.type === 'MATERIAL_DOC' && a.ref_key === documentId)
@@ -1420,7 +1402,17 @@
                 );
                 this.tabs = this.tabs.filter(t => !gone.has(t.id));
                 if (gone.has(this.activeTabId)) this.activeTabId = null;
-                await this.openTask(this.task.id, data.batch_artifact_id || null);
+                if (data.task) {
+                    this.task = data.task;
+                } else {
+                    const taskResp = await fetch(`/api/tasks/${this.task.id}`);
+                    this.task = await taskResp.json();
+                }
+                this._renderDirectory();
+                const batchId = data.batch_artifact_id
+                    || (this.task.artifacts || []).find(a => a.type === 'MATERIAL_BATCH')?.id;
+                if (batchId) await this.openArtifact(batchId);
+                else this._renderPanel();
             } catch (e) {
                 Toast.error('删除失败：' + e.message);
             }
@@ -1628,15 +1620,25 @@
 
         async _refreshBatch() {
             if (!this.task) return;
-            await fetch(`/api/tasks/${this.task.id}/materials`);
-            const batch = (this.task.artifacts || []).find(a => a.type === 'MATERIAL_BATCH');
-            if (batch) await this.openArtifact(batch.id);
+            const resp = await fetch(`/api/tasks/${this.task.id}/materials`);
+            const data = await resp.json();
+            if (data.error_code) return;
+            const taskResp = await fetch(`/api/tasks/${this.task.id}`);
+            const task = await taskResp.json();
+            if (!task.error_code) {
+                this.task = task;
+                this._renderDirectory();
+            }
+            const batchId = data.artifact_id
+                || (this.task.artifacts || []).find(a => a.type === 'MATERIAL_BATCH')?.id;
+            if (batchId) await this.openArtifact(batchId);
         },
 
         _schedulePoll(payload) {
             clearTimeout(this.pollTimer);
             const pending = (payload.groups || []).some(g =>
-                (g.materials || []).some(m => ['UPLOADED', 'PARSING'].includes(m.status))
+                (g.materials || []).filter(m => m.status !== 'DELETED')
+                    .some(m => ['UPLOADED', 'PARSING'].includes(m.status))
             );
             if (!pending) return;
             this.pollTimer = setTimeout(() => this._refreshBatch(), 4000);
