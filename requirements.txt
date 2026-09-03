@@ -10,7 +10,9 @@ python-multipart==0.0.32
 pymupdf==1.28.2
 Pillow==12.3.0
 pytest==9.1.1
-PyYAML==6.0.3
 paddleocr>=2.7.0
 paddlepaddle>=2.5.0
 prikit==1.0.0
+presidio-analyze
+spacy
+PyPDF2

@@ -24,9 +24,6 @@ app.add_middleware(
 init_db()
 init_task_db()
 
-#from tools.tools import run_task_collision, run_task_timeline
-#print(run_task_collision(task_id="b3a77f1a-397d-44a5-9e82-ba43f2ef9337"))
-#print(run_task_timeline(task_id="b3a77f1a-397d-44a5-9e82-ba43f2ef9337"))
 
 # ---------- 案件卷宗上传与处理 ----------
 def material_error_response(exc: MaterialError) -> JSONResponse:

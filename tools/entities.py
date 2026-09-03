@@ -11,7 +11,7 @@ import json
 import re
 from collections import defaultdict
 from typing import Any
-from agents.gateway import canonical_hash, quote_hash
+import hashlib
 
 from app.files import (
     _insert,
@@ -115,6 +115,15 @@ CREATE TABLE IF NOT EXISTS event_mentions (
 CREATE INDEX IF NOT EXISTS idx_event_mentions_task
 ON event_mentions(task_id, event_type, time_text);
 """
+
+def canonical_hash(payload: Any) -> str:
+    text = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def quote_hash(quote: str) -> str:
+    return hashlib.sha256((quote or "").encode("utf-8")).hexdigest()
+
 
 def init_entity_db(db_path=None) -> None:
     with db_session(db_path) as conn:

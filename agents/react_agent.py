@@ -88,12 +88,13 @@ class ReactAgent(BaseAgent):
             },
         )
         for step in range(len(plan_steps)):
+            """
             self.messages.append(
                 {
                     "role": "system",
                     "content": f"当前进度：第 {step + 1} 步 / 共 {len(plan_steps)} 步。请根据计划继续执行:{PLANS[1][step]}",
                 }
-            )
+            )"""
             while 1:
                 stream = self.llm_call()
 

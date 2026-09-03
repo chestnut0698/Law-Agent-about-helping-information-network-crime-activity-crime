@@ -119,9 +119,10 @@ def run_task_timeline(task_id: str, user_id: str | None = None) -> str:
     except TaskError as exc:
         return _tool_json(exc.to_dict())
 
-
+# 废弃
+"""
 def generate_task_clues(task_id: str, user_id: str | None = None) -> str:
-    """根据 R001–R006 规则命中生成跨案线索产物（含表述与校核）。"""
+    # 根据 R001–R006 规则命中生成跨案线索产物（含表述与校核）。
     try:
         result = get_task_service().generate_clues(task_id, user_id=user_id or "system")
         return _tool_json(
@@ -135,6 +136,7 @@ def generate_task_clues(task_id: str, user_id: str | None = None) -> str:
         )
     except TaskError as exc:
         return _tool_json(exc.to_dict())
+"""
 
 def write_ai_clues(task_id: str, clues: list[dict[str, Any]], user_id: str | None = None) -> str:
     try:
