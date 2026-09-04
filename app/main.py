@@ -7,7 +7,7 @@ from agents.react_agent import *
 from typing import Optional
 import json
 from app.config import REPO_ROOT
-from app.files import MaterialError, get_material_service, init_db
+from app.files import MaterialError, get_material_service, init_db, get_global_mapper
 from app.tasks import TaskError, get_task_service, init_task_db
 
 
@@ -29,6 +29,72 @@ init_task_db()
 def material_error_response(exc: MaterialError) -> JSONResponse:
     return JSONResponse(status_code=400, content=exc.to_dict())
 
+@app.post("/api/mappings/batch")
+async def batch_update_mappings(payload: dict):
+    """
+    批量更新脱敏映射，并自动重脱敏受影响的文档。
+    payload: {
+        "document_id": "xxx",  # 可选，限定范围
+        "updates": {"fingerprint": {"sens_type": "NAME", "anonymous_id": "NEW_ID"}},
+        "deletions": ["fingerprint1", "fingerprint2"],
+        "additions": [{"original": "张三", "sens_type": "PERSON"}]
+    }
+    """
+    mapper = get_global_mapper()
+    result = mapper.batch_apply_and_redact(payload)
+    return result
+
+@app.get("/api/mappings")
+async def list_mappings(
+    task_id: str | None = None,
+    sens_type: str | None = None,
+    anonymous_id: str | None = None,
+    limit: int = 100,
+    offset: int = 0
+):
+    """列出脱敏映射。"""
+    mapper = get_global_mapper()
+    return mapper.list_mappings(
+        task_id=task_id,
+        sens_type=sens_type,
+        anonymous_id=anonymous_id,
+        limit=limit,
+        offset=offset
+    )
+
+@app.put("/api/mappings/{fingerprint}")
+async def update_mapping(
+    fingerprint: str,
+    payload: dict,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id")
+):
+    """更新脱敏映射（仅限修改 anonymous_id 或 sens_type）。"""
+    mapper = get_global_mapper()
+    new_anon = payload.get("anonymous_id")
+    new_type = payload.get("sens_type")
+    if not new_anon and not new_type:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "至少提供 anonymous_id 或 sens_type 之一"}
+        )
+    try:
+        ok = mapper.update_mapping(fingerprint, new_anonymous_id=new_anon, new_sens_type=new_type)
+        # 记录操作日志（可复用 add_audit）
+        return {"ok": ok, "fingerprint": fingerprint}
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+
+@app.delete("/api/mappings/{fingerprint}")
+async def delete_mapping(
+    fingerprint: str,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id")
+):
+    """删除脱敏映射。如果被引用则拒绝。"""
+    mapper = get_global_mapper()
+    ok, msg = mapper.delete_mapping(fingerprint)
+    if not ok:
+        return JSONResponse(status_code=409, content={"error": msg})
+    return {"ok": True, "message": msg}
 
 @app.post("/api/materials/upload")
 async def upload_materials(

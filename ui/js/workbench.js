@@ -495,7 +495,7 @@
                 await this._uploadStartFiles(data.task);
                 await this._transitionToDraftWorkspace(
                     data.task.id,
-                    data.scope_artifact_id || this._scopeArtifactId(data.task)
+                    null
                 );
             } catch (e) {
                 Toast.error('任务创建失败：' + e.message);
@@ -1548,14 +1548,268 @@
             }
             panel.appendChild(chart);
         },
+        async _saveMappingChanges(documentId, changes) {
+            try {
+                const resp = await fetch('/api/mappings/batch', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        document_id: documentId,
+                        updates: changes.updates,
+                        deletions: Array.from(changes.deletions),
+                        additions: changes.additions
+                    })
+                });
+                const result = await resp.json();
+                if (result.ok) {
+                    Toast.success(result.message);
+                    // 刷新映射列表
+                    this._openMappingManager(documentId);
+                } else {
+                    Toast.error(result.error || '保存失败');
+                }
+                return result;
+            } catch (e) {
+                Toast.error('保存失败：' + e.message);
+                throw e;
+            }
+        },
+        async _openMappingManager(documentId) {
+            // 1. 创建模态框
+            const modal = Utils.create('div', { class: 'wb-modal-overlay' });
+            const content = Utils.create('div', { class: 'wb-modal-content', style: 'max-width: 1000px; max-height: 90vh; overflow-y: auto;' });
+            content.addEventListener('click', (e) => e.stopPropagation());
+            modal.appendChild(content);
+            document.body.appendChild(modal);
 
+            // 2. 状态
+            const changes = {
+                updates: {},      // fingerprint -> { sens_type }
+                deletions: new Set(),
+                additions: []     // { original, sens_type }
+            };
+
+            // 3. 加载数据
+            const resp = await fetch(`/api/mappings?limit=200`);
+            const data = await resp.json();
+            const items = data.items || [];
+
+            // 收集所有已使用的类型，并补充常见类型
+            const typeSet = new Set();
+            items.forEach(item => {
+                if (item.sens_type) typeSet.add(item.sens_type);
+            });
+            // 补充常见脱敏类型（与系统 REDACTION_PATTERNS 保持一致）
+            const commonTypes = ['PERSON', 'PHONE', 'ID', 'BANK_CARD', 'EMAIL', 'URL', 'IP'];
+            commonTypes.forEach(t => typeSet.add(t));
+            const allTypes = Array.from(typeSet).sort();
+
+            // 4. 渲染表格
+            const table = Utils.create('table', { class: 'wb-mapping-table' });
+            const thead = Utils.create('thead', {}, [
+                Utils.create('tr', {}, [
+                    Utils.create('th', { text: '匿名ID' }),
+                    Utils.create('th', { text: '原文样例' }),
+                    Utils.create('th', { text: '类型' }),
+                    Utils.create('th', { text: '最后出现' }),
+                    Utils.create('th', { text: '操作' })
+                ])
+            ]);
+            table.appendChild(thead);
+
+            const tbody = Utils.create('tbody');
+            items.forEach(item => {
+                const tr = Utils.create('tr');
+                const fp = item.fingerprint;
+
+                const isDeleted = changes.deletions.has(fp);
+                if (isDeleted) tr.style.opacity = '0.5';
+
+                // 匿名ID
+                tr.appendChild(Utils.create('td', { text: item.anonymous_id || '' }));
+
+                // 原文
+                tr.appendChild(Utils.create('td', {
+                    text: item.sample_raw || '—',
+                    style: 'font-family: monospace; font-size: 12px;'
+                }));
+
+                // 类型（下拉选择框）
+                const typeSelect = Utils.create('select', {
+                    style: 'width: 80px; padding: 2px 4px; border: 1px solid var(--border-color); border-radius: 4px; background: var(--bg-input); color: var(--text-primary);'
+                });
+                allTypes.forEach(t => {
+                    const opt = Utils.create('option', { value: t, text: t });
+                    if (t === item.sens_type) opt.selected = true;
+                    typeSelect.appendChild(opt);
+                });
+                typeSelect.addEventListener('change', () => {
+                    changes.updates[fp] = { sens_type: typeSelect.value };
+                });
+                tr.appendChild(Utils.create('td', {}, [typeSelect]));
+
+                // 最后出现
+                tr.appendChild(Utils.create('td', {
+                    text: item.last_seen_at ? item.last_seen_at.slice(0, 16) : '—'
+                }));
+
+                // 操作
+                const btnGroup = Utils.create('div', { style: 'display: flex; gap: 4px;' });
+
+                const delBtn = Utils.create('button', {
+                    class: 'wb-btn wb-btn-danger',
+                    text: isDeleted ? '恢复' : '删除',
+                    style: 'padding: 2px 8px; font-size: 11px;'
+                });
+                delBtn.addEventListener('click', () => {
+                    if (changes.deletions.has(fp)) {
+                        changes.deletions.delete(fp);
+                        delBtn.textContent = '删除';
+                        tr.style.opacity = '1';
+                    } else {
+                        changes.deletions.add(fp);
+                        delBtn.textContent = '恢复';
+                        tr.style.opacity = '0.5';
+                    }
+                });
+                btnGroup.appendChild(delBtn);
+                tr.appendChild(Utils.create('td', {}, [btnGroup]));
+                tbody.appendChild(tr);
+            });
+            table.appendChild(tbody);
+            content.appendChild(table);
+
+            // 5. 新增映射区域（也改用下拉选择框）
+            const addSection = Utils.create('div', {
+                style: 'margin-top: 16px; padding: 12px; background: var(--bg-secondary); border-radius: 8px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap;'
+            });
+            addSection.appendChild(Utils.create('span', { text: '新增映射：', style: 'font-size: 12px; font-weight: 600;' }));
+
+            const addOriginal = Utils.create('input', {
+                placeholder: '原文（如“张三”）',
+                style: 'flex: 1; min-width: 120px; padding: 4px 8px;'
+            });
+            addSection.appendChild(addOriginal);
+
+            const addTypeSelect = Utils.create('select', {
+                style: 'width: 120px; padding: 4px 8px; border: 1px solid var(--border-color); border-radius: 4px; background: var(--bg-input); color: var(--text-primary);'
+            });
+            allTypes.forEach(t => {
+                const opt = Utils.create('option', { value: t, text: t });
+                if (t === 'PERSON') opt.selected = true;  // 默认选 PERSON
+                addTypeSelect.appendChild(opt);
+            });
+            addSection.appendChild(addTypeSelect);
+
+            const addBtn = Utils.create('button', { class: 'wb-btn wb-btn-primary', text: '添加' });
+            addBtn.addEventListener('click', () => {
+                const original = addOriginal.value.trim();
+                const sens_type = addTypeSelect.value;
+                if (!original || !sens_type) {
+                    Toast.warning('请填写原文并选择类型');
+                    return;
+                }
+                // 记录到变更列表
+                changes.additions.push({ original, sens_type });
+                // 在表格中临时显示
+                const newRow = Utils.create('tr', { style: 'background: var(--wb-accent-pale);' });
+                newRow.innerHTML = `
+                    <td style="color: var(--wb-accent-strong);">（待应用）</td>
+                    <td>${original}</td>
+                    <td>${sens_type}</td>
+                    <td>—</td>
+                    <td><span style="color: var(--wb-accent-strong);">✅ 新增</span></td>
+                `;
+                tbody.appendChild(newRow);
+                addOriginal.value = '';
+                Toast.success(`已暂存新增映射：${original} → ${sens_type}`);
+            });
+            addSection.appendChild(addBtn);
+
+            // 添加“清空”按钮方便调试（可选）
+            const clearBtn = Utils.create('button', { class: 'wb-btn wb-btn-ghost', text: '清空新增' });
+            clearBtn.addEventListener('click', () => {
+                if (changes.additions.length === 0) {
+                    Toast.info('暂无新增映射');
+                    return;
+                }
+                changes.additions = [];
+                // 移除临时行
+                const rows = tbody.querySelectorAll('tr');
+                rows.forEach(row => {
+                    if (row.style && row.style.background === 'var(--wb-accent-pale)') {
+                        row.remove();
+                    }
+                });
+                Toast.info('已清空新增列表');
+            });
+            addSection.appendChild(clearBtn);
+
+            content.appendChild(addSection);
+
+            // 6. 底部操作按钮
+            const footer = Utils.create('div', {
+                style: 'margin-top: 16px; display: flex; justify-content: flex-end; gap: 8px;'
+            });
+            const saveBtn = Utils.create('button', {
+                class: 'wb-btn wb-btn-primary',
+                text: '💾 保存并重脱敏'
+            });
+            saveBtn.addEventListener('click', async () => {
+                const hasChanges = Object.keys(changes.updates).length > 0 ||
+                                  changes.deletions.size > 0 ||
+                                  changes.additions.length > 0;
+                if (!hasChanges) {
+                    Toast.info('没有变更需要保存');
+                    return;
+                }
+                saveBtn.disabled = true;
+                saveBtn.textContent = '处理中…';
+                try {
+                    await this._saveMappingChanges(null, changes);
+                    modal.remove();
+                } catch (e) {
+                    // 错误已在 _saveMappingChanges 中处理
+                } finally {
+                    saveBtn.disabled = false;
+                    saveBtn.textContent = '💾 保存并重脱敏';
+                }
+            });
+            footer.appendChild(saveBtn);
+
+            const closeBtn = Utils.create('button', { class: 'wb-btn', text: '取消（关闭）' });
+            closeBtn.addEventListener('click', () => modal.remove());
+            footer.appendChild(closeBtn);
+            content.appendChild(footer);
+
+            // 点击遮罩关闭
+            modal.addEventListener('click', (e) => {
+                if (e.target === modal && !confirm('有未保存的变更，确定关闭吗？')) return;
+                modal.remove();
+            });
+        },
         async _renderMaterialDoc(panel, artifact, payload) {
-            // 从 artifact 或 payload 中获取 document_id
+
+            // 1. 先获取 documentId
             const documentId = artifact.ref_key || (payload && payload.document_id);
             if (!documentId) {
                 panel.appendChild(Utils.create('div', { class: 'wb-empty', text: '缺少材料标识，无法加载内容' }));
                 return;
             }
+            // 2. 创建按钮栏（现在 documentId 已经可用）
+            const actionBar = Utils.create('div', {
+                style: 'display: flex; gap: 8px; margin-bottom: 12px;'
+            });
+
+            const manageBtn = Utils.create('button', {
+                class: 'wb-btn wb-btn-ghost',
+                text: '⚙️ 管理脱敏映射'
+            });
+            manageBtn.addEventListener('click', () => {
+                this._openMappingManager(documentId);
+            });
+            actionBar.appendChild(manageBtn);
+            panel.appendChild(actionBar);
 
             // 显示加载状态
             const loading = Utils.create('div', { class: 'wb-empty', text: '正在加载脱敏内容…' });
@@ -1851,6 +2105,7 @@
                 Toast.warning('请先选择材料文件');
                 return;
             }
+            Toast.info('正在上传文件，请稍候…');
             const form = new FormData();
             form.append('case_id', caseId);
             Array.from(files).forEach(f => form.append('files', f));

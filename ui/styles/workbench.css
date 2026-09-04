@@ -1711,7 +1711,6 @@ body,
     overflow-y: auto;
     margin-top: 12px;
 }
-
 /* ========== 三栏壳：参考式左栏 + 中间视图 + 右侧 Agent ========== */
 
 .wb-app {
@@ -2758,4 +2757,84 @@ body,
     display: inline-flex;
     align-items: center;
     gap: 6px;
+}
+
+/* 人工管理脱敏映射弹窗 */
+.wb-modal-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.55);
+    z-index: 99999;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    backdrop-filter: blur(2px);
+    animation: wbModalFade 200ms ease;
+}
+
+.wb-modal-content {
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border-radius: 12px;
+    padding: 24px;
+    max-width: 920px;
+    width: 94%;
+    max-height: 85vh;
+    overflow-y: auto;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+    border: 1px solid var(--border-color);
+    animation: wbModalSlide 280ms cubic-bezier(.22, 1, .36, 1);
+}
+
+.wb-modal-content table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 12px 0 16px;
+    font-size: 13px;
+}
+
+.wb-modal-content th {
+    text-align: left;
+    padding: 8px 8px 10px;
+    border-bottom: 2px solid var(--border-color);
+    color: var(--text-secondary);
+    font-weight: 600;
+    font-size: 11px;
+    letter-spacing: .3px;
+}
+
+.wb-modal-content td {
+    padding: 8px 8px;
+    border-bottom: 1px solid var(--border-color);
+    vertical-align: middle;
+}
+
+.wb-modal-content .wb-btn {
+    height: 28px;
+    padding: 0 10px;
+    font-size: 12px;
+}
+
+.wb-modal-content .wb-btn-danger {
+    background: var(--wb-danger-pale);
+    border-color: var(--wb-danger-line);
+    color: var(--wb-danger-text);
+}
+
+.wb-modal-content .wb-btn-danger:hover {
+    background: var(--wb-danger);
+    color: #fff;
+}
+
+@keyframes wbModalFade {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+@keyframes wbModalSlide {
+    from { opacity: 0; transform: translateY(18px) scale(.96); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
 }

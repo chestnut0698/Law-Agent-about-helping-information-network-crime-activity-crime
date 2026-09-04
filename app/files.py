@@ -14,19 +14,21 @@ import re
 import sqlite3
 import uuid
 from contextlib import contextmanager
+import contextvars
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Optional, Protocol
+from typing import Any, Iterator, Optional, Protocol, List, Tuple
 from prikit import PDFAnonymizer
 from presidio_analyzer import AnalyzerEngine
 from presidio_analyzer.nlp_engine import NlpEngineProvider
 from presidio_analyzer import RecognizerResult
 
-from app.config import DATABASE_PATH,MATERIAL_STORAGE_DIR,REDACTION_STORAGE_DIR
+from app.config import DATABASE_PATH, MATERIAL_STORAGE_DIR, REDACTION_STORAGE_DIR
 
+_db_connection_ctx = contextvars.ContextVar('_db_connection_ctx', default=None)
 
-# PriKit/Presidio 实体类型 → 内部 sens_type 映射
+# ---------- 常量 ----------
 PRIKIT_ENTITY_MAP = {
     "PERSON": "name",
     "PHONE_NUMBER": "phone",
@@ -42,43 +44,25 @@ PRIKIT_ENTITY_MAP = {
     "IBAN_CODE": "iban",
 }
 
-# 各实体类型的置信度阈值
 CONFIDENCE_THRESHOLD = {
-    "name": 0.6,       # NLP 识别，阈值低一些
+    "name": 0.7,
     "address": 0.6,
-    "phone": 0.85,     # 正则为主，阈值高
-    "id_card": 0.9,
-    "bank_card": 0.9,
+    "phone": 0.7,
+    "id_card": 0.7,
+    "bank_card": 0.7,
     "email": 0.9,
     "ip": 0.9,
 }
-# 允许上传的材料文件扩展名列表
-ALLOWED_MATERIAL_EXTENSIONS = {
-    ".pdf",
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".docx",
-    ".txt",
-}
-# 文档分片时相邻 chunk 之间的重叠字符数，用于保证跨片语义不丢失
-CHUNK_OVERLAP = 120
-# 每个chunk的目标字符数（或token数），决定文档切分的粒度
-CHUNK_SIZE = 1000
-# 看门的
-MATERIAL_AUTH_MODE = "allow_all"
-# 单次上传文件的最大字节数限制，50MB
-MAX_UPLOAD_BYTES = 50 * 1024 * 1024
-# OCR文本密度阈值，用于判断页面是否有足够文字
-OCR_TEXT_DENSITY_THRESHOLD = 0.08
-# OCR 识别置信度阈值，低于此值的页面会被标记为低置信度，需要人工复核
-OCR_LOW_CONFIDENCE_THRESHOLD = 0.75
-# OCR处理失败时每页的最大重试次数
-OCR_MAX_PAGE_RETRIES = 2
-# 当前解析器的版本号，用于版本追踪和缓存失效
-PARSER_VERSION = "stage3-v1"
 
-# ---------- 状态与错误码 ----------
+ALLOWED_MATERIAL_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".docx", ".txt"}
+CHUNK_OVERLAP = 120
+CHUNK_SIZE = 1000
+MATERIAL_AUTH_MODE = "allow_all"
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+OCR_TEXT_DENSITY_THRESHOLD = 0.08
+OCR_LOW_CONFIDENCE_THRESHOLD = 0.75
+OCR_MAX_PAGE_RETRIES = 2
+PARSER_VERSION = "stage3-v1"
 
 MATERIAL_STATUSES = {
     "UPLOADED",
@@ -118,7 +102,6 @@ class MaterialError(Exception):
 
 
 # ---------- 数据库 ----------
-
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS users (
     id VARCHAR(64) PRIMARY KEY,
@@ -314,20 +297,24 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def get_connection(db_path=None) -> sqlite3.Connection:
+def get_connection(db_path=None):
+    # 如果上下文中已有连接，直接返回（复用）
+    conn = _db_connection_ctx.get()
+    if conn is not None:
+        return conn
+    # 否则创建新连接
     conn = sqlite3.connect(str(db_path or DATABASE_PATH), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
+
 def init_db(db_path=None) -> None:
-    """建表并补齐旧库缺失的列，可重复执行。"""
     conn = get_connection(db_path)
     try:
         conn.executescript(SCHEMA_SQL)
-        existing = {
-            row["name"] for row in conn.execute("PRAGMA table_info(documents)").fetchall()
-        }
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(documents)").fetchall()}
         for column, ddl in (
             ("status", "status VARCHAR(32) NOT NULL DEFAULT 'UPLOADED'"),
             ("current_version_id", "current_version_id VARCHAR(36)"),
@@ -342,8 +329,15 @@ def init_db(db_path=None) -> None:
 
 
 @contextmanager
-def db_session(db_path=None) -> Iterator[sqlite3.Connection]:
+def db_session(db_path=None):
+    # 检查是否已有上下文连接，有则复用，无则新建
+    existing_conn = _db_connection_ctx.get()
+    if existing_conn is not None:
+        yield existing_conn
+        return
+    # 没有上下文连接，新建
     conn = get_connection(db_path)
+    token = _db_connection_ctx.set(conn)
     try:
         yield conn
         conn.commit()
@@ -351,6 +345,7 @@ def db_session(db_path=None) -> Iterator[sqlite3.Connection]:
         conn.rollback()
         raise
     finally:
+        _db_connection_ctx.reset(token)
         conn.close()
 
 
@@ -387,7 +382,6 @@ def get_case(conn, case_id: str) -> Optional[dict[str, Any]]:
 
 
 def ensure_demo_case(conn, case_id: str | None = None) -> str:
-    """为本地导入准备可用案件：指定 id 时建该案件，未指定时复用任一已有案件。"""
     if case_id and get_case(conn, case_id):
         return case_id
     if case_id is None:
@@ -519,16 +513,12 @@ def add_audit(conn, **fields) -> None:
     _insert(conn, "material_audit_events", fields)
 
 
-# ---------- 授权（仅契约，完整 RBAC 未实现） ----------
-
-
+# ---------- 授权 ----------
 def deny_all_auth(user_id: str | None, case_id: str | None, action: str) -> tuple[bool, str]:
-    """默认策略：未接入真实授权前一律拒绝材料操作。"""
     return False, "未配置材料授权。本地演示请在 .env 设置 MATERIAL_AUTH_MODE=allow_all 后重启服务"
 
 
 def allow_all_auth(user_id: str | None, case_id: str | None, action: str) -> tuple[bool, str]:
-    """本地与测试用桩，不是真实 RBAC。"""
     return True, "allow_all_stub"
 
 
@@ -536,9 +526,9 @@ def _default_auth():
     mode = (MATERIAL_AUTH_MODE or "").strip().lower() or "allow_all"
     return allow_all_auth if mode == "allow_all" else deny_all_auth
 
-class GlobalEntityMapper:
-    """全局实体映射器：指纹 → 匿名ID（单向，不可逆）。"""
 
+# ---------- GlobalEntityMapper ----------
+class GlobalEntityMapper:
     def __init__(self, db_path=None, salt: str = "default-salt-change-me"):
         self.db_path = db_path
         self.salt = salt
@@ -550,54 +540,54 @@ class GlobalEntityMapper:
         short_uuid = uuid.uuid4().hex[:8]
         return f"{sens_type.upper()}_{short_uuid}"
 
+    def _is_in_context(self, conn) -> bool:
+        return _db_connection_ctx.get() is conn
+
     def delete_by_task_id(self, task_id: str) -> int:
-        """删除指定任务的所有实体映射记录，返回删除的行数。"""
         conn = get_connection(self.db_path)
         try:
             cursor = conn.execute(
                 "DELETE FROM entity_global_map WHERE task_id = ?",
                 (task_id,)
             )
-            conn.commit()
+            if not self._is_in_context(conn):
+                conn.commit()
             return cursor.rowcount
         finally:
-            conn.close()
+            if not self._is_in_context(conn):
+                conn.close()
 
     def get_or_create(self, original: str, sens_type: str, task_id: str = "") -> str:
         fp = self._fingerprint(original)
         conn = get_connection(self.db_path)
-        try:
-            row = conn.execute(
-                "SELECT anonymous_id FROM entity_global_map WHERE fingerprint = ?",
-                (fp,)
-            ).fetchone()
-            if row:
-                # 更新 last_seen_at，同时确保 task_id 被记录（如果原来为空则补充）
-                conn.execute(
-                    "UPDATE entity_global_map SET last_seen_at = ?, task_id = COALESCE(NULLIF(task_id,''), ?) WHERE fingerprint = ?",
-                    (utc_now(), task_id, fp)
-                )
-                conn.commit()
-                return row[0]
-
-            anon_id = self._new_anonymous_id(sens_type)
-            now = utc_now()
+        row = conn.execute(
+            "SELECT anonymous_id FROM entity_global_map WHERE fingerprint = ?",
+            (fp,)
+        ).fetchone()
+        if row:
             conn.execute(
-                "INSERT INTO entity_global_map (fingerprint, anonymous_id, sens_type, task_id, first_seen_at, last_seen_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (fp, anon_id, sens_type, task_id, now, now)
+                "UPDATE entity_global_map SET last_seen_at = ?, task_id = COALESCE(NULLIF(task_id,''), ?) WHERE fingerprint = ?",
+                (utc_now(), task_id, fp)
             )
+            if not self._is_in_context(conn):
+                conn.commit()
+            return row[0]
+
+        anon_id = self._new_anonymous_id(sens_type)
+        now = utc_now()
+        conn.execute(
+            "INSERT INTO entity_global_map (fingerprint, anonymous_id, sens_type, task_id, first_seen_at, last_seen_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (fp, anon_id, sens_type, task_id, now, now)
+        )
+        if not self._is_in_context(conn):
             conn.commit()
-            return anon_id
-        finally:
-            conn.close()
+        return anon_id
 
     def get_fingerprint(self, original: str) -> str:
-        """根据原始值计算 fingerprint（不写入数据库）。"""
         return self._fingerprint(original)
 
     def get_fingerprint_by_anonymous_id(self, anonymous_id: str) -> str | None:
-        """通过匿名占位符反查 fingerprint。"""
         conn = get_connection(self.db_path)
         try:
             row = conn.execute(
@@ -606,48 +596,485 @@ class GlobalEntityMapper:
             ).fetchone()
             return row[0] if row else None
         finally:
-            conn.close()
+            if not self._is_in_context(conn):
+                conn.close()
 
+    def list_mappings(
+            self,
+            task_id: str | None = None,
+            sens_type: str | None = None,
+            anonymous_id: str | None = None,
+            limit: int = 100,
+            offset: int = 0
+    ) -> dict[str, Any]:
+        conn = get_connection(self.db_path)
+        try:
+            query = """
+                SELECT fingerprint, anonymous_id, sens_type, task_id, first_seen_at, last_seen_at
+                FROM entity_global_map
+                WHERE 1=1
+            """
+            params = []
+            if task_id is not None and task_id != "":
+                query += " AND task_id = ?"
+                params.append(task_id)
+            if sens_type:
+                query += " AND sens_type = ?"
+                params.append(sens_type)
+            if anonymous_id:
+                query += " AND anonymous_id = ?"
+                params.append(anonymous_id)
+
+            count_query = f"SELECT COUNT(*) as total FROM ({query})"
+            total_row = conn.execute(count_query, params).fetchone()
+            total = total_row[0] if total_row else 0
+
+            query += " ORDER BY last_seen_at DESC LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+            rows = conn.execute(query, params).fetchall()
+            items = [dict(row) for row in rows]
+
+            for item in items:
+                fingerprint = item["fingerprint"]
+                redact_row = conn.execute(
+                    """
+                    SELECT document_version_id, chunk_id, start_offset, end_offset
+                    FROM redaction_items
+                    WHERE map_ref = ?
+                    LIMIT 1
+                    """,
+                    (fingerprint,)
+                ).fetchone()
+                if redact_row:
+                    chunk_row = conn.execute(
+                        "SELECT text_raw FROM document_chunks WHERE id = ?",
+                        (redact_row["chunk_id"],)
+                    ).fetchone()
+                    if chunk_row:
+                        text_raw = chunk_row["text_raw"] or ""
+                        start = redact_row["start_offset"]
+                        end = redact_row["end_offset"]
+                        if 0 <= start < end <= len(text_raw):
+                            item["sample_raw"] = text_raw[start:end]
+                        else:
+                            item["sample_raw"] = None
+                    else:
+                        item["sample_raw"] = None
+                else:
+                    item["sample_raw"] = None
+
+            return {
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "items": items
+            }
+        finally:
+            if not self._is_in_context(conn):
+                conn.close()
+
+    def update_mapping(
+            self,
+            fingerprint: str,
+            new_anonymous_id: str | None = None,
+            new_sens_type: str | None = None
+    ) -> bool:
+        if not new_anonymous_id and not new_sens_type:
+            return False
+        conn = get_connection(self.db_path)
+        try:
+            updates = []
+            params = []
+            if new_anonymous_id is not None:
+                updates.append("anonymous_id = ?")
+                params.append(new_anonymous_id)
+            if new_sens_type is not None:
+                updates.append("sens_type = ?")
+                params.append(new_sens_type)
+            params.append(fingerprint)
+            sql = f"UPDATE entity_global_map SET {', '.join(updates)} WHERE fingerprint = ?"
+            conn.execute(sql, params)
+            if not self._is_in_context(conn):
+                conn.commit()
+            return True
+        finally:
+            if not self._is_in_context(conn):
+                conn.close()
+
+    def delete_mapping(self, fingerprint: str) -> tuple[bool, str]:
+        conn = get_connection(self.db_path)
+        try:
+            # 检查引用（如果有引用则拒绝删除）
+            ref = conn.execute(
+                "SELECT COUNT(*) FROM redaction_items WHERE map_ref = ?",
+                (fingerprint,)
+            ).fetchone()[0]
+            if ref > 0:
+                return False, f"该映射被 {ref} 条脱敏记录引用，无法删除"
+            # ★ 关键：执行真正的 DELETE
+            conn.execute("DELETE FROM entity_global_map WHERE fingerprint = ?", (fingerprint,))
+            if not self._is_in_context(conn):
+                conn.commit()
+            return True, "删除成功"
+        finally:
+            if not self._is_in_context(conn):
+                conn.close()
+
+    # --------------------------------------------------------------
+    # 核心重构方法：batch_apply_and_redact
+    # --------------------------------------------------------------
+    def batch_apply_and_redact(self, payload: dict) -> dict[str, Any]:
+        """
+        批量应用变更（删除、更新、新增映射），并重脱敏所有受影响的 chunk。
+        所有操作在一个事务中完成，基于原文和现有 redaction_items 重建脱敏文本，
+        不调用 redact_text。
+        """
+        with db_session(self.db_path) as conn:
+            deletions = payload.get("deletions", [])
+            updates = payload.get("updates", {})
+            additions = payload.get("additions", [])
+            document_id = payload.get("document_id")
+
+            # ---------- 1. 应用删除和更新（影响 redaction_items） ----------
+            affected_chunks = {}
+
+            # 收集删除影响的 chunk
+            for fp in deletions:
+                if document_id:
+                    rows = conn.execute(
+                        """
+                        SELECT ri.id, ri.chunk_id, ri.start_offset, ri.end_offset, ri.placeholder, ri.map_ref
+                        FROM redaction_items ri
+                        JOIN document_chunks dc ON dc.id = ri.chunk_id
+                        JOIN document_versions dv ON dv.id = dc.document_version_id
+                        WHERE ri.map_ref = ? AND dv.document_id = ?
+                        """,
+                        (fp, document_id)
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT id, chunk_id, start_offset, end_offset, placeholder, map_ref FROM redaction_items WHERE map_ref = ?",
+                        (fp,)
+                    ).fetchall()
+                for row in rows:
+                    affected_chunks.setdefault(row["chunk_id"], []).append(dict(row))
+
+            # 收集更新影响的 chunk
+            for fp in updates:
+                if document_id:
+                    rows = conn.execute(
+                        """
+                        SELECT ri.id, ri.chunk_id, ri.start_offset, ri.end_offset, ri.placeholder, ri.map_ref
+                        FROM redaction_items ri
+                        JOIN document_chunks dc ON dc.id = ri.chunk_id
+                        JOIN document_versions dv ON dv.id = dc.document_version_id
+                        WHERE ri.map_ref = ? AND dv.document_id = ?
+                        """,
+                        (fp, document_id)
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT id, chunk_id, start_offset, end_offset, placeholder, map_ref FROM redaction_items WHERE map_ref = ?",
+                        (fp,)
+                    ).fetchall()
+                for row in rows:
+                    affected_chunks.setdefault(row["chunk_id"], []).append(dict(row))
+
+            # 执行更新映射（entity_global_map 层面）
+            for fp, update in updates.items():
+                sets = []
+                params = []
+                if "sens_type" in update:
+                    sets.append("sens_type = ?")
+                    params.append(update["sens_type"])
+                if "anonymous_id" in update:
+                    sets.append("anonymous_id = ?")
+                    params.append(update["anonymous_id"])
+                if sets:
+                    params.append(fp)
+                    conn.execute(
+                        f"UPDATE entity_global_map SET {', '.join(sets)} WHERE fingerprint = ?",
+                        params
+                    )
+
+            # 对受影响的 chunk 进行重脱敏（删除和更新）
+            redacted_count = 0
+            for chunk_id, old_items in affected_chunks.items():
+                chunk = conn.execute(
+                    "SELECT text_raw, document_version_id FROM document_chunks WHERE id = ?",
+                    (chunk_id,)
+                ).fetchone()
+                if not chunk:
+                    continue
+
+                text_raw = chunk["text_raw"]
+                doc_version_id = chunk["document_version_id"]
+                new_text = text_raw
+                new_items = []
+
+                # 按 start_offset 降序
+                sorted_items = sorted(old_items, key=lambda x: x["start_offset"], reverse=True)
+
+                for item in sorted_items:
+                    start = item["start_offset"]
+                    end = item["end_offset"]
+                    map_ref = item["map_ref"]
+
+                    if map_ref in deletions:
+                        placeholder = text_raw[start:end]  # 恢复原文
+                    else:
+                        # 检查更新
+                        update = updates.get(map_ref)
+                        if update:
+                            new_anon = conn.execute(
+                                "SELECT anonymous_id, sens_type FROM entity_global_map WHERE fingerprint = ?",
+                                (map_ref,)
+                            ).fetchone()
+                            if new_anon:
+                                new_placeholder = new_anon["anonymous_id"]
+                                sens_type = new_anon["sens_type"]
+                                new_items.append({
+                                    "id": new_id(),
+                                    "document_version_id": doc_version_id,
+                                    "chunk_id": chunk_id,
+                                    "sens_type": sens_type,
+                                    "start_offset": start,
+                                    "end_offset": end,
+                                    "placeholder": new_placeholder,
+                                    "map_ref": map_ref,
+                                    "created_at": utc_now()
+                                })
+                                placeholder = new_placeholder
+                            else:
+                                placeholder = text_raw[start:end]
+                        else:
+                            # 保持不变
+                            cur_anon = conn.execute(
+                                "SELECT anonymous_id, sens_type FROM entity_global_map WHERE fingerprint = ?",
+                                (map_ref,)
+                            ).fetchone()
+                            if cur_anon:
+                                new_items.append({
+                                    "id": new_id(),
+                                    "document_version_id": doc_version_id,
+                                    "chunk_id": chunk_id,
+                                    "sens_type": cur_anon["sens_type"],
+                                    "start_offset": start,
+                                    "end_offset": end,
+                                    "placeholder": cur_anon["anonymous_id"],
+                                    "map_ref": map_ref,
+                                    "created_at": utc_now()
+                                })
+                                placeholder = cur_anon["anonymous_id"]
+                            else:
+                                placeholder = text_raw[start:end]
+
+                    new_text = new_text[:start] + placeholder + new_text[end:]
+
+                # 更新 chunk
+                conn.execute(
+                    "UPDATE document_chunks SET text_redacted = ? WHERE id = ?",
+                    (new_text, chunk_id)
+                )
+                conn.execute("DELETE FROM redaction_items WHERE chunk_id = ?", (chunk_id,))
+                for item_data in new_items:
+                    conn.execute(
+                        """
+                        INSERT INTO redaction_items 
+                        (id, document_version_id, chunk_id, sens_type, start_offset, end_offset, placeholder, map_ref, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            item_data["id"],
+                            item_data["document_version_id"],
+                            item_data["chunk_id"],
+                            item_data["sens_type"],
+                            item_data["start_offset"],
+                            item_data["end_offset"],
+                            item_data["placeholder"],
+                            item_data["map_ref"],
+                            item_data["created_at"]
+                        )
+                    )
+                redacted_count += 1
+
+            # ---------- 2. 处理新增映射（先插入映射，再应用到所有文档） ----------
+            for add in additions:
+                original = add.get("original")
+                sens_type = add.get("sens_type")
+                if not original or not sens_type:
+                    continue
+                fp = self._fingerprint(original)
+                existing = conn.execute(
+                    "SELECT fingerprint FROM entity_global_map WHERE fingerprint = ?",
+                    (fp,)
+                ).fetchone()
+                if existing:
+                    # 映射已存在，可能不需要重复插入，但我们可以继续应用
+                    # 仍然需要获取 anonymous_id
+                    anon_info = conn.execute(
+                        "SELECT anonymous_id, sens_type FROM entity_global_map WHERE fingerprint = ?",
+                        (fp,)
+                    ).fetchone()
+                    if not anon_info:
+                        continue
+                    placeholder = anon_info["anonymous_id"]
+                    sens_type = anon_info["sens_type"]
+                else:
+                    anon_id = self._new_anonymous_id(sens_type)
+                    now = utc_now()
+                    conn.execute(
+                        """
+                        INSERT INTO entity_global_map 
+                        (fingerprint, anonymous_id, sens_type, task_id, first_seen_at, last_seen_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (fp, anon_id, sens_type, '', now, now)
+                    )
+                    placeholder = anon_id
+
+                # 如果指定了文档，只处理该文档；否则处理所有文档
+                if document_id:
+                    chunk_rows = conn.execute(
+                        """
+                        SELECT dc.id, dc.text_raw, dc.document_version_id
+                        FROM document_chunks dc
+                        JOIN document_versions dv ON dv.id = dc.document_version_id
+                        WHERE dv.document_id = ? AND dv.is_current = 1 AND dv.is_active = 1 AND dc.is_active = 1
+                        """,
+                        (document_id,)
+                    ).fetchall()
+                else:
+                    # 全局生效：处理所有文档的所有当前版本 chunk
+                    chunk_rows = conn.execute(
+                        """
+                        SELECT dc.id, dc.text_raw, dc.document_version_id
+                        FROM document_chunks dc
+                        JOIN document_versions dv ON dv.id = dc.document_version_id
+                        WHERE dv.is_current = 1 AND dv.is_active = 1 AND dc.is_active = 1
+                        """
+                    ).fetchall()
+
+                for chunk_row in chunk_rows:
+                    chunk_id = chunk_row["id"]
+                    text_raw = chunk_row["text_raw"]
+                    doc_version_id = chunk_row["document_version_id"]
+
+                    # 获取现有 redaction_items 的占用区间
+                    existing_items = conn.execute(
+                        "SELECT start_offset, end_offset FROM redaction_items WHERE chunk_id = ?",
+                        (chunk_id,)
+                    ).fetchall()
+                    occupied_intervals = [(row["start_offset"], row["end_offset"]) for row in existing_items]
+
+                    # 查找所有匹配位置（非重叠）
+                    import re
+                    positions = []
+                    start_pos = 0
+                    while True:
+                        idx = text_raw.find(original, start_pos)
+                        if idx == -1:
+                            break
+                        positions.append((idx, idx + len(original)))
+                        start_pos = idx + 1
+
+                    # 筛选未被占用的位置
+                    new_positions = []
+                    for start, end in positions:
+                        overlapped = False
+                        for os, oe in occupied_intervals:
+                            if not (end <= os or start >= oe):
+                                overlapped = True
+                                break
+                        if not overlapped:
+                            new_positions.append((start, end))
+
+                    if not new_positions:
+                        continue
+
+                    # 获取当前 text_redacted
+                    cur_redacted = conn.execute(
+                        "SELECT text_redacted FROM document_chunks WHERE id = ?",
+                        (chunk_id,)
+                    ).fetchone()[0]
+
+                    # 按 start 降序，从后往前替换
+                    new_positions_sorted = sorted(new_positions, key=lambda x: x[0], reverse=True)
+                    new_text = cur_redacted
+                    for start, end in new_positions_sorted:
+                        new_text = new_text[:start] + placeholder + new_text[end:]
+
+                    # 更新 chunk
+                    conn.execute(
+                        "UPDATE document_chunks SET text_redacted = ? WHERE id = ?",
+                        (new_text, chunk_id)
+                    )
+
+                    # 插入新的 redaction_items
+                    for start, end in new_positions_sorted:
+                        conn.execute(
+                            """
+                            INSERT INTO redaction_items 
+                            (id, document_version_id, chunk_id, sens_type, start_offset, end_offset, placeholder, map_ref, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                new_id(),
+                                doc_version_id,
+                                chunk_id,
+                                sens_type,
+                                start,
+                                end,
+                                placeholder,
+                                fp,
+                                utc_now()
+                            )
+                        )
+                    redacted_count += 1
+
+            # ---------- 3. 删除映射（entity_global_map） ----------
+            for fp in deletions:
+                conn.execute("DELETE FROM entity_global_map WHERE fingerprint = ?", (fp,))
+
+            return {
+                "ok": True,
+                "deleted": len(deletions),
+                "updated": len(updates),
+                "added": len(additions),
+                "redacted_chunks": redacted_count,
+                "message": f"变更已应用，重脱敏 {redacted_count} 个文本块"
+            }
 
 # ---------- 敏感信息检测与脱敏 ----------
-
 REDACTION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    # 身份证（不变）
     ("id_card", re.compile(
         r"(?<!\d)([1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])"
         r"(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx])(?!\d)"
     )),
-    # 银行卡：去掉18位排除，匹配15~19位纯数字或带分隔符的格式
     ("bank_card", re.compile(
         r"(?<!\d)("
-        r"[1-9]\d{14,18}"                      # 纯数字15~19位
+        r"[1-9]\d{14,18}"
         r"|"
-        r"[1-9]\d{3}(?:[\s\-_.／/]+\d{4}){2,3}(?:[\s\-_.／/]+\d{1,4})?"  # 带分隔符
+        r"[1-9]\d{3}(?:[\s\-_.／/]+\d{4}){2,3}(?:[\s\-_.／/]+\d{1,4})?"
         r")(?!\d)"
     )),
-    # 手机号（不变）
     ("phone", re.compile(r"(?<!\d)(1[3-9]\d{9})(?!\d)")),
-    # IMEI（不变）
     ("imei", re.compile(r"(?<!\d)(\d{15})(?!\d)")),
-    # IP（不变）
     ("ip", re.compile(r"(?<!\d)((?:\d{1,3}\.){3}\d{1,3})(?!\d)")),
-    # 账号（不变）
     ("account", re.compile(r"(?i)(?:账号|帐户|账户|user(?:name)?|login)[:：\s]*([A-Za-z0-9_.-]{4,32})")),
-    # 地址（不变）
     ("address", re.compile(
         r"([\u4e00-\u9fff]{2,10}(?:省|市|自治区|特别行政区))?"
         r"[\u4e00-\u9fff]{1,10}(?:市|州|盟)?"
         r"[\u4e00-\u9fff]{1,12}(?:区|县|旗)"
         r"[\u4e00-\u9fff0-9\-号弄幢栋单元室楼]{0,30}"
     )),
-    # 姓名：扩充关键词前缀，并增加独立人名匹配（2~4个汉字，前后非汉字或标点）
     ("name", re.compile(
-    r"(?:"
-    r"(?:姓名|被告人|嫌疑人|当事人|原告|被告|证人|辩护人|被害人|申诉人|被申诉人|法定代表人|负责人|联系人)"
-    r"[:：\s]*([\u4e00-\u9fff·]{2,4})"
-    r"|"
-    r"(?<![^\s,，。；：、\(\)（）])([\u4e00-\u9fff·]{2,4})(?![^\s,，。；：、\(\)（）])"
-    r")"
+        r"(?:"
+        r"(?:姓名|被告人|嫌疑人|当事人|原告|被告|证人|辩护人|被害人|申诉人|被申诉人|法定代表人|负责人|联系人)"
+        r"[:：\s]*([\u4e00-\u9fff·]{2,4})"
+        r"|"
+        r"(?<![^\s,，。；：、\(\)（）])([\u4e00-\u9fff·]{2,4})(?![^\s,，。；：、\(\)（）])"
+        r")"
     )),
 ]
 
@@ -661,7 +1088,6 @@ _UNREDACTED_PATTERNS = [
 ]
 
 
-
 @dataclass
 class RedactionHit:
     sens_type: str
@@ -672,18 +1098,13 @@ class RedactionHit:
 
 
 def merge_person_spans(text: str, person_results: list) -> list:
-    """
-    合并相邻/重叠的 PERSON 实体，过滤单字名，去除尾部动词，去除头部动词。
-    """
     if not person_results:
         return []
 
-    # ----- 常量定义 -----
-    MERGE_SEPARATORS = set("，,、；;。.！!？?：:""''（）()【】[]《》<>／/\\\t\n\r ")
+    MERGE_SEPARATORS = set("，,、；;。.！!？?：:\"\"''（）()【】[]《》<>／/\\\t\n\r ")
     MERGE_STOP_WORDS = {"的", "和", "与", "及", "或", "以及", "及其", "暨"}
     VERB_PREFIXES = set("受被让给为由将把向对与同跟从在到予以用拿借凭靠沿顺朝往冲离除比")
     VERB_SUFFIXES = ["说", "道", "讲", "问", "答"]
-    # ------------------
 
     merged = []
     current = person_results[0]
@@ -695,13 +1116,11 @@ def merge_person_spans(text: str, person_results: list) -> list:
             not any(w in gap for w in MERGE_STOP_WORDS)
         )
         if clean_gap:
-            # 检查第二个实体的第一个字符是否是动词，若是则禁止合并
             second_first_char = text[r.start:r.start+1]
             if second_first_char in VERB_PREFIXES:
                 merged.append(current)
                 current = r
                 continue
-            # 正常合并
             new_start = min(current.start, r.start)
             new_end = max(current.end, r.end)
             new_score = max(current.score, r.score)
@@ -716,10 +1135,8 @@ def merge_person_spans(text: str, person_results: list) -> list:
             current = r
     merged.append(current)
 
-    # 过滤单字名
     merged = [r for r in merged if (r.end - r.start) >= 2]
 
-    # 去除尾部动词
     filtered = []
     for r in merged:
         name = text[r.start:r.end]
@@ -734,7 +1151,6 @@ def merge_person_spans(text: str, person_results: list) -> list:
             )
         filtered.append(r)
 
-    # 去除头部动词（兜底）
     trimmed = []
     for r in filtered:
         name = text[r.start:r.end]
@@ -752,43 +1168,30 @@ def merge_person_spans(text: str, person_results: list) -> list:
         trimmed.append(r)
     return trimmed
 
+
 def mask_phone_number(phone: str) -> str:
-    """
-    对手机号进行掩码处理：保留前3位和后4位，中间用 * 填充。
-    如果长度不足11位或不是纯数字，则返回原字符串（不处理）。
-    """
-    # 去除可能的 +86、空格、横线等前缀（简单处理）
     cleaned = phone.replace("+86", "").replace("-", "").replace(" ", "")
     if cleaned.isdigit() and len(cleaned) == 11:
         return cleaned[:3] + "****" + cleaned[-4:]
-    # 对于其他格式（如座机、短号），不做掩码，直接返回原字符串（或可改用占位符）
     return phone
 
+
 def _generate_placeholder(sens_type: str) -> str:
-    """生成一个临时的占位符，不持久化到数据库。"""
     short_uuid = uuid.uuid4().hex[:8]
     return f"{sens_type.upper()}_{short_uuid}"
+
 
 def redact_text(
     text: str,
     document_version_id: str = None,
     chunk_id: str = None,
 ) -> Tuple[str, List[RedactionHit]]:
-    """
-    对文本进行脱敏处理，返回脱敏后的文本和命中的脱敏记录列表。
-
-    核心保证：同一原始值始终映射到同一占位符（通过 entity_global_map）。
-    不直接写入 redaction_items，由调用方（如 _persist_pages）统一持久化。
-
-    支持：人名、手机号（掩码）、银行卡号、身份证号、地址等（不含时间）。
-    """
     mapper = get_global_mapper()
     analyzer = get_global_analyzer()
 
     if not text:
         return text, []
 
-    # 1. 使用 Presidio 分析器识别实体（排除 DATE_TIME）
     results = analyzer.analyze(
         text=text,
         language="zh",
@@ -798,24 +1201,25 @@ def redact_text(
         score_threshold=0.8
     )
 
-    # 2. 分离 PERSON 和其他实体
     person_results = [r for r in results if r.entity_type == "PERSON"]
     other_results = [r for r in results if r.entity_type != "PERSON"]
 
-    # 3. 处理 PERSON 实体（合并、过滤、别名等）—— 保持原有逻辑不变
     person_results.sort(key=lambda r: (r.start, r.end))
     person_results = merge_person_spans(text, person_results)
+    filtered_person_results = []
+    for r in person_results:
+        name = text[r.start:r.end]
+        # 只允许中文字符和间隔符“·”
+        if re.fullmatch(r'[\u4e00-\u9fa5·]+', name):
+            filtered_person_results.append(r)
+    person_results = filtered_person_results
 
-    # 4. 收集所有实体区间（start, end, original, entity_type）
     spans: list[tuple[int, int, str, str]] = []
 
-    # 4a. PERSON
     for r in person_results:
         spans.append((r.start, r.end, text[r.start:r.end], "PERSON"))
 
-    # ---- 基于"往后读一位"的别名合并（仅用于 PERSON）—— 保持原有逻辑 ----
     VERB_PREFIXES = set("受被让给为由将把向对与同跟从在到予以用拿借凭靠沿顺朝往冲离除比")
-    # 按原始文本分组
     name_spans: dict[str, list[tuple[int, int]]] = {}
     for s, e, name, etype in spans:
         if etype == "PERSON":
@@ -853,8 +1257,6 @@ def redact_text(
             if found:
                 break
 
-    # 应用别名映射：短名共享长名的 placeholder
-    # 将短名的所有 span 替换为长名的合并后 span
     new_spans = []
     merged_short = set()
     for s, e, name, etype in spans:
@@ -871,7 +1273,6 @@ def redact_text(
                     text[next_start:next_start + len(remaining)] == remaining):
                 new_spans.append((sp_start, next_start + len(remaining), long_name, "PERSON"))
 
-    # 去重
     seen = set()
     unique_spans = []
     for span in new_spans:
@@ -881,25 +1282,21 @@ def redact_text(
             unique_spans.append(span)
     spans = unique_spans
 
-    # 4b. 其他实体
     for r in other_results:
         spans.append((r.start, r.end, text[r.start:r.end], r.entity_type))
 
-    # 5. 合并重叠区间（优先保留长的、先出现的）
     spans.sort(key=lambda x: (x[0], -(x[1] - x[0])))
     merged_spans: list[tuple[int, int, str, str]] = []
     last_end = -1
     for start, end, original, entity_type in spans:
         if start < last_end:
-            continue  # 重叠，跳过
+            continue
         merged_spans.append((start, end, original, entity_type))
         last_end = end
 
-    # 6. 生成持久化占位符并从后往前替换
     redacted_text = text
     hits = []
     for start, end, original, entity_type in reversed(merged_spans):
-        # 生成持久化占位符（同一原始值始终同一占位符）
         if entity_type == "PERSON":
             placeholder = mapper.get_or_create(original, "PERSON")
         elif entity_type == "PHONE_NUMBER":
@@ -908,10 +1305,7 @@ def redact_text(
         else:
             placeholder = mapper.get_or_create(original, entity_type.lower())
 
-        # 替换
         redacted_text = redacted_text[:start] + placeholder + redacted_text[end:]
-
-        # 记录
         hits.append(RedactionHit(
             sens_type=entity_type,
             start=start,
@@ -920,14 +1314,11 @@ def redact_text(
             placeholder=placeholder
         ))
 
-    # 按 start 排序返回
     hits.sort(key=lambda h: h.start)
     return redacted_text, hits
 
 
 # ---------- 解析与页级 OCR ----------
-
-
 @dataclass
 class PageResult:
     page_no: int
@@ -958,8 +1349,6 @@ class OCREngine(Protocol):
 
 
 class FallbackOCREngine:
-    """未安装 PaddleOCR 时使用的确定性后备引擎，便于本地与测试运行。"""
-
     def recognize(self, image_bytes: bytes) -> list[OCRLine]:
         marker = b"__OCR_TEXT__:"
         if marker in image_bytes:
@@ -976,7 +1365,6 @@ class FallbackOCREngine:
 class PaddleOCREngine:
     def __init__(self):
         from paddleocr import PaddleOCR
-
         self._ocr = PaddleOCR(use_angle_cls=True, lang="ch", show_log=False)
 
     def recognize(self, image_bytes: bytes) -> list[OCRLine]:
@@ -999,7 +1387,6 @@ _ocr_engine: OCREngine | None = None
 
 
 def set_ocr_engine(engine: OCREngine | None) -> None:
-    """注入 OCR 引擎，用于替换实现或测试。"""
     global _ocr_engine
     _ocr_engine = engine
 
@@ -1111,7 +1498,6 @@ def _extract_pdf(path: Path) -> list[PageResult]:
 def _extract_docx(path: Path) -> list[PageResult]:
     try:
         from docx import Document
-
         document = Document(str(path))
     except ImportError as exc:
         raise MaterialError(ERROR_CODES["PARSE_FAILED"], "python-docx not installed") from exc
@@ -1194,7 +1580,6 @@ def _run_page_ocr(page: PageResult, retries: int) -> PageResult:
 
 
 def parse_file_to_pages(path: Path | str, max_retries: int | None = None) -> list[dict[str, Any]]:
-    """按文件类型取文，只对需要识别的页面执行 OCR，成功页不重跑。"""
     file_path = Path(path)
     extractors = {
         ".pdf": _extract_pdf,
@@ -1236,7 +1621,6 @@ def parse_file_to_pages(path: Path | str, max_retries: int | None = None) -> lis
 
 
 def summarize_page_quality(pages: list[dict[str, Any]]) -> dict[str, Any]:
-    """汇总页级识别质量，供状态展示与人工修正定位。"""
     confidences = [p["avg_confidence"] for p in pages if p.get("avg_confidence") is not None]
     minimums = [p["min_confidence"] for p in pages if p.get("min_confidence") is not None]
     low_pages: list[int] = []
@@ -1276,9 +1660,7 @@ def derive_version_status(pages: list[dict[str, Any]]) -> str:
     return "PARSED" if all(status == "PARSED" for status in statuses) else "NEEDS_OCR_REVIEW"
 
 
-# ---------- 分块与定位 ----------
-
-
+# ---------- 分块 ----------
 def _text_sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -1291,7 +1673,6 @@ def build_chunks(
     overlap: int | None = None,
     parser_version: str | None = None,
 ) -> list[dict[str, Any]]:
-    """生成稳定重叠文本块，ID 由版本、块序与文本哈希派生。"""
     size = CHUNK_SIZE if chunk_size is None else chunk_size
     overlap_size = CHUNK_OVERLAP if overlap is None else overlap
     version = parser_version or PARSER_VERSION
@@ -1377,17 +1758,11 @@ def build_chunks(
     return chunks
 
 
-# ---------- 材料处理服务 ----------
-
-
+# ---------- MaterialService ----------
 class MaterialService:
-    """案件卷宗上传后的处理入口：版本、解析、质量、修正、删除与安全读取。"""
-
-    def __init__(self, db_path=None, auth_check=None,
-                 mapper_salt=None):
+    def __init__(self, db_path=None, auth_check=None, mapper_salt=None):
         self.db_path = db_path
         self.auth_check = auth_check or _default_auth()
-
         init_db(self.db_path)
 
     def _init_analyzer(self) -> AnalyzerEngine | None:
@@ -1403,11 +1778,8 @@ class MaterialService:
             nlp_engine = provider.create_engine()
             analyzer = AnalyzerEngine(nlp_engine=nlp_engine)
 
-            # ---- 新增：中文姓名专用识别器 ----
-            # 匹配"姓名/被告人/原告/受害人..."等上下文后的 2-4 个汉字
             chinese_name_pattern = Pattern(
                 name="chinese_name_pattern",
-                # 2-4 个汉字，支持中间有 ·（少数民族姓名）
                 regex=r"(?:姓名|被告人|嫌疑人|当事人|原告|被告|证人|辩护人|被害人|申诉人|被申诉人|法定代表人|负责人|联系人|申请人|被申请人)[:：\s]*([\u4e00-\u9fa5·]{2,4})",
                 score=0.9,
             )
@@ -1415,13 +1787,10 @@ class MaterialService:
                 supported_entity="PERSON",
                 name="chinese_name_recognizer",
                 patterns=[chinese_name_pattern],
-                # context 词能进一步提升 score
                 context=["姓名", "被告人", "原告", "被告", "证人", "受害人", "当事人"],
             )
             analyzer.registry.add_recognizer(chinese_name_recognizer)
 
-            # ---- 新增：纯姓名兜底（无上下文时，2-3 字中文串）----
-            # 这个 score 低一些，避免误伤普通词语
             bare_name_pattern = Pattern(
                 name="bare_chinese_name_pattern",
                 regex=r"(?<![\u4e00-\u9fa5])([\u4e00-\u9fa5]{2,3})(?![\u4e00-\u9fa5])",
@@ -1455,7 +1824,6 @@ class MaterialService:
             raise MaterialError(ERROR_CODES["AUTH_DENIED"], reason or "authorization denied")
 
     # ----- 上传与版本 -----
-
     def upload_many(
         self,
         items: list[dict[str, Any]],
@@ -1464,7 +1832,6 @@ class MaterialService:
         parse: bool = True,
         keep_duplicate: bool = False,
     ) -> list[dict[str, Any]]:
-        """一次导入多份材料，可分别归属不同案件。"""
         return [
             self.upload_one(
                 case_id=item["case_id"],
@@ -1656,7 +2023,6 @@ class MaterialService:
             }
 
     # ----- 解析 -----
-
     def parse_version(self, version_id: str, user_id: str | None = None) -> dict[str, Any]:
         with db_session(self.db_path) as conn:
             version = get_version(conn, version_id)
@@ -1742,18 +2108,15 @@ class MaterialService:
         event_type: str,
         audit_reason: str | None = None,
     ) -> dict[str, Any]:
-        """落库页面、分块与脱敏结果，并同步材料状态。"""
         quality = summarize_page_quality(pages)
         status = derive_version_status(pages)
         chunks = build_chunks(version_id, pages)
 
-        # 第一步：对所有 chunk 进行脱敏
-        # redact_text 已返回持久化占位符（通过 entity_global_map），无需二次转换
         redaction_rows: list[dict[str, Any]] = []
         for chunk in chunks:
             redacted, hits = redact_text(chunk["text_raw"])
             chunk["text_redacted"] = redacted
-            chunk["_hits"] = hits  # 缓存 hits 供后续碰撞使用
+            chunk["_hits"] = hits
             for hit in hits:
                 redaction_rows.append({
                     "id": new_id(),
@@ -1792,7 +2155,6 @@ class MaterialService:
                     },
                 )
 
-            # 清理临时字段，避免插入数据库时报错
             for chunk in chunks:
                 chunk.pop("_hits", None)
             replace_chunks(conn, version_id, chunks)
@@ -1838,7 +2200,6 @@ class MaterialService:
             }
 
     # ----- 查询 -----
-
     def list_materials(self, case_id: str, user_id: str | None = None) -> list[dict[str, Any]]:
         self._authorize(user_id, case_id, "material.list")
         with db_session(self.db_path) as conn:
@@ -1903,14 +2264,12 @@ class MaterialService:
             }
 
     # ----- 外发门控 -----
-
     def read_redacted_chunk(
         self,
         document_version_id: str,
         chunk_id: str | None = None,
         user_id: str | None = None,
     ) -> dict[str, Any]:
-        """经门控读取脱敏片段：版本有效、已脱敏、最小必要片段。"""
         with db_session(self.db_path) as conn:
             version = get_version(conn, document_version_id)
             if not version:
@@ -2006,7 +2365,6 @@ class MaterialService:
             }
 
     # ----- 人工修正 -----
-
     def apply_correction(
         self,
         *,
@@ -2016,7 +2374,6 @@ class MaterialService:
         corrected_text: str,
         user_id: str | None = None,
     ) -> dict[str, Any]:
-        """人工修正生成新版本，旧版本原文与 chunk 保留但标记失效。"""
         with db_session(self.db_path) as conn:
             document = get_document(conn, document_id)
             if not document:
@@ -2108,7 +2465,6 @@ class MaterialService:
         return result
 
     # ----- 删除与重复裁决 -----
-
     def preview_delete_impact(self, document_id: str, user_id: str | None = None) -> dict[str, Any]:
         with db_session(self.db_path) as conn:
             document = get_document(conn, document_id)
@@ -2173,7 +2529,6 @@ class MaterialService:
     def resolve_duplicate(
         self, document_id: str, *, action: str, user_id: str | None = None
     ) -> dict[str, Any]:
-        """裁决重复导入：keep 保留并解析，cancel 逻辑删除。"""
         with db_session(self.db_path) as conn:
             document = get_document(conn, document_id)
             if not document:
@@ -2207,4 +2562,3 @@ def get_material_service() -> MaterialService:
 def set_material_service(service: MaterialService | None) -> None:
     global _default_service
     _default_service = service
-
