@@ -4,237 +4,220 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>链证智析 · 跨案关联线索监督工作台</title>
-    <link rel="stylesheet" href="styles/main.css">
-    <link rel="stylesheet" href="styles/sidebar.css">
-    <link rel="stylesheet" href="styles/chat.css">
-    <link rel="stylesheet" href="styles/tool-call.css">
-    <link rel="stylesheet" href="styles/thinking.css">
-    <link rel="stylesheet" href="styles/plan.css">
-    <link rel="stylesheet" href="styles/input.css">
-    <link rel="stylesheet" href="styles/toast.css">
-    <link rel="stylesheet" href="styles/markdown.css">
-    <link rel="stylesheet" href="styles/responsive.css">
-    <link rel="stylesheet" href="styles/workbench.css?v=20260903-filedel">
+    <link rel="stylesheet" href="styles/main.css?v=20260905-ui3">
+    <link rel="stylesheet" href="styles/sidebar.css?v=20260905-ui3">
+    <link rel="stylesheet" href="styles/chat.css?v=20260905-ui3">
+    <link rel="stylesheet" href="styles/tool-call.css?v=20260905-ui3">
+    <link rel="stylesheet" href="styles/thinking.css?v=20260905-ui3">
+    <link rel="stylesheet" href="styles/plan.css?v=20260905-ui3">
+    <link rel="stylesheet" href="styles/input.css?v=20260905-ui3">
+    <link rel="stylesheet" href="styles/toast.css?v=20260905-ui3">
+    <link rel="stylesheet" href="styles/markdown.css?v=20260905-ui3">
+    <link rel="stylesheet" href="styles/responsive.css?v=20260905-ui3">
+    <link rel="stylesheet" href="styles/workbench.css?v=20260905-ui3">
     <script>
-        // 在样式生效前定妥主题，避免深色模式下首帧闪白
         (function () {
             var saved = null;
             try { saved = localStorage.getItem('agent-theme'); } catch (e) { }
-            var dark = saved ? saved === 'dark'
-                : window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+            var mode = (saved === 'system' || saved === 'dark' || saved === 'light')
+                ? saved
+                : (saved === 'true' ? 'dark' : (saved === 'false' ? 'light' : 'system'));
+            var dark = mode === 'dark'
+                || (mode === 'system' && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
             document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+            document.documentElement.setAttribute('data-theme-pref', mode);
+            document.documentElement.removeAttribute('data-theme-mode');
         })();
     </script>
 </head>
 <body>
 <div class="wb-app" id="wb-app">
 
-    <!-- 全局栏：切换的是监督分析任务，不是一次性对话 -->
-    <aside class="wb-rail" id="sidebar">
-        <div class="wb-rail-top">
-            <div class="wb-brand" title="链证智析">链证</div>
-            <button class="wb-rail-btn" id="wb-collapse-rail" title="收起侧栏">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M15 18l-6-6 6-6"/>
-                </svg>
-            </button>
-            <button class="wb-rail-btn wb-rail-primary" id="wb-new-task" title="新建监督分析任务">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M12 4v16m-8-8h16"/>
-                </svg>
-            </button>
-        </div>
-
-        <div class="wb-rail-label">最近任务</div>
-        <div class="wb-task-list" id="wb-task-list"></div>
-        <div class="wb-rail-label">History</div>
-        <div class="wb-task-history" id="wb-task-history"></div>
-
-        <div class="wb-rail-footer">
-            <button class="wb-rail-btn" id="btn-theme-toggle" title="切换主题">
-                <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <circle cx="12" cy="12" r="5"/>
-                    <path d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
-                </svg>
-                <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/>
-                </svg>
-            </button>
-            <button class="wb-rail-btn" id="wb-settings" title="设置">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <circle cx="12" cy="12" r="3"/>
-                    <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 11-4 0v-.09a1.65 1.65 0 00-1.08-1.51 1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06A1.65 1.65 0 004.6 15a1.65 1.65 0 00-1.51-1H3a2 2 0 110-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06A1.65 1.65 0 009 4.6a1.65 1.65 0 001-1.51V3a2 2 0 114 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06A1.65 1.65 0 0019.4 9v0a1.65 1.65 0 001.51 1H21a2 2 0 110 4h-.09a1.65 1.65 0 00-1.51 1z"/>
-                </svg>
-            </button>
-            <button class="wb-rail-btn" id="wb-help" title="帮助与文档">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <circle cx="12" cy="12" r="10"/>
-                    <path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3M12 17h.01"/>
-                </svg>
-            </button>
-            <div class="wb-user" id="wb-user" title="当前用户">检</div>
-        </div>
-
-    </aside>
-
-    <!-- 状态 A：对话式任务启动（保留范围选项，可按案件上传） -->
-    <section class="wb-start" id="wb-start">
-        <div class="wb-page-expand-host" id="wb-start-expand-host">
-            <button class="wb-rail-btn wb-dir-expand-rail" id="wb-expand-rail-start" title="展开侧栏" type="button" tabindex="-1">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M9 18l6-6-6-6"/>
-                </svg>
-            </button>
-        </div>
-        <div class="wb-start-inner wb-start-chat">
-            <header class="wb-start-head">
-                <div class="wb-brand wb-brand-lg">链证</div>
-                <div>
-                    <div class="wb-start-brandname">链证智析</div>
-                    <div class="wb-start-brandsub">DeepSeek V4 Flash · 跨案关联线索监督</div>
-                </div>
-            </header>
-
-            <div class="wb-start-thread" id="wb-start-thread">
-                <div class="wb-start-hello">
-                    我是监督分析智能体。请先填好案件范围与监督目的，并把材料挂到对应案件；生成计划后会移到右侧，无需再补材料或提示词即可执行。
-                </div>
-
-                <div class="wb-card wb-scope" id="wb-scope">
-                    <div class="wb-card-head">
-                        <span>任务范围（必填选项）</span>
-                        <span class="wb-pill" id="wb-scope-check">必填项 0/3</span>
-                    </div>
-                    <div class="wb-card-body">
-                        <label class="wb-field">
-                            <span class="wb-field-label">监督目的</span>
-                            <textarea id="wb-purpose" rows="2"
-                                placeholder="例如：核查两起案件中重复出现的银行卡、手机号和设备标识，线索须回原文核验。"></textarea>
-                        </label>
-
-                        <div class="wb-field-row">
-                            <label class="wb-field">
-                                <span class="wb-field-label">任务名称</span>
-                                <input id="wb-title" type="text" placeholder="银行卡—设备跨案关联核查">
-                            </label>
-                            <label class="wb-field">
-                                <span class="wb-field-label">授权有效期</span>
-                                <input id="wb-until" type="date">
-                            </label>
-                        </div>
-
-                        <div class="wb-field">
-                            <span class="wb-field-label">案件范围与材料（至少两起，材料挂到对应案件）</span>
-                            <div class="wb-case-list" id="wb-case-list"></div>
-                            <button class="wb-btn wb-btn-ghost" id="wb-add-case">添加案件</button>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <div class="wb-start-composer">
-                <div class="wb-hint-box">支持 PDF / DOCX / TXT / PNG / JPEG。XML、XLSX 暂不能作为卷宗正文解析。</div>
-                <div class="wb-actions">
-                    <button class="wb-btn wb-btn-primary" id="wb-gen-plan">生成分析计划</button>
-                </div>
+    <!-- 左栏：对齐前端参考信息架构 -->
+    <aside class="wb-nav" id="sidebar">
+        <div class="wb-nav-brand">
+            <div class="wb-nav-logo" aria-hidden="true">链</div>
+            <div class="wb-nav-brand-text">
+                <div class="wb-nav-title">链证智析</div>
+                <div class="wb-nav-sub">多案关联分析工作台</div>
             </div>
         </div>
-    </section>
 
-    <!-- 状态 C：四区工作台 -->
-    <section class="wb-workspace" id="wb-workspace" hidden>
-        <!-- 任务目录：业务对象清单，可收起 -->
-        <nav class="wb-dir" id="wb-dir">
-            <div class="wb-dir-head" id="wb-dir-head">
-                <div class="wb-dir-head-text">
-                    <div class="wb-dir-title" id="wb-dir-title">监督分析任务</div>
-                    <div class="wb-dir-meta" id="wb-dir-meta"></div>
-                </div>
-                <button class="wb-rail-btn wb-dir-expand-rail" id="wb-expand-rail" title="展开侧栏" type="button" tabindex="-1">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M9 18l6-6-6-6"/>
-                    </svg>
-                </button>
+        <button type="button" class="wb-nav-switcher" id="wb-task-switcher" title="切换分析任务">
+            <div class="wb-nav-switcher-body">
+                <div class="wb-nav-switcher-name" id="wb-switcher-name">未选择分析任务</div>
+                <div class="wb-nav-switcher-meta" id="wb-switcher-meta">请新建或选择任务</div>
             </div>
-            <div class="wb-dir-body" id="wb-dir-body"></div>
+            <span class="wb-nav-switcher-chevron">▾</span>
+        </button>
+        <div class="wb-nav-switcher-menu" id="wb-task-menu" hidden></div>
+
+        <div class="wb-nav-section-label">分析工作流</div>
+        <nav class="wb-nav-list" id="wb-nav-list">
+            <button type="button" class="wb-nav-item" data-view="tasks"><span class="wb-nav-item-label">分析任务</span></button>
+            <button type="button" class="wb-nav-item" data-view="materials"><span class="wb-nav-item-label">材料中心</span><span class="wb-nav-badge" data-badge="materials" hidden></span></button>
+            <button type="button" class="wb-nav-item" data-view="entities"><span class="wb-nav-item-label">实体复核</span><span class="wb-nav-badge" data-badge="entities" hidden></span></button>
+            <button type="button" class="wb-nav-item" data-view="leads"><span class="wb-nav-item-label">线索中心</span><span class="wb-nav-badge" data-badge="leads" hidden></span></button>
+            <button type="button" class="wb-nav-item" data-view="timeline"><span class="wb-nav-item-label">角色时间线</span></button>
+            <button type="button" class="wb-nav-item" data-view="graph"><span class="wb-nav-item-label">链条图谱</span></button>
+            <button type="button" class="wb-nav-item" data-view="reports"><span class="wb-nav-item-label">报告与审计</span></button>
         </nav>
 
-        <!-- 中间产物工作区 -->
-        <div class="wb-center">
-            <header class="wb-topbar">
-                <div class="wb-topbar-context" id="wb-topbar-context"></div>
-                <button class="wb-icon-btn" id="wb-toggle-agent" title="收起 / 展开智能体">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/>
-                    </svg>
-                </button>
-            </header>
-            <div class="wb-tabs" id="wb-tabs"></div>
-            <div class="wb-panel" id="wb-panel"></div>
-        </div>
-
-        <!-- 右侧智能体面板 -->
-        <aside class="wb-agent" id="wb-agent">
-            <div class="wb-agent-head">
+        <div class="wb-nav-footer">
+            <button type="button" class="wb-nav-item muted" id="wb-new-task">新建分析任务</button>
+            <button type="button" class="wb-nav-item muted" id="wb-settings">系统管理<span class="wb-nav-hint">未接入</span></button>
+            <button type="button" class="wb-nav-item muted" id="wb-help">帮助与文档</button>
+            <div class="wb-theme-seg" id="wb-theme-seg" title="主题">
+                <button type="button" data-theme-mode="system">系统</button>
+                <button type="button" data-theme-mode="dark">深色</button>
+                <button type="button" data-theme-mode="light">浅色</button>
+            </div>
+            <div class="wb-nav-user">
+                <div class="wb-nav-avatar" id="wb-user">检</div>
                 <div>
-                    <div class="wb-agent-title">智能体</div>
-                    <div class="wb-agent-sub" id="wb-agent-context">当前绑定：任务</div>
-                </div>
-                <div class="agent-status" id="agent-status">
-                    <span class="status-dot status-idle"></span>
-                    <span class="status-text">空闲</span>
+                    <div class="wb-nav-user-name">检察官</div>
+                    <div class="wb-nav-user-role">演示账号</div>
                 </div>
             </div>
+        </div>
+    </aside>
 
-            <div class="wb-agent-model">
-                <div class="model-selector" id="model-selector">
-                    <span class="model-selector-label">模型：</span>
-                    <span class="model-selector-value" id="current-model">DeepSeek V4 Flash</span>
-                    <svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M6 9l6 6 6-6"/>
-                    </svg>
-                </div>
-            </div>
+    <div class="wb-shell">
+        <!-- 无任务：新建页 -->
+        <section class="wb-start" id="wb-start">
+            <div class="wb-start-inner wb-start-chat">
+                <header class="wb-start-head">
+                    <div class="wb-brand wb-brand-lg">链证</div>
+                    <div>
+                        <div class="wb-start-brandname">新建分析任务</div>
+                        <div class="wb-start-brandsub">填好范围与案件材料后生成任务，将进入分析任务页</div>
+                    </div>
+                </header>
 
-            <div class="chat-container" id="chat-container">
-                <div class="chat-messages" id="chat-messages"></div>
-                <div class="status-bar" id="status-bar" style="display: none;">
-                    <div class="status-bar-left">
-                        <div class="status-bar-icon" id="status-bar-icon">
-                            <svg class="spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <path d="M21 12a9 9 0 11-6.219-8.56"/>
-                            </svg>
+                <div class="wb-start-thread" id="wb-start-thread">
+                    <div class="wb-card wb-scope" id="wb-scope">
+                        <div class="wb-card-head">
+                            <span>任务范围（必填）</span>
+                            <span class="wb-pill" id="wb-scope-check">必填项 0/3</span>
                         </div>
-                        <span class="status-bar-text" id="status-bar-text">思考中...</span>
-                    </div>
-                    <div class="status-bar-right">
-                        <div class="progress-bar-mini">
-                            <div class="progress-fill" id="progress-fill"></div>
+                        <div class="wb-card-body">
+                            <label class="wb-field">
+                                <span class="wb-field-label">监督目的</span>
+                                <textarea id="wb-purpose" rows="2"
+                                    placeholder="例如：核查两起案件中重复出现的银行卡、手机号和设备标识，线索须回原文核验。"></textarea>
+                            </label>
+                            <div class="wb-field-row">
+                                <label class="wb-field">
+                                    <span class="wb-field-label">任务名称</span>
+                                    <input id="wb-title" type="text" placeholder="银行卡—设备跨案关联核查">
+                                </label>
+                                <label class="wb-field">
+                                    <span class="wb-field-label">授权有效期</span>
+                                    <input id="wb-until" type="date">
+                                </label>
+                            </div>
+                            <div class="wb-field">
+                                <span class="wb-field-label">案件范围与材料（至少两起）</span>
+                                <div class="wb-case-list" id="wb-case-list"></div>
+                                <button class="wb-btn wb-btn-ghost" id="wb-add-case" type="button">添加案件</button>
+                            </div>
                         </div>
-                        <span class="token-count" id="token-count">0 tokens</span>
                     </div>
                 </div>
-            </div>
 
-            <div class="input-area">
-                <div class="input-wrapper">
-                    <div class="input-box">
-                        <textarea
-                            class="input-textarea"
-                            id="input-textarea"
-                            placeholder="询问当前产物，或提出下一步要求…（Enter 发送 / Shift+Enter 换行）"
-                            rows="1"
-                        ></textarea>
-                        <button class="btn-send" id="btn-send" disabled>
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/>
-                            </svg>
-                        </button>
+                <div class="wb-start-composer">
+                    <div class="wb-hint-box">支持 PDF / DOCX / TXT / PNG / JPEG。XML、XLSX 暂不能作为卷宗正文解析。</div>
+                    <div class="wb-actions">
+                        <button class="wb-btn wb-btn-primary" id="wb-gen-plan" type="button">生成分析任务</button>
                     </div>
                 </div>
             </div>
-        </aside>
-    </section>
+            <footer class="wb-legal">本系统仅汇集跨案关联候选与待核验事项，不构成对犯罪事实、人员责任或证据能力的认定。</footer>
+        </section>
+
+        <!-- 有任务：中间业务页 + 右侧智能体 -->
+        <section class="wb-workspace" id="wb-workspace" hidden>
+            <div class="wb-center" id="wb-center">
+                <div class="wb-center-main">
+                    <div class="wb-view" id="wb-view"></div>
+                    <footer class="wb-legal">本系统仅汇集跨案关联候选与待核验事项，不构成对犯罪事实、人员责任或证据能力的认定。</footer>
+                </div>
+                <!-- 原文对照：仅占中间区右侧，不覆盖智能体 -->
+                <aside class="wb-cite-drawer" id="wb-cite-drawer" hidden>
+                    <div class="wb-cite-drawer-head">
+                        <div>
+                            <div class="wb-cite-kicker" id="wb-cite-kicker">原文对照</div>
+                            <div class="wb-cite-title" id="wb-cite-title">—</div>
+                        </div>
+                        <button type="button" class="wb-icon-btn" id="wb-cite-close" title="关闭">×</button>
+                    </div>
+                    <div class="wb-cite-drawer-body" id="wb-cite-drawer-body"></div>
+                </aside>
+            </div>
+            <div class="wb-splitter" id="wb-split-agent" data-split="agent" title="拖动调节智能体宽度"></div>
+
+            <aside class="wb-agent" id="wb-agent">
+                <div class="wb-agent-head">
+                    <div>
+                        <div class="wb-agent-title">智能体</div>
+                        <div class="wb-agent-sub" id="wb-agent-context">当前绑定：任务</div>
+                    </div>
+                    <div class="agent-status" id="agent-status">
+                        <span class="status-dot status-idle"></span>
+                        <span class="status-text">空闲</span>
+                    </div>
+                </div>
+
+                <div class="wb-agent-model">
+                    <div class="model-selector" id="model-selector">
+                        <span class="model-selector-label">模型：</span>
+                        <span class="model-selector-value" id="current-model">DeepSeek V4 Flash</span>
+                        <svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M6 9l6 6 6-6"/>
+                        </svg>
+                    </div>
+                </div>
+
+                <div class="chat-container" id="chat-container">
+                    <div class="chat-messages" id="chat-messages"></div>
+                    <div class="status-bar" id="status-bar" style="display: none;">
+                        <div class="status-bar-left">
+                            <div class="status-bar-icon" id="status-bar-icon">
+                                <svg class="spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M21 12a9 9 0 11-6.219-8.56"/>
+                                </svg>
+                            </div>
+                            <span class="status-bar-text" id="status-bar-text">分析中…</span>
+                        </div>
+                        <div class="status-bar-right">
+                            <div class="progress-bar-mini">
+                                <div class="progress-fill" id="progress-fill"></div>
+                            </div>
+                            <span class="token-count" id="token-count">进度 0%</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="input-area">
+                    <div class="input-wrapper">
+                        <div class="input-box">
+                            <textarea
+                                class="input-textarea"
+                                id="input-textarea"
+                                placeholder="询问当前分析成果，或提出下一步要求…（Enter 发送 / Shift+Enter 换行）"
+                                rows="1"
+                            ></textarea>
+                            <button class="btn-send" id="btn-send" disabled>
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/>
+                                </svg>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </aside>
+        </section>
+    </div>
 </div>
 
 <div class="toast-container" id="toast-container"></div>
@@ -263,20 +246,21 @@
     </div>
 </div>
 
-<script src="js/state.js"></script>
+<script src="js/state.js?v=20260905-ui3"></script>
 <script src="js/utils.js"></script>
 <script src="js/toast.js"></script>
 <script src="js/markdown.js"></script>
 <script src="js/plan.js"></script>
 <script src="js/file-upload.js"></script>
-<script src="js/thinking.js"></script>
-<script src="js/tool-call.js"></script>
+<script src="js/icons.js?v=20260905-ui3"></script>
+<script src="js/thinking.js?v=20260905-ui3"></script>
+<script src="js/tool-call.js?v=20260905-ui3"></script>
 <script src="js/message.js"></script>
-<script src="js/agent.js"></script>
-<script src="js/sidebar.js"></script>
+<script src="js/agent.js?v=20260905-ui3"></script>
+<script src="js/sidebar.js?v=20260905-ui3"></script>
 <script src="js/input.js"></script>
-<script src="js/theme.js"></script>
-<script src="js/workbench.js?v=20260903-filedel"></script>
-<script src="js/main.js"></script>
+<script src="js/theme.js?v=20260905-ui3"></script>
+<script src="js/workbench.js?v=20260905-ui3"></script>
+<script src="js/main.js?v=20260905-ui3"></script>
 </body>
 </html>

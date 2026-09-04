@@ -114,7 +114,7 @@
             // 空会话提示：只读提问即时执行，改动业务状态需确认
             container.innerHTML = `
                 <div class="welcome-screen" id="welcome-screen">
-                    <p class="welcome-subtitle">可以询问当前产物、材料处理情况，或提出下一步要求。</p>
+                    <p class="welcome-subtitle">可以询问当前分析成果、材料处理情况，或提出下一步要求。</p>
                     <div class="welcome-prompts">
                         <button class="prompt-card" data-prompt="解释当前材料处理进度">
                             <span>解释当前处理进度</span>

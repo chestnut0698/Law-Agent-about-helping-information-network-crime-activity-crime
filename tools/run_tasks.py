@@ -10,7 +10,7 @@ def _tool_json(data: Any) -> str:
 
 def _artifact_brief(artifact: dict[str, Any] | None, **extra: Any) -> dict[str, Any]:
     if not artifact:
-        return {"ok": False, "message": "未生成产物", **extra}
+        return {"ok": False, "message": "未生成分析成果", **extra}
     return {
         "ok": True,
         "artifact_id": artifact.get("id"),
@@ -84,7 +84,7 @@ def refresh_task_materials(task_id: str, user_id: str | None = None) -> str:
     """刷新任务材料批次产物。"""
     try:
         artifact = get_task_service().refresh_material_batch(task_id, user_id=user_id or "system")
-        return _tool_json(_artifact_brief(artifact, message="材料批次已刷新"))
+        return _tool_json(_artifact_brief(artifact, message="材料接入情况已刷新"))
     except TaskError as exc:
         return _tool_json(exc.to_dict())
 
@@ -96,7 +96,7 @@ def run_task_collision(task_id: str, user_id: str | None = None) -> str:
         return _tool_json(
             _artifact_brief(
                 result.get("artifact"),
-                message="强标识碰撞完成",
+                message="跨案标识比对完成，已生成对象待核清单",
                 candidate_count=result.get("candidate_count"),
                 mention_count=result.get("mention_count"),
             )
@@ -112,7 +112,7 @@ def run_task_timeline(task_id: str, user_id: str | None = None) -> str:
         return _tool_json(
             _artifact_brief(
                 result.get("artifact"),
-                message="事件时间线已生成",
+                message="事件时间线已整理",
                 event_count=result.get("event_count"),
             )
         )
@@ -145,7 +145,7 @@ def write_ai_clues(task_id: str, clues: list[dict[str, Any]], user_id: str | Non
             "ok": True,
             "artifact_id": result["artifact"]["id"] if result.get("artifact") else None,
             "clue_count": result["clue_count"],
-            "message": f"成功写入 {result['clue_count']} 条线索",
+            "message": f"已写入 {result['clue_count']} 条疑似关联线索，请到中间工作区核验",
         })
     except TaskError as exc:
         return _tool_json(exc.to_dict())

@@ -136,12 +136,12 @@
     width: 64px;
     height: 64px;
     border-radius: 16px;
-    background: linear-gradient(135deg, var(--accent-primary), var(--accent-blue));
+    background: var(--primary);
     display: flex;
     align-items: center;
     justify-content: center;
     margin-bottom: 24px;
-    box-shadow: var(--shadow-lg);
+    box-shadow: var(--shadow-md);
 }
 
 .welcome-logo svg {
@@ -229,13 +229,13 @@
 }
 
 .message-avatar.user {
-    background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
-    color: white;
+    background: var(--secondary);
+    color: var(--secondary-foreground);
 }
 
 .message-avatar.assistant {
-    background: linear-gradient(135deg, var(--accent-primary), var(--accent-cyan));
-    color: white;
+    background: var(--primary);
+    color: var(--primary-foreground);
 }
 
 .message-name {
@@ -359,7 +359,7 @@
 .progress-fill {
     height: 100%;
     width: 0%;
-    background: linear-gradient(90deg, var(--accent-primary), var(--accent-blue));
+    background: var(--accent);
     border-radius: 2px;
     transition: width 0.3s ease;
 }

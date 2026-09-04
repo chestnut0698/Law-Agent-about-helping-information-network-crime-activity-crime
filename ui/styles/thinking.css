@@ -133,3 +133,64 @@
     overflow: hidden;
     transition: max-height var(--transition-normal);
 }
+
+/* 分步分析卡：思考 + 执行同卡，默认折叠 */
+.analysis-step {
+    max-width: 800px;
+    margin: 10px auto;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    background: var(--bg-secondary);
+    overflow: hidden;
+}
+
+.analysis-step-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    cursor: pointer;
+    user-select: none;
+}
+
+.analysis-step-header:hover {
+    background: var(--bg-hover);
+}
+
+.analysis-step.expanded .thinking-chevron {
+    transform: rotate(180deg);
+}
+
+.analysis-step-body {
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height 0.25s ease;
+}
+
+.analysis-step.expanded .analysis-step-body {
+    max-height: 2400px;
+}
+
+.analysis-step-label {
+    padding: 8px 14px 0 48px;
+    font-size: 11px;
+    color: var(--text-muted);
+    font-weight: 600;
+}
+
+.analysis-step-think {
+    padding: 4px 14px 8px 48px;
+}
+
+.analysis-step-tools {
+    padding: 4px 14px 14px 48px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.analysis-step-tools .tool-call-card {
+    max-width: none;
+    margin: 0;
+}
+

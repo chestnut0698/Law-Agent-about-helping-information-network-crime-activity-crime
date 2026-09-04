@@ -24,9 +24,9 @@
 
 /* 拖拽悬停效果 */
 .input-wrapper.drag-over {
-    outline: 2px dashed var(--accent-color, #4A90D9);
+    outline: 2px dashed var(--primary, #2f9a9e);
     outline-offset: -4px;
-    background: rgba(74, 144, 217, 0.03);
+    background: color-mix(in srgb, var(--primary) 6%, transparent);
     transition: outline 0.2s ease, background 0.2s ease;
 }
 
@@ -37,7 +37,7 @@
     top: 50%;
     left: 50%;
     transform: translate(-50%, -50%);
-    color: var(--accent-color, #4A90D9);
+    color: var(--primary, #2f9a9e);
     font-size: 14px;
     pointer-events: none;
     background: var(--bg-primary, #fff);
@@ -153,17 +153,17 @@
     width: 34px;
     height: 34px;
     border: none;
-    border-radius: var(--radius-sm);
-    background: var(--accent-primary);
-    color: white;
+    border-radius: 8px;
+    background: var(--primary);
+    color: var(--primary-foreground);
     cursor: pointer;
     transition: all var(--transition-fast);
     flex-shrink: 0;
 }
 
 .btn-send:hover:not(:disabled) {
-    background: var(--accent-hover);
-    transform: scale(1.05);
+    background: color-mix(in oklch, var(--primary) 80%, transparent);
+    transform: none;
 }
 
 .btn-send:disabled {

@@ -310,7 +310,63 @@ async def review_task_entity_candidate(task_id: str, candidate_id: str, payload:
             decision=payload.get("decision", ""),
             reason=payload.get("reason", ""),
             correction=payload.get("correction"),
+            expected_version=payload.get("expected_version"),
         )
+    except TaskError as exc:
+        return task_error_response(exc)
+
+
+@app.post("/api/tasks/{task_id}/clues/{artifact_id}/disposition")
+async def dispose_task_clue(task_id: str, artifact_id: str, payload: dict):
+    try:
+        return get_task_service().dispose_clue_item(
+            task_id,
+            artifact_id,
+            disposition=payload.get("disposition", ""),
+            reason=payload.get("reason", ""),
+            expected_version=payload.get("expected_version"),
+        )
+    except TaskError as exc:
+        return task_error_response(exc)
+
+
+@app.post("/api/tasks/{task_id}/report/draft")
+async def task_report_draft(task_id: str):
+    try:
+        return get_task_service().build_report_draft(task_id)
+    except TaskError as exc:
+        return task_error_response(exc)
+
+
+@app.post("/api/tasks/{task_id}/collision/run")
+async def task_run_collision(
+    task_id: str,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    try:
+        return get_task_service().run_collision(task_id, user_id=x_user_id)
+    except TaskError as exc:
+        return task_error_response(exc)
+
+
+@app.post("/api/tasks/{task_id}/clues/generate")
+async def task_generate_clues(
+    task_id: str,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    try:
+        return get_task_service().generate_clues(task_id, user_id=x_user_id)
+    except TaskError as exc:
+        return task_error_response(exc)
+
+
+@app.post("/api/tasks/{task_id}/timeline/run")
+async def task_run_role_timeline(
+    task_id: str,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    try:
+        return get_task_service().run_role_timeline(task_id, user_id=x_user_id)
     except TaskError as exc:
         return task_error_response(exc)
 
@@ -392,16 +448,25 @@ async def apply_artifact_impact(task_id: str, artifact_id: str, payload: dict | 
 
 @app.get("/chat/{task_id}/messages")
 async def get_chat_history(task_id: str):
-    """获取任务的历史聊天记录"""
-    from app.files import db_session, _rows
-    with db_session() as conn:
-        rows = _rows(
-            conn,
-            "SELECT role, content, created_at FROM chat_messages "
-            "WHERE task_id = ? ORDER BY created_at ASC",
-            (task_id,)
-        )
-    return {"messages": rows}
+    """获取任务的历史聊天记录（含 tool_calls，供前端还原折叠步骤）"""
+    messages = get_task_service().repair_chat_messages(task_id)
+    payload = []
+    for msg in messages:
+        if msg.get("role") == "system":
+            continue
+        item = {
+            "role": msg.get("role"),
+            "content": msg.get("content") or "",
+            "created_at": msg.get("created_at"),
+        }
+        if msg.get("tool_call_id"):
+            item["tool_call_id"] = msg["tool_call_id"]
+        if msg.get("tool_calls"):
+            item["tool_calls"] = msg["tool_calls"]
+        if msg.get("reasoning_content"):
+            item["reasoning_content"] = msg["reasoning_content"]
+        payload.append(item)
+    return {"messages": payload}
 
 # 前后端通信
 @app.post("/chat/{task_id}")
@@ -441,67 +506,75 @@ async def chat(request: Request, task_id):
 
 
     async def event_stream():
-        agent.switch_id(task_id)
-        # 调用 agent.chat() 获得生成器
-        responses = agent.chat(user_message)
+        try:
+            agent.switch_id(task_id)
+            # 调用 agent.chat() 获得生成器
+            responses = agent.chat(user_message)
 
-        assistant_content = []
-        for chunk in responses:
-            chunk_type = chunk[0]
-            chunk_data = chunk[1]
+            assistant_content = []
+            for chunk in responses:
+                chunk_type = chunk[0]
+                chunk_data = chunk[1]
 
-            if chunk_type == "reasoning_content":
-                # 思考过程 → 发送 thinking 事件
-                yield f"data: {json.dumps({'type': 'thinking', 'content': chunk_data})}\n\n"
+                if chunk_type == "reasoning_content":
+                    # 思考过程 → 发送 thinking 事件
+                    yield f"data: {json.dumps({'type': 'thinking', 'content': chunk_data})}\n\n"
 
-            elif chunk_type == "tool_calls":
-                name = chunk_data["name"]
-                if name[:3] in {"web", "sea"}:
-                    tool_type = "search"
-                elif "file" in name:
-                    tool_type = "file"
-                else:
-                    tool_type = "code"
-                payload = {
-                    "type": "tool_call",
-                    "tool": {
-                        "type": tool_type,
-                        "name": name,
-                        "params": chunk_data.get("arguments", {}),
-                        "status": "running",
-                    },
-                }
-                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                elif chunk_type == "tool_calls":
+                    name = chunk_data["name"]
+                    if name[:3] in {"web", "sea"}:
+                        tool_type = "search"
+                    elif "file" in name:
+                        tool_type = "file"
+                    else:
+                        tool_type = "code"
+                    payload = {
+                        "type": "tool_call",
+                        "tool": {
+                            "type": tool_type,
+                            "name": name,
+                            "params": chunk_data.get("arguments", {}),
+                            "status": "running",
+                        },
+                    }
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
-            elif chunk_type == "tool_result":
-                payload = {
-                    "type": "tool_result",
-                    "tool": {
-                        "result": chunk_data,
-                        "status": (
-                            "error" if "工具调用出错" in str(chunk_data) else "success"
-                        ),
-                    },
-                }
-                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                elif chunk_type == "tool_result":
+                    payload = {
+                        "type": "tool_result",
+                        "tool": {
+                            "result": chunk_data,
+                            "status": (
+                                "error" if "工具调用出错" in str(chunk_data) else "success"
+                            ),
+                        },
+                    }
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
-            elif chunk_type == "content":
-                assistant_content.append(chunk_data)
-                # 文本内容 → 逐字符发送 text_delta（或整段发送）
-                for char in chunk_data:
-                    yield f"data: {json.dumps({'type': 'text_delta', 'text': char})}\n\n"
+                elif chunk_type == "content":
+                    assistant_content.append(chunk_data)
+                    # 文本内容 → 逐字符发送 text_delta（或整段发送）
+                    for char in chunk_data:
+                        yield f"data: {json.dumps({'type': 'text_delta', 'text': char})}\n\n"
 
-            elif chunk_type == "plan":
-                yield f"data: {json.dumps({'type': 'plan', 'plan': chunk_data})}\n\n"
+                elif chunk_type == "plan":
+                    yield f"data: {json.dumps({'type': 'plan', 'plan': chunk_data})}\n\n"
 
-            elif chunk_type == "done":
-                yield  f"data: {json.dumps({'type': 'done', 'done': chunk_data})}\n\n"
-            # 其他类型可扩展（如 plan, citation 等）
+                elif chunk_type == "done":
+                    yield  f"data: {json.dumps({'type': 'done', 'done': chunk_data})}\n\n"
 
-            # 每次 yield 后小睡，让出事件循环 → 触发真实网络 flush
-            await asyncio.sleep(0)
+                elif chunk_type == "error":
+                    yield f"data: {json.dumps({'type': 'error', 'message': chunk_data}, ensure_ascii=False)}\n\n"
+                # 其他类型可扩展（如 plan, citation 等）
 
-        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                # 每次 yield 后小睡，让出事件循环 → 触发真实网络 flush
+                await asyncio.sleep(0)
+
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        except Exception as exc:
+            from agents.react_agent import _public_chat_error
+            yield f"data: {json.dumps({'type': 'error', 'message': _public_chat_error(exc)}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

@@ -3,42 +3,85 @@
    ======================================== */
 
 :root {
-    /* 深色主题（默认） */
-    --bg-primary: #0f0f0f;
-    --bg-secondary: #1a1a1a;
-    --bg-tertiary: #242424;
-    --bg-hover: #2a2a2a;
-    --bg-active: #333333;
-    --bg-input: #1e1e1e;
-    --bg-overlay: rgba(0, 0, 0, 0.6);
+    /*
+     * 前端参考 globals.css 色板（用户可见主色：青绿 / 橙 / 红）
+     * primary 采用参考中的 accent 青绿作为操作主色，避免藏青按钮。
+     * themeColor 参考：#faf7f0
+     */
+    color-scheme: light;
+    --background: #faf7f0;
+    --foreground: #2a2d3a;
+    --card: #fffcf7;
+    --card-foreground: #2a2d3a;
+    --popover: #fffcf7;
+    --popover-foreground: #2a2d3a;
 
-    --text-primary: #e8e8e8;
-    --text-secondary: #a0a0a0;
-    --text-muted: #666666;
-    --text-inverse: #0f0f0f;
+    /* 青绿（参考 --accent oklch 0.55 0.09 195） */
+    --primary: #2f9a9e;
+    --primary-foreground: #f7fffe;
+    --accent: #2f9a9e;
+    --accent-foreground: #f7fffe;
+    --ring: #2f9a9e;
 
-    --accent-primary: #10a37f;
-    --accent-hover: #0d8a6c;
-    --accent-light: rgba(16, 163, 127, 0.15);
-    --accent-blue: #3b82f6;
-    --accent-purple: #8b5cf6;
-    --accent-orange: #f59e0b;
-    --accent-red: #ef4444;
-    --accent-green: #22c55e;
-    --accent-cyan: #06b6d4;
+    --secondary: #f0ebe3;
+    --secondary-foreground: #34384a;
+    --muted: #f1ece4;
+    --muted-foreground: #6b7285;
+    --border: #e4ddd2;
+    --input: #e4ddd2;
 
-    --border-color: #2a2a2a;
-    --border-light: #333333;
-    --shadow-sm: 0 1px 2px rgba(0,0,0,0.3);
-    --shadow-md: 0 4px 12px rgba(0,0,0,0.4);
-    --shadow-lg: 0 8px 30px rgba(0,0,0,0.5);
+    /* 橙（参考 --warning） / 红（参考 --destructive） / 绿（success） */
+    --warning: #d9a116;
+    --warning-foreground: #2a2d3a;
+    --destructive: #c23d2e;
+    --success: #2f9a6a;
+    --success-foreground: #f7fffe;
+
+    --sidebar: #f6f1e8;
+    --sidebar-foreground: #2a2d3a;
+    --sidebar-primary: #2f9a9e;
+    --sidebar-primary-foreground: #f7fffe;
+    --sidebar-accent: #ebe4d8;
+    --sidebar-accent-foreground: #2a2d3a;
+    --sidebar-border: #e0d7c9;
+    --sidebar-ring: #2f9a9e;
+
+    --bg-primary: var(--card);
+    --bg-secondary: var(--background);
+    --bg-tertiary: var(--muted);
+    --bg-hover: var(--secondary);
+    --bg-active: color-mix(in srgb, var(--primary) 10%, var(--card));
+    --bg-input: var(--card);
+    --bg-overlay: rgba(42, 45, 58, 0.35);
+
+    --text-primary: var(--foreground);
+    --text-secondary: var(--secondary-foreground);
+    --text-muted: var(--muted-foreground);
+    --text-inverse: var(--primary-foreground);
+
+    --accent-primary: var(--primary);
+    --accent-hover: #27888c;
+    --accent-light: color-mix(in srgb, var(--primary) 14%, transparent);
+    --accent-blue: var(--primary);
+    --accent-cyan: var(--primary);
+    --accent-orange: var(--warning);
+    --accent-red: var(--destructive);
+    --accent-green: var(--success);
+    --accent-purple: #7a6bb5;
+
+    --border-color: var(--border);
+    --border-light: #ebe4d8;
+    --shadow-sm: 0 1px 2px rgba(42, 45, 58, 0.06);
+    --shadow-md: 0 4px 12px rgba(42, 45, 58, 0.08);
+    --shadow-lg: 0 8px 30px rgba(42, 45, 58, 0.12);
 
     --radius-sm: 6px;
-    --radius-md: 10px;
-    --radius-lg: 14px;
-    --radius-xl: 20px;
+    --radius-md: 8px;
+    --radius-lg: 10px;
+    --radius-xl: 14px;
+    --radius: 0.5rem;
 
-    --sidebar-width: 280px;
+    --sidebar-width: 248px;
     --topbar-height: 56px;
     --input-height: auto;
 
@@ -46,29 +89,78 @@
     --transition-normal: 250ms ease;
     --transition-slow: 400ms ease;
 
-    --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+    --font-sans: "Noto Sans SC", -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
     --font-mono: 'SF Mono', 'Fira Code', 'Consolas', 'Monaco', monospace;
+    --font-serif: "Noto Serif SC", "Songti SC", "Source Han Serif SC", Georgia, serif;
 }
 
 [data-theme="light"] {
-    --bg-primary: #ffffff;
-    --bg-secondary: #f7f7f8;
-    --bg-tertiary: #ececec;
-    --bg-hover: #e8e8e8;
-    --bg-active: #d4d4d4;
-    --bg-input: #f5f5f5;
-    --bg-overlay: rgba(0, 0, 0, 0.3);
+    color-scheme: light;
+}
 
-    --text-primary: #1a1a1a;
-    --text-secondary: #4a4a4a;
-    --text-muted: #888888;
-    --text-inverse: #ffffff;
+html[data-theme="dark"],
+[data-theme="dark"] {
+    color-scheme: dark;
+    /* 对齐截图：近黑底 + 灰卡片 + 青绿/橙/红状态；主按钮白底黑字 */
+    --background: #0a0a0a;
+    --foreground: #f5f5f5;
+    --card: #1a1a1a;
+    --card-foreground: #f5f5f5;
+    --popover: #1a1a1a;
+    --popover-foreground: #f5f5f5;
+    --primary: #f5f5f5;
+    --primary-foreground: #0a0a0a;
+    --secondary: #262626;
+    --secondary-foreground: #f5f5f5;
+    --muted: #222222;
+    --muted-foreground: #8e8e93;
+    --accent: #2f9a9e;
+    --accent-foreground: #f7fffe;
+    --destructive: #e63946;
+    --border: rgba(255, 255, 255, 0.1);
+    --input: rgba(255, 255, 255, 0.12);
+    --ring: #2f9a9e;
+    --success: #2f9a9e;
+    --success-foreground: #041516;
+    --warning: #f4a261;
+    --warning-foreground: #1a1208;
 
-    --border-color: #e0e0e0;
-    --border-light: #d0d0d0;
-    --shadow-sm: 0 1px 2px rgba(0,0,0,0.08);
-    --shadow-md: 0 4px 12px rgba(0,0,0,0.12);
-    --shadow-lg: 0 8px 30px rgba(0,0,0,0.15);
+    --sidebar: #121212;
+    --sidebar-foreground: #f5f5f5;
+    --sidebar-primary: #2f9a9e;
+    --sidebar-primary-foreground: #f7fffe;
+    --sidebar-accent: #1e1e1e;
+    --sidebar-accent-foreground: #f5f5f5;
+    --sidebar-border: rgba(255, 255, 255, 0.08);
+    --sidebar-ring: #2f9a9e;
+
+    --bg-primary: var(--card);
+    --bg-secondary: var(--background);
+    --bg-tertiary: var(--muted);
+    --bg-hover: #262626;
+    --bg-active: #2a2a2a;
+    --bg-input: #141414;
+    --bg-overlay: rgba(0, 0, 0, 0.62);
+
+    --text-primary: var(--foreground);
+    --text-secondary: #d4d4d8;
+    --text-muted: var(--muted-foreground);
+    --text-inverse: var(--primary-foreground);
+
+    --accent-primary: var(--accent);
+    --accent-hover: #3aadb1;
+    --accent-light: color-mix(in srgb, var(--accent) 18%, transparent);
+    --accent-blue: var(--accent);
+    --accent-cyan: var(--accent);
+    --accent-green: var(--success);
+    --accent-red: var(--destructive);
+    --accent-orange: var(--warning);
+
+    --border-color: var(--border);
+    --border-light: rgba(255, 255, 255, 0.06);
+    --shadow-sm: 0 1px 2px rgba(0,0,0,0.45);
+    --shadow-md: 0 4px 12px rgba(0,0,0,0.5);
+    --shadow-lg: 0 8px 30px rgba(0,0,0,0.6);
 }
 
 * {

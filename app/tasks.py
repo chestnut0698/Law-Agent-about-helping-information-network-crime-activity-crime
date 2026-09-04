@@ -65,13 +65,13 @@ FROZEN_ARTIFACT_TYPES = {"REPORT_EXPORT"}
 
 # 任务目录分组：左侧业务清单按此归组，未生成的节点显示步骤状态而不是伪文件
 DIRECTORY_GROUPS = [
-    {"key": "scope", "label": "概览", "types": ["TASK_SCOPE"]},
-    {"key": "materials", "label": "材料", "types": ["MATERIAL_BATCH", "MATERIAL_DOC"]},
-    {"key": "entities", "label": "实体候选", "types": ["ENTITY_CANDIDATE_SET"]},
-    {"key": "clues", "label": "关联线索", "types": ["CLUE_SET", "CLUE_ITEM"]},
-    {"key": "views", "label": "时间线 / 图谱", "types": ["ROLE_TIMELINE", "LINK_GRAPH"]},
-    {"key": "verify", "label": "核验记录", "types": ["SOURCE_VERIFY"]},
-    {"key": "reports", "label": "报告版本", "types": ["REPORT_DRAFT", "REPORT_EXPORT"]},
+    {"key": "scope", "label": "任务说明", "types": ["TASK_SCOPE"]},
+    {"key": "materials", "label": "卷宗材料", "types": ["MATERIAL_BATCH", "MATERIAL_DOC"]},
+    {"key": "entities", "label": "跨案对象待核", "types": ["ENTITY_CANDIDATE_SET"]},
+    {"key": "clues", "label": "疑似关联线索", "types": ["CLUE_SET", "CLUE_ITEM"]},
+    {"key": "views", "label": "事件时间线", "types": ["ROLE_TIMELINE", "LINK_GRAPH"]},
+    {"key": "verify", "label": "核验留痕", "types": ["SOURCE_VERIFY"]},
+    {"key": "reports", "label": "报告", "types": ["REPORT_DRAFT", "REPORT_EXPORT"]},
 ]
 
 TASK_ERROR_CODES = {
@@ -521,7 +521,7 @@ class TaskService:
                 {"key": "PARSE", "label": "材料解析与 OCR", "mode": "auto"},
                 {"key": "QUALITY", "label": "识别质量检查", "mode": "review"},
                 {"key": "EXTRACT", "label": "对象与行为抽取", "mode": "auto"},
-                {"key": "ENTITY_REVIEW", "label": "实体候选复核", "mode": "review"},
+                    {"key": "ENTITY_REVIEW", "label": "跨案对象判断", "mode": "review"},
                 {"key": "CLUE", "label": "关联线索生成", "mode": "auto"},
                 {"key": "SOURCE_VERIFY", "label": "回原文核验", "mode": "review"},
                 {"key": "REPORT", "label": "线索报告", "mode": "review"},
@@ -568,7 +568,7 @@ class TaskService:
         artifact = self.write_artifact(
             task_id=task_id,
             type="ENTITY_CANDIDATE_SET",
-            title="实体候选·待复核",
+            title="跨案对象待核·待判断",
             ref_key="entity-candidates",
             status="PENDING_REVIEW",
             parent_ids=[batch["id"]] if batch else [],
@@ -580,7 +580,7 @@ class TaskService:
                     **(summary or {}),
                 },
                 "candidates": normalized,
-                "boundary": "候选相似仅用于辅助复核，不代表系统已认定为同一实体。",
+                "boundary": "标识重合仅为待核验提示，不代表系统已认定同一人、同一账户或共同犯罪。",
             },
             run_id=run_id,
         )
@@ -599,19 +599,19 @@ class TaskService:
         """记录合并/分离/修正/暂缓决定，并为候选集追加版本。"""
         allowed = {"MERGE", "KEEP_SEPARATE", "CORRECT", "DEFER"}
         if decision not in allowed:
-            raise TaskError(TASK_ERROR_CODES["STATE_CONFLICT"], "不支持的实体复核决定")
+            raise TaskError(TASK_ERROR_CODES["STATE_CONFLICT"], "不支持的对象判断决定")
         if not (reason or "").strip():
-            raise TaskError(TASK_ERROR_CODES["STATE_CONFLICT"], "实体复核必须填写理由")
+            raise TaskError(TASK_ERROR_CODES["STATE_CONFLICT"], "对象判断必须填写理由")
 
         current = self.find_artifact(task_id, "ENTITY_CANDIDATE_SET", "entity-candidates")
         if not current:
-            raise TaskError(TASK_ERROR_CODES["ARTIFACT_NOT_FOUND"], "实体候选集不存在")
+            raise TaskError(TASK_ERROR_CODES["ARTIFACT_NOT_FOUND"], "跨案对象待核清单不存在")
         if current["status"] in {"STALE", "INVALID"}:
-            raise TaskError(TASK_ERROR_CODES["STATE_CONFLICT"], "候选集已过期或失效，请先更新")
+            raise TaskError(TASK_ERROR_CODES["STATE_CONFLICT"], "待核清单已过期或失效，请先更新")
         if expected_version is not None and int(current["current_version"]) != int(expected_version):
             raise TaskError(
                 TASK_ERROR_CODES["STATE_CONFLICT"],
-                "候选集版本已变化，请刷新后重试",
+                "待核清单版本已变化，请刷新后重试",
                 {"expected_version": expected_version, "current_version": current["current_version"]},
             )
 
@@ -627,7 +627,7 @@ class TaskService:
                 found = candidate
                 break
         if not found:
-            raise TaskError(TASK_ERROR_CODES["ARTIFACT_NOT_FOUND"], "实体候选不存在")
+            raise TaskError(TASK_ERROR_CODES["ARTIFACT_NOT_FOUND"], "待核对象不存在")
 
         if decision == "KEEP_SEPARATE" and found.get("fingerprint"):
             from tools.entities import remember_rejection
@@ -653,13 +653,214 @@ class TaskService:
         artifact = self.write_artifact(
             task_id=task_id,
             type="ENTITY_CANDIDATE_SET",
-            title="实体候选·已完成" if pending == 0 else "实体候选·待复核",
+            title="跨案对象待核·已完成" if pending == 0 else "跨案对象待核·待判断",
             ref_key="entity-candidates",
             status=status,
             parent_ids=json.loads(current["parent_ids_json"] or "[]"),
             payload=payload,
         )
+        self.append_source_verify(
+            task_id,
+            {
+                "action": "实体决策",
+                "type": "entity_decision",
+                "target": candidate_id,
+                "summary": f"{found.get('title') or found.get('display_name') or candidate_id} · {decision}",
+                "result": "ok",
+                "at": utc_now(),
+            },
+        )
         return {"artifact": artifact, "task": self.get_task(task_id)}
+
+    def dispose_clue_item(
+        self,
+        task_id: str,
+        artifact_id: str,
+        disposition: str,
+        reason: str = "",
+        expected_version: int | None = None,
+    ) -> dict[str, Any]:
+        """线索卡片内联处置：继续核查 / 需补材料 / 排除 / 暂缓。"""
+        allowed = {"CONTINUE", "NEED_MATERIAL", "EXCLUDE", "DEFER"}
+        if disposition not in allowed:
+            raise TaskError(TASK_ERROR_CODES["STATE_CONFLICT"], "不支持的线索处置决定")
+        if not (reason or "").strip():
+            raise TaskError(TASK_ERROR_CODES["STATE_CONFLICT"], "线索处置必须填写理由")
+
+        detail = self.get_artifact(task_id, artifact_id)
+        art = detail["artifact"]
+        if art["type"] != "CLUE_ITEM":
+            raise TaskError(TASK_ERROR_CODES["STATE_CONFLICT"], "仅支持对单条线索处置")
+        if art["status"] in {"STALE", "INVALID"}:
+            raise TaskError(TASK_ERROR_CODES["STATE_CONFLICT"], "该线索已过期或失效")
+        if expected_version is not None and int(art["current_version"]) != int(expected_version):
+            raise TaskError(
+                TASK_ERROR_CODES["STATE_CONFLICT"],
+                "线索版本已变化，请刷新后重试",
+                {"expected_version": expected_version, "current_version": art["current_version"]},
+            )
+
+        payload = dict(detail.get("payload") or {})
+        payload["disposition"] = disposition
+        payload["disposition_reason"] = reason.strip()
+        payload["disposed_at"] = utc_now()
+        artifact = self.write_artifact(
+            task_id=task_id,
+            type="CLUE_ITEM",
+            title=payload.get("title") or art["title"],
+            ref_key=art.get("ref_key"),
+            status="VALID",
+            parent_ids=json.loads(art["parent_ids_json"] or "[]"),
+            payload=payload,
+        )
+        self.append_source_verify(
+            task_id,
+            {
+                "action": "线索处置",
+                "type": "clue_disposition",
+                "target": artifact_id,
+                "summary": f"{payload.get('title') or art['title']} · {disposition}",
+                "result": "ok",
+                "at": utc_now(),
+            },
+        )
+        return {"artifact": artifact, "task": self.get_task(task_id)}
+
+    def append_source_verify(self, task_id: str, event: dict[str, Any]) -> dict[str, Any]:
+        """追加核验留痕事件到 SOURCE_VERIFY 产物。"""
+        existing = self.find_artifact(task_id, "SOURCE_VERIFY", "source-verify-log")
+        events: list[dict[str, Any]] = []
+        parent_ids: list[str] = []
+        if existing:
+            detail = self.get_artifact(task_id, existing["id"])
+            events = list((detail.get("payload") or {}).get("events") or [])
+            parent_ids = json.loads(existing["parent_ids_json"] or "[]")
+        events.append(event)
+        return self.write_artifact(
+            task_id=task_id,
+            type="SOURCE_VERIFY",
+            title="核验留痕",
+            ref_key="source-verify-log",
+            status="VALID",
+            parent_ids=parent_ids,
+            payload={
+                "events": events[-200:],
+                "boundary": "留痕仅记录人工核验与回链操作，不构成法律结论。",
+            },
+        )
+
+    def build_report_draft(self, task_id: str) -> dict[str, Any]:
+        """汇总范围、实体、线索为跨案关联线索核验单草稿。"""
+        task = self.get_task(task_id)
+        scope = None
+        entity = None
+        clues: list[dict[str, Any]] = []
+        for art in task.get("artifacts") or []:
+            if art["type"] == "TASK_SCOPE":
+                scope = self.get_artifact(task_id, art["id"])
+            elif art["type"] == "ENTITY_CANDIDATE_SET" and art["status"] not in {"STALE", "INVALID"}:
+                entity = self.get_artifact(task_id, art["id"])
+            elif art["type"] == "CLUE_ITEM" and art["status"] not in {"STALE", "INVALID"}:
+                clues.append(self.get_artifact(task_id, art["id"]))
+
+        boundary = (
+            "本文件仅汇集跨案关联候选、待核验事项及材料原文依据，"
+            "不构成对犯罪事实、人员责任、证据能力、证明力或证明标准的认定。"
+        )
+        invalid_refs = 0
+        clue_lines: list[str] = []
+        for item in clues:
+            payload = item.get("payload") or {}
+            evidence = payload.get("evidence") or []
+            if not evidence:
+                invalid_refs += 1
+            clue_lines.append(
+                f"- {payload.get('title') or item['artifact']['title']} "
+                f"（状态：{payload.get('disposition') or 'PENDING'}；"
+                f"支持材料 {len(evidence)} 处）"
+            )
+
+        entity_payload = (entity or {}).get("payload") or {}
+        candidates = entity_payload.get("candidates") or []
+        confirmed = sum(1 for c in candidates if c.get("decision") == "MERGE")
+        separated = sum(1 for c in candidates if c.get("decision") == "KEEP_SEPARATE")
+        pending = sum(1 for c in candidates if c.get("decision", "PENDING") == "PENDING")
+
+        scope_payload = (scope or {}).get("payload") or {}
+        case_names = "、".join(
+            c.get("display_name") or c.get("name") or ""
+            for c in (scope_payload.get("cases") or task.get("cases") or [])
+        ) or "—"
+
+        markdown = "\n".join(
+            [
+                "# 跨案关联线索核验单",
+                "",
+                f"**任务**：{task.get('title') or '—'}",
+                f"**生成时间**：{utc_now()}",
+                "",
+                "## 边界声明",
+                boundary,
+                "",
+                "## 1. 分析范围概览",
+                f"- 监督目的：{task.get('purpose') or scope_payload.get('purpose') or '—'}",
+                f"- 授权有效期：{task.get('authorized_until') or scope_payload.get('authorized_until') or '—'}",
+                f"- 案件范围：{case_names}",
+                "",
+                "## 2. 实体处理摘要",
+                f"- 候选总数：{len(candidates)}",
+                f"- 视为同一：{confirmed} · 不是同一：{separated} · 待核：{pending}",
+                "",
+                "## 3. 待核验线索清单",
+                *(clue_lines or ["- （暂无线索）"]),
+                "",
+                "## 4. 有效性",
+                (
+                    "- 存在缺少原文依据的线索，正式导出前需补证或排除。"
+                    if invalid_refs
+                    else "- 当前纳入线索均可回链，可导出。"
+                ),
+                "",
+            ]
+        )
+        valid = invalid_refs == 0 and len(clues) > 0
+        parent_ids = []
+        if scope:
+            parent_ids.append(scope["artifact"]["id"])
+        if entity:
+            parent_ids.append(entity["artifact"]["id"])
+        parent_ids.extend(c["artifact"]["id"] for c in clues)
+
+        artifact = self.write_artifact(
+            task_id=task_id,
+            type="REPORT_DRAFT",
+            title="跨案关联线索核验单（草稿）",
+            ref_key="report-draft",
+            status="VALID" if valid else "PENDING_REVIEW",
+            parent_ids=parent_ids,
+            payload={
+                "title": "跨案关联线索核验单",
+                "markdown": markdown,
+                "text": markdown,
+                "valid": valid,
+                "invalid_refs": invalid_refs,
+                "clue_count": len(clues),
+                "boundary": boundary,
+                "generated_at": utc_now(),
+            },
+        )
+        self.append_source_verify(
+            task_id,
+            {
+                "action": "生成报告草稿",
+                "type": "report_draft",
+                "target": artifact["id"],
+                "summary": f"线索 {len(clues)} 条 · {'有效' if valid else '含待补证'}",
+                "result": "ok" if valid else "warn",
+                "at": utc_now(),
+            },
+        )
+        return {"artifact": artifact, "task": self.get_task(task_id), "valid": valid}
 
     # ----- 产物 -----
 
@@ -1145,7 +1346,7 @@ class TaskService:
         artifact = self.write_artifact(
             task_id=task_id,
             type="ENTITY_CANDIDATE_SET",
-            title="实体候选·待复核" if pending else "实体候选·已完成",
+            title="跨案对象待核·待判断" if pending else "跨案对象待核·已完成",
             ref_key="entity-candidates",
             status="PENDING_REVIEW" if pending else "VALID",
             parent_ids=[batch["id"]] if batch else [],
@@ -1176,6 +1377,128 @@ class TaskService:
             "task": self.get_task(task_id),
         }
 
+    def generate_clues(
+        self,
+        task_id: str,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """R001–R005 规则命中 → 模板化线索表述 → 落 CLUE 产物（不经 LLM 改写）。"""
+        from tools.entities import LEGAL_BOUNDARY, collect_rule_hits
+
+        task = self.get_task(task_id)
+        if task["status"] == "SCOPE_DRAFT":
+            raise TaskError(TASK_ERROR_CODES["STATE_CONFLICT"], "计划尚未确认")
+
+        hits = collect_rule_hits(task_id, task["cases"], db_path=self.db_path)
+        existing_set = self.find_artifact(task_id, "CLUE_SET", "clues")
+        existing_fps = set()
+        if existing_set:
+            prev = self.get_artifact(task_id, existing_set["id"]).get("payload") or {}
+            existing_fps = {
+                item.get("fingerprint")
+                for item in (prev.get("items") or [])
+                if item.get("fingerprint")
+            }
+
+        created = []
+        skipped = []
+        parent = self.find_artifact(task_id, "ENTITY_CANDIDATE_SET", "entity-candidates")
+        timeline = self.find_artifact(task_id, "ROLE_TIMELINE", "role-timeline")
+        parent_ids = []
+        if parent:
+            parent_ids.append(parent["id"])
+        if timeline:
+            parent_ids.append(timeline["id"])
+
+        for hit in hits:
+            fingerprint = hit.get("fingerprint")
+            if fingerprint in existing_fps:
+                skipped.append({"fingerprint": fingerprint, "reason": "duplicate"})
+                continue
+            evidence = hit.get("evidence") or []
+            case_ids = {item.get("case_id") for item in evidence if item.get("case_id")}
+            chunk_ids = {item.get("chunk_id") for item in evidence if item.get("chunk_id")}
+            if len(case_ids) < 2 or len(chunk_ids) < 2:
+                skipped.append({"fingerprint": fingerprint, "reason": "below_cross_case_threshold"})
+                continue
+
+            case_names = [
+                c.get("case_name") or c.get("case_id") or ""
+                for c in (hit.get("cases") or [])
+            ]
+            title = hit.get("label") or f"{hit.get('rule_id') or '规则'}跨案命中"
+            summary = (
+                f"规则 {hit.get('rule_id') or ''} 在 { '、'.join([n for n in case_names if n]) or '多案' } "
+                f"命中可回链证据 {len(evidence)} 处。标识重合仅为待核验线索，须打开原文核对。"
+            )
+            item_payload = {
+                "title": title,
+                "summary": summary,
+                "rule_id": hit.get("rule_id"),
+                "rule_version": hit.get("rule_version"),
+                "evidence_mode": hit.get("evidence_mode") or "DIRECT_MATERIAL",
+                "cases": hit.get("cases") or [],
+                "evidence": evidence,
+                "generation": "rule+template",
+                "uncertainty": "标识重合仅为待核验线索，不代表同一人、同一账户控制关系或共同犯罪。",
+                "boundary": LEGAL_BOUNDARY,
+                "fingerprint": fingerprint,
+                "degraded": False,
+            }
+            artifact = self.write_artifact(
+                task_id=task_id,
+                type="CLUE_ITEM",
+                title=item_payload["title"],
+                ref_key=f"clue:{fingerprint[:16]}",
+                status="VALID",
+                parent_ids=parent_ids,
+                payload=item_payload,
+                input_snapshot={"rule_id": hit.get("rule_id"), "fingerprint": fingerprint},
+            )
+            created.append(
+                {
+                    "artifact_id": artifact["id"],
+                    "title": item_payload["title"],
+                    "rule_id": hit.get("rule_id"),
+                    "fingerprint": fingerprint,
+                    "case_count": len(case_ids),
+                    "chunk_count": len(chunk_ids),
+                }
+            )
+            existing_fps.add(fingerprint)
+
+        all_items = created[:]
+        if existing_set:
+            prev = self.get_artifact(task_id, existing_set["id"]).get("payload") or {}
+            for item in prev.get("items") or []:
+                if item.get("fingerprint") not in {c["fingerprint"] for c in created}:
+                    all_items.append(item)
+
+        clue_set = self.write_artifact(
+            task_id=task_id,
+            type="CLUE_SET",
+            title="关联线索",
+            ref_key="clues",
+            status="VALID" if all_items else "DRAFT",
+            parent_ids=parent_ids,
+            payload={
+                "summary": {
+                    "total": len(all_items),
+                    "created": len(created),
+                    "skipped": len(skipped),
+                },
+                "items": all_items,
+                "skipped": skipped,
+                "boundary": LEGAL_BOUNDARY,
+            },
+        )
+        return {
+            "artifact": clue_set,
+            "created": created,
+            "skipped": skipped,
+            "hit_count": len(hits),
+            "task": self.get_task(task_id),
+        }
 
     def run_role_timeline(
         self,
@@ -1255,7 +1578,7 @@ class TaskService:
                     "extractor_version": EVENT_EXTRACTOR_VERSION,
                 },
                 "items": items,
-                "boundary": "这里只记录材料中出现的转账/联络事件，供后续 R004/R005 规则使用；当前不直接生成共同犯罪或控制关系结论。",
+                "boundary": "这里只记录材料中出现的转账/联络事件，供后续资金路径与共同联系人规则使用；当前不直接生成共同犯罪或控制关系结论。",
             },
             input_snapshot={
                 "case_ids": [item["case_id"] for item in task["cases"]],
@@ -1333,15 +1656,15 @@ class TaskService:
             payload=self.material_overview(task_id, user_id=user_id),
         )
 
-    def save_message(self, task_id: str, role: str, content: str, tool_call_id: str | None = None, metadata: dict | None = None) -> dict:
+    def save_message(self, task_id: str, role: str, content: str, tool_call_id: str | None = None, metadata: dict | list | None = None) -> dict:
         """保存单条聊天消息到数据库"""
         with db_session(self.db_path) as conn:
             msg = {
                 "id": new_id(),
                 "task_id": task_id,
                 "role": role,
-                "content": content,
-                "tool_call_id": tool_call_id,
+                "content": content or "",
+                "tool_call_id": tool_call_id or None,
                 "created_at": utc_now(),
                 "metadata_json": json.dumps(metadata or {}, ensure_ascii=False),  # 注意：列表也会被正确序列化
             }
@@ -1353,10 +1676,27 @@ class TaskService:
         with db_session(self.db_path) as conn:
             return _rows(
                 conn,
-                "SELECT role, content, created_at FROM chat_messages "
+                "SELECT id, role, content, tool_call_id, created_at, metadata_json FROM chat_messages "
                 "WHERE task_id = ? ORDER BY created_at ASC",
                 (task_id,),
             )
+
+    def repair_chat_messages(self, task_id: str) -> list[dict]:
+        """删除不成对的 tool_calls 副本，返回可发给模型的历史。"""
+        from app.chat_history import row_to_llm_message, sanitize_tool_history, strip_internal_fields
+
+        rows = self.get_messages(task_id)
+        messages = [row_to_llm_message(row) for row in rows]
+        kept = sanitize_tool_history(messages)
+        keep_ids = {msg["_row_id"] for msg in kept if msg.get("_row_id")}
+        drop_ids = [row["id"] for row in rows if row["id"] not in keep_ids]
+        if drop_ids:
+            with db_session(self.db_path) as conn:
+                conn.executemany(
+                    "DELETE FROM chat_messages WHERE id = ?",
+                    [(message_id,) for message_id in drop_ids],
+                )
+        return strip_internal_fields(kept)
     # ----- 内部 -----
 
     def _scope_payload(self, task_id: str) -> dict[str, Any]:
@@ -1451,8 +1791,8 @@ MATERIAL_STAGE_LABELS = {
     "UPLOADED": "排队中",
     "PARSING": "解析中",
     "PARSED": "可用于分析",
-    "NEEDS_OCR_REVIEW": "OCR 待复核",
-    "OCR_FAILED": "OCR 失败",
+    "NEEDS_OCR_REVIEW": "扫描件需人工看清",
+    "OCR_FAILED": "文字识别失败",
     "DUPLICATE_PENDING": "重复待处理",
     "FAILED": "解析失败",
     "DELETED": "已删除",

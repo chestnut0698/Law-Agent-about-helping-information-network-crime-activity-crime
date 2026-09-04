@@ -18,7 +18,6 @@ from app.files import (
     _row,
     _rows,
     db_session,
-    redact_text,
     utc_now,
     new_id,
     get_global_mapper,
@@ -587,16 +586,15 @@ def persist_mentions(
     inserted = 0
     now = utc_now()
     for hit in hits:
-        for hit in hits:
-            if hit.get("quote_redacted") and hit.get("quote_hash"):
-                quote = hit["quote_redacted"]
-                qhash = hit["quote_hash"]
-            else:
-                quote, qhash = redacted_quote(
-                    chunk,
-                    int(hit["char_start"]),
-                    int(hit["char_end"]),
-                )
+        if hit.get("quote_redacted") and hit.get("quote_hash"):
+            quote = hit["quote_redacted"]
+            qhash = hit["quote_hash"]
+        else:
+            quote, qhash = redacted_quote(
+                chunk,
+                int(hit["char_start"]),
+                int(hit["char_end"]),
+            )
         payload_hash = canonical_hash(
             {
                 "type": hit["object_type"],
@@ -645,61 +643,26 @@ def persist_mentions(
 
 
 def extract_task_mentions(task_id: str, case_ids: list[str], db_path=None) -> dict[str, Any]:
+    """规则抽取强标识。解析阶段已写好 text_redacted，这里禁止再跑 ML 脱敏。"""
     init_entity_db(db_path)
 
-    # ---- 第一步：获取所有 chunks（事务外） ----
     with db_session(db_path) as conn:
         chunks = list_task_raw_chunks(conn, case_ids)
     scanned = len(chunks)
+    mapper = get_global_mapper(db_path)
 
-    # ---- 第二步：预处理所有 chunks（事务外） ----
-    mapper = get_global_mapper()
-    for chunk in chunks:
-        raw = chunk.get("text_raw") or ""
-        redacted, hits = redact_text(raw)  # 纯脱敏，不写数据库
-        # 将临时占位符替换为持久化占位符（写入 entity_global_map）
-        for hit in hits:
-            persistent_placeholder = mapper.get_or_create(
-                original=hit.original,
-                sens_type=hit.sens_type,
-                task_id=task_id
-            )
-            hit.placeholder = persistent_placeholder
-        # 缓存结果到 chunk 中
-        chunk["text_redacted"] = redacted
-        chunk["_hits"] = hits
-
-    # ---- 第三步：事务内持久化 mentions ----
     inserted = 0
     with db_session(db_path) as conn:
         for chunk in chunks:
-            # 明文 + 已脱敏占位符
-            rule_hits = extract_rule_mentions(chunk.get("text_raw") or "", mapper=mapper)
-
-            # 从脱敏 hits 中生成 NAME mentions（覆盖匿名姓名）
-            name_hits = []
-            for hit in chunk.get("_hits", []):
-                if hit.sens_type == "PERSON":
-                    normalized = normalize_identifier("NAME", hit.original)
-                    # 预计算 quote，避免 redacted_quote 因位置偏移出错
-                    placeholder = hit.placeholder or ""
-                    quote = placeholder
-                    qhash = quote_hash(quote)
-                    name_hits.append({
-                        "object_type": "NAME",
-                        "surface_raw": hit.original,
-                        "normalized_value": normalized,
-                        "mask_info": {"masked": True, "kind": "redacted", "placeholder": placeholder},
-                        "possible_forms": [],
-                        "char_start": hit.start,
-                        "char_end": hit.end,
-                        "producer": "REDACTION",
-                        "quote_redacted": quote,
-                        "quote_hash": qhash,
-                    })
-
-            all_hits = rule_hits + name_hits
-            inserted += persist_mentions(conn, task_id=task_id, chunk=chunk, hits=all_hits)
+            raw = chunk.get("text_raw") or ""
+            redacted = chunk.get("text_redacted") or ""
+            hits = extract_rule_mentions(raw, mapper=mapper)
+            if redacted and redacted != raw:
+                for hit in extract_rule_mentions(redacted, mapper=mapper):
+                    kind = (hit.get("mask_info") or {}).get("kind")
+                    if hit.get("object_type") == "NAME" and kind == "placeholder":
+                        hits.append(hit)
+            inserted += persist_mentions(conn, task_id=task_id, chunk=chunk, hits=hits)
 
         mentions = _rows(
             conn,

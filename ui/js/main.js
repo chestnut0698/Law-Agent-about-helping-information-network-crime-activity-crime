@@ -33,10 +33,10 @@
                     if (text) text.textContent = '空闲';
                 } else if (state === 'thinking') {
                     dot.classList.add('status-thinking');
-                    if (text) text.textContent = '思考中';
+                    if (text) text.textContent = '分析中';
                 } else if (state === 'working') {
                     dot.classList.add('status-working');
-                    if (text) text.textContent = '工作中';
+                    if (text) text.textContent = '正在查阅与比对';
                 } else if (state === 'done') {
                     dot.classList.add('status-done');
                     if (text) text.textContent = '完成';
@@ -50,9 +50,9 @@
             if (currentModel) currentModel.textContent = State.modelNames[model] || model;
         });
 
-        // 监听主题切换
-        Events.on('theme:change', (theme) => {
-            document.documentElement.setAttribute('data-theme', theme);
+        // 主题由 State.applyThemeMode 写 data-theme；此处只同步分段控件，禁止再写属性
+        Events.on('theme:change', () => {
+            if (window.Theme && Theme._syncControls) Theme._syncControls();
         });
 
         // 监听工具审批事件
@@ -75,7 +75,7 @@
         // 阻止表单默认提交
         document.addEventListener('submit', (e) => e.preventDefault());
 
-        console.log('%c链证智析 工作台就绪', 'color: #85CC16; font-size: 14px; font-weight: bold;');
+        console.log('%c链证智析 工作台就绪', 'color: oklch(0.55 0.09 195); font-size: 14px; font-weight: bold;');
         console.log('%c模型: ' + State.modelNames[State.currentModel], 'color: #666;');
     });
 })();

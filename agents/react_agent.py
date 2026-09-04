@@ -1,6 +1,8 @@
 from agents.base_agent import *
+from app.chat_history import messages_for_llm
 from app.config import *
 import inspect
+import json
 from tools.tools import *
 from pathlib import Path
 from app.tasks import get_task_service
@@ -10,6 +12,7 @@ class ReactAgent(BaseAgent):
     def __init__(self, task_id=0):
         super().__init__()
         self.task_id = task_id
+        self._persisted_count = 0
         schema_path = Path(__file__).resolve().parent.parent / "tools" / "tools_schema.json"
         with open(schema_path, "r", encoding="utf-8") as f:
             self.tools = json.load(f)
@@ -34,33 +37,23 @@ class ReactAgent(BaseAgent):
         return result
 
     def switch_id(self, task_id):
-        if self.task_id == task_id:
-            return
-
-        # 直接从数据库加载新 task_id 的历史消息
-        from app.files import db_session, _rows
-        with db_session() as conn:
-            rows = _rows(
-                conn,
-                "SELECT role, content, tool_call_id, metadata_json FROM chat_messages "
-                "WHERE task_id = ? ORDER BY created_at ASC",
-                (task_id,)
-            )
-        self.messages = []
-        for row in rows:
-            msg = {"role": row["role"], "content": row["content"]}
-            if row.get("tool_call_id"):
-                msg["tool_call_id"] = row["tool_call_id"]
-            if row.get("metadata_json"):
-                try:
-                    meta = json.loads(row.get("metadata_json"))
-                    if meta:
-                        msg["tool_calls"] = meta
-                except:
-                    pass
-            self.messages.append(msg)
-
+        # 每次请求都从库中重载，避免失败后内存里残留半截对话。
+        self.messages = get_task_service().repair_chat_messages(task_id)
+        self._persisted_count = len(self.messages)
         self.task_id = task_id
+
+    def llm_call(self, tool_choice="auto", temperature=0.1, max_tokens=4096):
+        payload = messages_for_llm(self.messages)
+        print(f"[llm_call] messages={len(payload)} last_role={(payload[-1]['role'] if payload else None)}")
+        return self.client.chat.completions.create(
+            model=self.model,
+            messages=payload,
+            tools=self.tools,
+            tool_choice=tool_choice,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True,
+        )
 
     def chat(self, user_input):
         """
@@ -87,28 +80,24 @@ class ReactAgent(BaseAgent):
                 "steps": plan_steps,
             },
         )
-        for step in range(len(plan_steps)):
-            """
-            self.messages.append(
-                {
-                    "role": "system",
-                    "content": f"当前进度：第 {step + 1} 步 / 共 {len(plan_steps)} 步。请根据计划继续执行:{PLANS[1][step]}",
-                }
-            )"""
-            while 1:
+        try:
+            max_rounds = 16
+            for _round in range(max_rounds):
                 stream = self.llm_call()
 
                 collected_content = ""
+                collected_reasoning = ""
                 tool_calls_buffer = {}
 
                 for chunk in stream:
                     delta = chunk.choices[0].delta
                     if hasattr(delta, "reasoning_content") and delta.reasoning_content:
+                        collected_reasoning += delta.reasoning_content
                         yield ("reasoning_content", delta.reasoning_content)
 
+                    # 内容先缓冲：有工具调用时不当成最终回答提前推给前端
                     if delta.content:
                         collected_content += delta.content
-                        yield ("content", delta.content)
 
                     if delta.tool_calls:
                         for tc in delta.tool_calls:
@@ -123,75 +112,95 @@ class ReactAgent(BaseAgent):
                                 tool_calls_buffer[idx]["arguments"] += tc.function.arguments
 
                 if not tool_calls_buffer:
-                    self.messages.append({"role": "assistant", "content": collected_content})
-                    if step != len(PLANS[0]) - 1:
+                    msg = {"role": "assistant", "content": collected_content}
+                    if collected_reasoning:
+                        msg["reasoning_content"] = collected_reasoning
+                    self.messages.append(msg)
+                    # 本轮无工具 → 推送最终可见回复
+                    if collected_content:
+                        yield ("content", collected_content)
                         break
-                    if collected_content != "":
-                        break
-                else:
-                    tool_calls_msg = []
-                    messages_tool_return = []
+                    # 只有可见回复才结束；纯思考空白轮继续，避免计划被空回复空推进
+                    continue
 
-                    for idx, data in sorted(tool_calls_buffer.items()):
-                        tool_calls_msg.append(
-                            {
-                                "id": data["id"],
-                                "type": "function",
-                                "function": {
-                                    "name": data["function_name"],
-                                    "arguments": data["arguments"],
-                                },
-                            }
-                        )
-                        yield ("tool_calls", tool_calls_msg[-1]["function"])
-                        result = self.execute_tool(data)
-                        messages_tool_return.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": data["id"],
-                                "content": str(result),
-                            }
-                        )
-                        yield ("tool_result", str(result))
+                # 工具轮：把模型夹带的 content 当作本步思路（无 reasoning 通道时）
+                if collected_content and not collected_reasoning:
+                    yield ("reasoning_content", collected_content)
 
-                    self.messages.append(
+                tool_calls_msg = []
+                messages_tool_return = []
+
+                for idx, data in sorted(tool_calls_buffer.items()):
+                    tool_calls_msg.append(
                         {
-                            "role": "assistant",
-                            "content": collected_content,
-                            "tool_calls": tool_calls_msg,
+                            "id": data["id"],
+                            "type": "function",
+                            "function": {
+                                "name": data["function_name"],
+                                "arguments": data["arguments"],
+                            },
                         }
                     )
-                    self.messages += messages_tool_return
+                    yield ("tool_calls", tool_calls_msg[-1]["function"])
+                    result = self.execute_tool(data)
+                    messages_tool_return.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": data["id"],
+                            "content": str(result),
+                        }
+                    )
+                    yield ("tool_result", str(result))
 
-            # 在循环结束后，保存消息到数据库
+                assistant_msg = {
+                    "role": "assistant",
+                    "content": collected_content,
+                    "tool_calls": tool_calls_msg,
+                }
+                if collected_reasoning:
+                    assistant_msg["reasoning_content"] = collected_reasoning
+                self.messages.append(assistant_msg)
+                self.messages += messages_tool_return
+
             self.save_messages_to_db()
             yield ("done", {})
+        except Exception as exc:
+            yield ("error", _public_chat_error(exc))
+
+    @staticmethod
+    def _message_metadata(msg: dict) -> dict | list | None:
+        tool_calls = msg.get("tool_calls")
+        reasoning = msg.get("reasoning_content")
+        if tool_calls and not reasoning:
+            return tool_calls
+        if not tool_calls and not reasoning:
+            return None
+        meta: dict = {}
+        if tool_calls:
+            meta["tool_calls"] = tool_calls
+        if reasoning:
+            meta["reasoning_content"] = reasoning
+        return meta
 
     def save_messages_to_db(self):
-        """将 self.messages 中未持久化的消息保存到数据库"""
+        """将 self.messages 中尚未落库的新消息追加保存。"""
         task_service = get_task_service()
-        existing = task_service.get_messages(self.task_id)
-
-        # 使用 (role, content, tool_call_id) 三元组去重
-        existing_set = {
-            (m["role"], m["content"], m.get("tool_call_id", ""))
-            for m in existing
-        }
-
-        for msg in self.messages:
-            # 跳过系统消息（可选）
+        start = min(self._persisted_count, len(self.messages))
+        for msg in self.messages[start:]:
             if msg["role"] == "system":
                 continue
+            task_service.save_message(
+                self.task_id,
+                msg["role"],
+                msg.get("content") or "",
+                tool_call_id=msg.get("tool_call_id") or None,
+                metadata=self._message_metadata(msg),
+            )
+        self._persisted_count = len(self.messages)
 
-            key = (msg["role"], msg["content"], msg.get("tool_call_id", ""))
-            if key not in existing_set:
-                # 保存完整消息，包括 tool_call_id 和 tool_calls
-                task_service.save_message(
-                    self.task_id,
-                    msg["role"],
-                    msg["content"],
-                    tool_call_id=msg.get("tool_call_id"),
-                    metadata=msg.get("tool_calls") if msg.get("tool_calls") else None,
 
-                )
-                existing_set.add(key)
+def _public_chat_error(exc: Exception) -> str:
+    text = str(exc)
+    if "tool_calls" in text or "tool_call_id" in text:
+        return "对话记录已自动修复，请再发送一次即可继续。"
+    return "分析过程中断，请稍后重试。"
