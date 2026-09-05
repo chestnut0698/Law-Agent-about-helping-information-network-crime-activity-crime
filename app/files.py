@@ -54,7 +54,39 @@ CONFIDENCE_THRESHOLD = {
     "ip": 0.9,
 }
 
-ALLOWED_MATERIAL_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".docx", ".txt"}
+ALLOWED_MATERIAL_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".docx", ".xlsx", ".xls", ".txt"}
+
+# 材料类型：当前用文件名启发式；后续可由 Agent 覆写 quality_summary.material_type
+_MATERIAL_TYPE_RULES: list[tuple[str, tuple[str, ...]]] = [
+    ("讯问笔录", ("讯问笔录", "询问笔录", "讯问")),
+    ("起诉意见书", ("起诉意见",)),
+    ("判决书", ("判决书", "刑事判决")),
+    ("银行流水", ("银行流水", "支付平台", "交易流水", "流水节选")),
+    ("通话记录", ("通话记录", "话单")),
+    ("勘验照片", ("勘验", "现场照片")),
+    ("开户信息", ("开户信息", "开户")),
+    ("电子取证", ("电子取证", "数据恢复", "取证报告")),
+    ("实体别名表", ("实体别名", "别名表")),
+    ("关联真值表", ("关联真值", "真值表", "检测要点")),
+]
+
+
+def infer_material_type(filename: str) -> str:
+    """根据文件名推断材料类型（Agent 分类的占位实现，可被 quality_summary 覆写）。"""
+    name = filename or ""
+    for label, keys in _MATERIAL_TYPE_RULES:
+        if any(k in name for k in keys):
+            return label
+    ext = Path(name).suffix.lower()
+    if ext in {".png", ".jpg", ".jpeg"}:
+        return "勘验照片"
+    if ext in {".xlsx", ".xls"}:
+        return "表格材料"
+    if ext == ".pdf":
+        return "书证材料"
+    if ext == ".docx":
+        return "文书材料"
+    return "其他材料"
 CHUNK_OVERLAP = 120
 CHUNK_SIZE = 1000
 MATERIAL_AUTH_MODE = "allow_all"
@@ -62,7 +94,7 @@ MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 OCR_TEXT_DENSITY_THRESHOLD = 0.08
 OCR_LOW_CONFIDENCE_THRESHOLD = 0.75
 OCR_MAX_PAGE_RETRIES = 2
-PARSER_VERSION = "stage3-v1"
+PARSER_VERSION = "stage4-structure-v1"
 
 MATERIAL_STATUSES = {
     "UPLOADED",
@@ -252,6 +284,7 @@ CREATE TABLE IF NOT EXISTS material_audit_events (
 CREATE TABLE IF NOT EXISTS entity_global_map (
     fingerprint VARCHAR(64) PRIMARY KEY,
     anonymous_id VARCHAR(48) NOT NULL UNIQUE,
+    display_alias VARCHAR(64) NOT NULL DEFAULT '',
     sens_type VARCHAR(24) NOT NULL,
     task_id VARCHAR(36) NOT NULL DEFAULT '',
     first_seen_at DATETIME NOT NULL,
@@ -277,15 +310,130 @@ def get_global_mapper(db_path=None, salt: str = "default-salt-change-me") -> Glo
 
 
 def get_global_analyzer() -> AnalyzerEngine:
+    """统一实体切片入口：spaCy zh_core_web_trf（人名/组织）+ Presidio 模式识别器（号证类）。
+
+    号证类（手机/银行卡等）不在 OntoNotes NER 标签里，只能挂在同一 Analyzer 管线；
+    不再在 tools.entities 里另写一套切片循环。
+    """
     global _global_analyzer_instance
     if _global_analyzer_instance is None:
+        from presidio_analyzer import Pattern, PatternRecognizer
+
         configuration = {
             "nlp_engine_name": "spacy",
             "models": [{"lang_code": "zh", "model_name": "zh_core_web_trf"}],
         }
         provider = NlpEngineProvider(nlp_configuration=configuration)
         nlp_engine = provider.create_engine()
-        _global_analyzer_instance = AnalyzerEngine(nlp_engine=nlp_engine)
+        analyzer = AnalyzerEngine(nlp_engine=nlp_engine)
+
+        # 数字/编码/商号类：挂到同一分析器（语言=zh）；含脱敏号与「某…公司」
+        _MASK = r"*＊xX×ｘ"
+        digit_specs: list[tuple[str, str, list[tuple[str, str, float]]]] = [
+            (
+                "cn_phone_recognizer",
+                "PHONE_NUMBER",
+                [
+                    ("cn_mobile", r"(?<!\d)(1[3-9]\d{9})(?!\d)", 0.9),
+                    (
+                        "cn_mobile_mask",
+                        rf"(?<!\d)(1[3-9]\d{{0,2}}[{_MASK}]{{2,6}}\d{{2,4}})(?!\d)",
+                        0.75,
+                    ),
+                ],
+            ),
+            (
+                "cn_bank_card_recognizer",
+                "CREDIT_CARD",
+                [
+                    ("cn_bank_card", r"(?<!\d)([1-9]\d{15,18})(?!\d)", 0.7),
+                    (
+                        "cn_bank_card_grouped",
+                        r"(?<!\d)([1-9]\d{3}(?:[\s\-_.／/]+\d{4}){2,3}(?:[\s\-_.／/]+\d{1,4})?)(?!\d)",
+                        0.7,
+                    ),
+                    (
+                        "cn_bank_card_mask",
+                        rf"(?<!\d)([1-9]\d{{3}}[{_MASK}\d]{{4,14}}\d{{2,4}})(?!\d)",
+                        0.65,
+                    ),
+                    ("cn_bank_tail", r"(?:尾号|卡号尾号|账号尾号)[:：\s]*(\d{4})(?!\d)", 0.55),
+                ],
+            ),
+            (
+                "cn_id_card_recognizer",
+                "CN_ID_CARD",
+                [
+                    (
+                        "cn_id_card",
+                        r"(?<!\d)([1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx])(?!\d)",
+                        0.85,
+                    ),
+                ],
+            ),
+            (
+                "cn_imei_recognizer",
+                "CN_IMEI",
+                [("cn_imei", r"(?<!\d)(\d{15})(?!\d)", 0.5)],
+            ),
+            (
+                "cn_ip_recognizer",
+                "IP_ADDRESS",
+                [("cn_ip", r"(?<!\d)((?:\d{1,3}\.){3}\d{1,3})(?!\d)", 0.6)],
+            ),
+            (
+                "cn_merchant_recognizer",
+                "CN_MERCHANT",
+                [
+                    (
+                        "cn_merchant_id",
+                        r"(?:商户号|商户编号|商户代码|商户账号|商户账户)[:：\s]*([A-Za-z0-9_-]{6,32})",
+                        0.8,
+                    ),
+                    (
+                        "cn_merchant_mcc",
+                        r"(?<![A-Za-z0-9_-])(MCC-[A-Za-z0-9_-]{3,28})(?![A-Za-z0-9_-])",
+                        0.7,
+                    ),
+                ],
+            ),
+            (
+                "cn_company_recognizer",
+                "CN_COMPANY",
+                [
+                    (
+                        "cn_company_mou",
+                        r"(某[\u4e00-\u9fff·A-Za-z0-9]{0,20}"
+                        r"(?:有限责任公司|股份有限公司|集团有限公司|有限公司|股份公司))",
+                        0.9,
+                    ),
+                    (
+                        "cn_company_name",
+                        r"((?<![某\u4e00-\u9fffA-Za-z0-9])[\u4e00-\u9fff·A-Za-z0-9]{2,16}"
+                        r"(?:有限责任公司|股份有限公司|集团有限公司|有限公司|股份公司))",
+                        0.8,
+                    ),
+                ],
+            ),
+            (
+                "cn_credit_code_recognizer",
+                "CN_CREDIT_CODE",
+                [("cn_credit_code", r"(?<![A-Z0-9])([0-9A-HJ-NP-RTUW-Y]{18})(?![A-Z0-9])", 0.6)],
+            ),
+        ]
+        for name, entity, patterns in digit_specs:
+            analyzer.registry.add_recognizer(
+                PatternRecognizer(
+                    supported_entity=entity,
+                    supported_language="zh",
+                    name=name,
+                    patterns=[
+                        Pattern(name=pname, regex=regex, score=score)
+                        for pname, regex, score in patterns
+                    ],
+                )
+            )
+        _global_analyzer_instance = analyzer
     return _global_analyzer_instance
 
 
@@ -323,6 +471,16 @@ def init_db(db_path=None) -> None:
         ):
             if column not in existing:
                 conn.execute(f"ALTER TABLE documents ADD COLUMN {ddl}")
+
+        map_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(entity_global_map)").fetchall()
+        }
+        if "display_alias" not in map_columns:
+            conn.execute(
+                "ALTER TABLE entity_global_map "
+                "ADD COLUMN display_alias VARCHAR(64) NOT NULL DEFAULT ''"
+            )
         conn.commit()
     finally:
         conn.close()
@@ -557,14 +715,32 @@ class GlobalEntityMapper:
             if not self._is_in_context(conn):
                 conn.close()
 
+    def _allocate_alias(self, conn, original: str, sens_type: str) -> str:
+        """在同一敏感类型内分配不冲突的可读化名。"""
+        taken = {
+            row[0]
+            for row in conn.execute(
+                "SELECT display_alias FROM entity_global_map "
+                "WHERE display_alias != '' AND sens_type = ?",
+                (sens_type,),
+            ).fetchall()
+        }
+        return make_alias(sens_type, original, taken)
+
     def get_or_create(self, original: str, sens_type: str, task_id: str = "") -> str:
         fp = self._fingerprint(original)
         conn = get_connection(self.db_path)
         row = conn.execute(
-            "SELECT anonymous_id FROM entity_global_map WHERE fingerprint = ?",
+            "SELECT anonymous_id, display_alias FROM entity_global_map WHERE fingerprint = ?",
             (fp,)
         ).fetchone()
         if row:
+            # 旧数据没有化名，补齐一次
+            if not row["display_alias"]:
+                conn.execute(
+                    "UPDATE entity_global_map SET display_alias = ? WHERE fingerprint = ?",
+                    (self._allocate_alias(conn, original, sens_type), fp),
+                )
             conn.execute(
                 "UPDATE entity_global_map SET last_seen_at = ?, task_id = COALESCE(NULLIF(task_id,''), ?) WHERE fingerprint = ?",
                 (utc_now(), task_id, fp)
@@ -574,15 +750,65 @@ class GlobalEntityMapper:
             return row[0]
 
         anon_id = self._new_anonymous_id(sens_type)
+        alias = self._allocate_alias(conn, original, sens_type)
         now = utc_now()
         conn.execute(
-            "INSERT INTO entity_global_map (fingerprint, anonymous_id, sens_type, task_id, first_seen_at, last_seen_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (fp, anon_id, sens_type, task_id, now, now)
+            "INSERT INTO entity_global_map (fingerprint, anonymous_id, display_alias, sens_type, task_id, first_seen_at, last_seen_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (fp, anon_id, alias, sens_type, task_id, now, now)
         )
         if not self._is_in_context(conn):
             conn.commit()
         return anon_id
+
+    def alias_map(self) -> dict[str, str]:
+        """anonymous_id -> 展示化名，供对外出口使用。"""
+        conn = get_connection(self.db_path)
+        try:
+            return {
+                row["anonymous_id"]: row["display_alias"]
+                for row in conn.execute(
+                    "SELECT anonymous_id, display_alias FROM entity_global_map "
+                    "WHERE display_alias != ''"
+                ).fetchall()
+            }
+        finally:
+            if not self._is_in_context(conn):
+                conn.close()
+
+    def original_map(self) -> dict[str, str]:
+        """anonymous_id -> 原文，供办案工作台预览还原。"""
+        conn = get_connection(self.db_path)
+        try:
+            rows = conn.execute(
+                """
+                SELECT m.anonymous_id,
+                       r.chunk_id, r.start_offset, r.end_offset
+                FROM entity_global_map m
+                JOIN redaction_items r ON r.map_ref = m.fingerprint
+                """
+            ).fetchall()
+            result: dict[str, str] = {}
+            chunk_cache: dict[str, str] = {}
+            for row in rows:
+                anon = row["anonymous_id"]
+                if anon in result:
+                    continue
+                chunk_id = row["chunk_id"]
+                if chunk_id not in chunk_cache:
+                    chunk = conn.execute(
+                        "SELECT text_raw FROM document_chunks WHERE id = ?",
+                        (chunk_id,),
+                    ).fetchone()
+                    chunk_cache[chunk_id] = (chunk["text_raw"] if chunk else "") or ""
+                text_raw = chunk_cache[chunk_id]
+                start, end = row["start_offset"], row["end_offset"]
+                if 0 <= start < end <= len(text_raw):
+                    result[anon] = text_raw[start:end]
+            return result
+        finally:
+            if not self._is_in_context(conn):
+                conn.close()
 
     def get_fingerprint(self, original: str) -> str:
         return self._fingerprint(original)
@@ -610,7 +836,7 @@ class GlobalEntityMapper:
         conn = get_connection(self.db_path)
         try:
             query = """
-                SELECT fingerprint, anonymous_id, sens_type, task_id, first_seen_at, last_seen_at
+                SELECT fingerprint, anonymous_id, display_alias, sens_type, task_id, first_seen_at, last_seen_at
                 FROM entity_global_map
                 WHERE 1=1
             """
@@ -662,6 +888,19 @@ class GlobalEntityMapper:
                         item["sample_raw"] = None
                 else:
                     item["sample_raw"] = None
+
+                if not item.get("display_alias") and item.get("sample_raw"):
+                    alias = self._allocate_alias(
+                        conn, item["sample_raw"], item.get("sens_type") or "PERSON"
+                    )
+                    conn.execute(
+                        "UPDATE entity_global_map SET display_alias = ? WHERE fingerprint = ?",
+                        (alias, fingerprint),
+                    )
+                    item["display_alias"] = alias
+
+            if not self._is_in_context(conn):
+                conn.commit()
 
             return {
                 "total": total,
@@ -922,14 +1161,15 @@ class GlobalEntityMapper:
                     sens_type = anon_info["sens_type"]
                 else:
                     anon_id = self._new_anonymous_id(sens_type)
+                    alias = self._allocate_alias(conn, original, sens_type)
                     now = utc_now()
                     conn.execute(
                         """
                         INSERT INTO entity_global_map 
-                        (fingerprint, anonymous_id, sens_type, task_id, first_seen_at, last_seen_at)
-                        VALUES (?, ?, ?, ?, ?, ?)
+                        (fingerprint, anonymous_id, display_alias, sens_type, task_id, first_seen_at, last_seen_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (fp, anon_id, sens_type, '', now, now)
+                        (fp, anon_id, alias, sens_type, '', now, now)
                     )
                     placeholder = anon_id
 
@@ -1045,38 +1285,226 @@ class GlobalEntityMapper:
                 "message": f"变更已应用，重脱敏 {redacted_count} 个文本块"
             }
 
+
+# ---------- 化名生成与占位符渲染（对外出口；办案预览走原文还原） ----------
+_COMPOUND_SURNAMES = (
+    "欧阳", "太史", "端木", "上官", "司马", "东方", "独孤", "南宫", "万俟",
+    "闻人", "夏侯", "诸葛", "尉迟", "公羊", "赫连", "澹台", "皇甫", "宗政",
+    "濮阳", "公冶", "太叔", "申屠", "公孙", "慕容", "仲孙", "钟离", "长孙",
+    "宇文", "司徒", "鲜于", "司空", "闾丘", "子车", "亓官", "司寇", "巫马",
+    "公西", "颛孙", "壤驷", "公良", "漆雕", "乐正", "宰父", "谷梁", "拓跋",
+    "夹谷", "轩辕", "令狐", "段干", "百里", "呼延", "东郭", "南门", "羊舌",
+    "微生", "公户", "公玉", "公仪", "梁丘", "公仲", "公上", "公门", "公山",
+    "公坚", "左丘", "公伯", "西门", "第五", "淳于",
+)
+_ORDINAL_MARKS = (
+    "甲", "乙", "丙", "丁", "戊", "己", "庚", "辛", "壬", "癸",
+    "子", "丑", "寅", "卯", "辰", "巳", "午", "未", "申", "酉", "戌", "亥",
+)
+_CJK_NAME_RE = re.compile(r"^[\u4e00-\u9fff·]+$")
+_ALIAS_TYPE_LABELS = {
+    "phone": "手机号", "phone_number": "手机号", "id_card": "身份证",
+    "bank_card": "银行卡", "account": "账号", "imei": "设备",
+    "ip": "IP", "address": "地址", "email": "邮箱", "organization": "单位",
+}
+_HEX_CHARS = frozenset("0123456789abcdef")
+_FULL_HEX_TAIL_RE = re.compile(r"[A-Za-z]+_([a-f0-9]{8})")
+_TRUNCATED_TOKEN_RE = re.compile(r"[A-Z][A-Z_]*_[a-f0-9]{1,7}(?![a-f0-9])")
+
+
+def _split_surname(name: str) -> tuple[str, str]:
+    cleaned = (name or "").strip().replace("·", "")
+    if not cleaned:
+        return "", ""
+    for compound in _COMPOUND_SURNAMES:
+        if cleaned.startswith(compound) and len(cleaned) > len(compound):
+            return compound, cleaned[len(compound):]
+    return cleaned[0], cleaned[1:]
+
+
+def _base_alias(name: str) -> str:
+    cleaned = (name or "").strip()
+    if not cleaned:
+        return ""
+    if not _CJK_NAME_RE.match(cleaned):
+        head = cleaned.split()[0] if cleaned.split() else cleaned
+        return f"{head[:1].upper()}某"
+    surname, _ = _split_surname(cleaned)
+    return f"{surname}某" if surname else ""
+
+
+def _build_display_alias(name: str, taken: set[str] | frozenset[str]) -> str:
+    base = _base_alias(name)
+    if not base:
+        return ""
+    if base not in taken:
+        return base
+    for mark in _ORDINAL_MARKS:
+        candidate = f"{base}{mark}"
+        if candidate not in taken:
+            return candidate
+    index = len(_ORDINAL_MARKS) + 1
+    while f"{base}{index}" in taken:
+        index += 1
+    return f"{base}{index}"
+
+
+def _build_generic_alias(sens_type: str, original: str, taken: set[str] | frozenset[str]) -> str:
+    label = _ALIAS_TYPE_LABELS.get((sens_type or "").lower(), "信息")
+    digits = re.sub(r"\D", "", original or "")
+    base = f"尾号{digits[-4:]}{label}" if len(digits) >= 4 else f"某{label}"
+    if base not in taken:
+        return base
+    for mark in _ORDINAL_MARKS:
+        candidate = f"{base}{mark}"
+        if candidate not in taken:
+            return candidate
+    index = len(_ORDINAL_MARKS) + 1
+    while f"{base}{index}" in taken:
+        index += 1
+    return f"{base}{index}"
+
+
+def make_alias(sens_type: str, original: str, taken: set[str] | frozenset[str]) -> str:
+    if (sens_type or "").lower() in {"person", "name"}:
+        return _build_display_alias(original, taken)
+    return _build_generic_alias(sens_type, original, taken)
+
+
+def _hex_suffix(anonymous_id: str) -> str | None:
+    if "_" not in (anonymous_id or ""):
+        return None
+    suffix = anonymous_id.rsplit("_", 1)[-1]
+    if len(suffix) == 8 and all(ch in _HEX_CHARS for ch in suffix):
+        return suffix
+    return None
+
+
+def _apply_placeholder_map(text: str, mapping: dict[str, str] | None) -> str:
+    """把 PERSON_xxx 等占位符（含切片残片）替换为 mapping 中的值。"""
+    if not text:
+        return text or ""
+    if not mapping:
+        return text
+    for anon_id, value in sorted(mapping.items(), key=lambda item: len(item[0]), reverse=True):
+        if anon_id:
+            text = text.replace(anon_id, value)
+    hex_owners: dict[str, list[str]] = {}
+    for anon_id, value in mapping.items():
+        hx = _hex_suffix(anon_id)
+        if hx:
+            hex_owners.setdefault(hx, []).append(value)
+    by_hex = {hx: owners[0] for hx, owners in hex_owners.items() if len(owners) == 1}
+    if by_hex:
+        text = _FULL_HEX_TAIL_RE.sub(
+            lambda m: by_hex.get(m.group(1), m.group(0)), text
+        )
+
+    def swap_truncated(match: re.Match[str]) -> str:
+        token = match.group(0)
+        hits = [value for anon_id, value in mapping.items() if anon_id.startswith(token)]
+        return hits[0] if len(hits) == 1 else token
+
+    return _TRUNCATED_TOKEN_RE.sub(swap_truncated, text)
+
+
+def render_display_aliases(text: str, aliases: dict[str, str] | None = None) -> str:
+    """占位符 → 化名（对外出口）。"""
+    if aliases is None:
+        aliases = get_global_mapper().alias_map()
+    return _apply_placeholder_map(text, aliases)
+
+
+def render_workbench_text(text: str) -> str:
+    """占位符 → 真实原文（办案工作台预览）。"""
+    return _apply_placeholder_map(text, get_global_mapper().original_map())
+
+
+# ---------- 文本结构推断（预览用，不改存储） ----------
+_LEGAL_HEADING_RE = re.compile(
+    r"^(?:"
+    r"第[一二三四五六七八九十百千零〇两\d]+[章节条款项编](?:\s|.+)?|"
+    r"(?:一|二|三|四|五|六|七|八|九|十){1,3}、.+|"
+    r"(?:\d{1,2}[\.、]\s*).{2,40}|"
+    r"(?:经查明|经审理查明|本院认为|判决如下|裁定如下|起诉书|起诉意见书|"
+    r"询问笔录|讯问笔录|辨认笔录|扣押清单|情况说明|到案经过|案件来源|"
+    r"犯罪嫌疑人基本情况|被害人基本情况|主要证据|附带民事诉讼|"
+    r"工作表[:：].+)"
+    r")$"
+)
+
+
+def infer_structure_markdown(text: str) -> str:
+    """对已落库平坦文本做轻量结构推断，不改动原文词句。"""
+    if not text or not text.strip():
+        return text or ""
+    if re.search(r"(?m)^#{1,3}\s+", text) or re.search(r"(?m)^\|.+\|", text):
+        return re.sub(r"\n{3,}", "\n\n", text).strip() + "\n"
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    out: list[str] = []
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            out.append("")
+            continue
+        if _LEGAL_HEADING_RE.match(line) and len(line) <= 40:
+            if line.startswith("第") and any(ch in line for ch in "章节编"):
+                out.append(f"# {line}")
+            elif line in {"经查明", "经审理查明", "本院认为", "判决如下", "裁定如下"} or (
+                len(line) <= 12 and not any(ch.isdigit() for ch in line[:1])
+            ):
+                out.append(f"## {line}")
+            else:
+                out.append(f"### {line}")
+        else:
+            out.append(line)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip() + "\n"
+
+
+def pdf_dict_to_markdown(page) -> str:
+    """按字号把 PDF 页面整理成 Markdown。"""
+    try:
+        data = page.get_text("dict") or {}
+    except Exception:
+        return page.get_text("text") or ""
+    sizes: list[float] = []
+    blocks_out: list[tuple[float, str]] = []
+    for block in data.get("blocks") or []:
+        if block.get("type", 0) != 0:
+            continue
+        line_parts: list[str] = []
+        line_size = 0.0
+        for line in block.get("lines") or []:
+            spans = line.get("spans") or []
+            if not spans:
+                continue
+            chunk = "".join(str(span.get("text") or "") for span in spans).strip()
+            if not chunk:
+                continue
+            size = max(float(span.get("size") or 0) for span in spans)
+            sizes.append(size)
+            line_parts.append(chunk)
+            line_size = max(line_size, size)
+        if line_parts:
+            blocks_out.append((line_size, " ".join(line_parts)))
+    if not blocks_out:
+        return page.get_text("text") or ""
+    body_size = sorted(sizes)[len(sizes) // 2] if sizes else 12.0
+    lines: list[str] = []
+    for size, text in blocks_out:
+        if size >= body_size + 4 and len(text) <= 40:
+            lines.append(f"# {text}")
+        elif size >= body_size + 2 and len(text) <= 48:
+            lines.append(f"## {text}")
+        elif size >= body_size + 1 and len(text) <= 56 and _LEGAL_HEADING_RE.match(text):
+            lines.append(f"### {text}")
+        else:
+            lines.append(text)
+    return infer_structure_markdown("\n".join(lines))
+
+
 # ---------- 敏感信息检测与脱敏 ----------
-REDACTION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    ("id_card", re.compile(
-        r"(?<!\d)([1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])"
-        r"(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx])(?!\d)"
-    )),
-    ("bank_card", re.compile(
-        r"(?<!\d)("
-        r"[1-9]\d{14,18}"
-        r"|"
-        r"[1-9]\d{3}(?:[\s\-_.／/]+\d{4}){2,3}(?:[\s\-_.／/]+\d{1,4})?"
-        r")(?!\d)"
-    )),
-    ("phone", re.compile(r"(?<!\d)(1[3-9]\d{9})(?!\d)")),
-    ("imei", re.compile(r"(?<!\d)(\d{15})(?!\d)")),
-    ("ip", re.compile(r"(?<!\d)((?:\d{1,3}\.){3}\d{1,3})(?!\d)")),
-    ("account", re.compile(r"(?i)(?:账号|帐户|账户|user(?:name)?|login)[:：\s]*([A-Za-z0-9_.-]{4,32})")),
-    ("address", re.compile(
-        r"([\u4e00-\u9fff]{2,10}(?:省|市|自治区|特别行政区))?"
-        r"[\u4e00-\u9fff]{1,10}(?:市|州|盟)?"
-        r"[\u4e00-\u9fff]{1,12}(?:区|县|旗)"
-        r"[\u4e00-\u9fff0-9\-号弄幢栋单元室楼]{0,30}"
-    )),
-    ("name", re.compile(
-        r"(?:"
-        r"(?:姓名|被告人|嫌疑人|当事人|原告|被告|证人|辩护人|被害人|申诉人|被申诉人|法定代表人|负责人|联系人)"
-        r"[:：\s]*([\u4e00-\u9fff·]{2,4})"
-        r"|"
-        r"(?<![^\s,，。；：、\(\)（）])([\u4e00-\u9fff·]{2,4})(?![^\s,，。；：、\(\)（）])"
-        r")"
-    )),
-]
+# 人名/卡号等识别走 Presidio + spaCy（见 redact_text / get_global_analyzer）。
 
 _UNREDACTED_PATTERNS = [
     re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)"),
@@ -1453,7 +1881,9 @@ def _extract_pdf(path: Path) -> list[PageResult]:
     try:
         for index, page in enumerate(document):
             try:
-                text = page.get_text("text") or ""
+                text = pdf_dict_to_markdown(page)
+                if not (text or "").strip():
+                    text = page.get_text("text") or ""
                 bbox = [
                     [float(block[0]), float(block[1]), float(block[2]), float(block[3])]
                     for block in (page.get_text("blocks") or [])
@@ -1504,13 +1934,41 @@ def _extract_docx(path: Path) -> list[PageResult]:
     except Exception as exc:
         raise MaterialError(ERROR_CODES["CORRUPT_FILE"], f"Cannot open DOCX: {exc}") from exc
 
-    parts = [paragraph.text for paragraph in document.paragraphs if paragraph.text]
+    parts = []
+    # 段落保留样式结构标记
+    for p in document.paragraphs:
+        txt = p.text.strip()
+        if not txt:
+            continue
+        style_name = (p.style.name if p.style else "").lower()
+        if "heading 1" in style_name or style_name == "title":
+            parts.append(f"# {txt}")
+        elif "heading 2" in style_name:
+            parts.append(f"## {txt}")
+        elif "heading 3" in style_name:
+            parts.append(f"### {txt}")
+        else:
+            parts.append(txt)
+
+    # 表格保留 Markdown 结构
     for table in document.tables:
+        rows_data = []
         for row in table.rows:
-            cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
-            if cells:
-                parts.append("\t".join(cells))
-    return [PageResult(1, "docx", "\n".join(parts), text_density=1.0)]
+            cells = [cell.text.strip().replace("\n", " ") for cell in row.cells]
+            if any(cells):
+                rows_data.append(cells)
+        if rows_data:
+            header = rows_data[0]
+            parts.append("\n| " + " | ".join(header) + " |")
+            parts.append("| " + " | ".join(["---"] * len(header)) + " |")
+            for r in rows_data[1:]:
+                # 补齐列数
+                if len(r) < len(header):
+                    r = r + [""] * (len(header) - len(r))
+                parts.append("| " + " | ".join(r[:len(header)]) + " |")
+            parts.append("")
+
+    return [PageResult(1, "docx", "\n\n".join(parts), text_density=1.0)]
 
 
 def _extract_txt(path: Path) -> list[PageResult]:
@@ -1526,6 +1984,36 @@ def _extract_txt(path: Path) -> list[PageResult]:
     except Exception as exc:
         raise MaterialError(ERROR_CODES["CORRUPT_FILE"], f"Cannot read text file: {exc}") from exc
     return [PageResult(1, "txt", text, text_density=1.0)]
+
+
+def _extract_xlsx(path: Path) -> list[PageResult]:
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(str(path), data_only=True)
+    except ImportError as exc:
+        raise MaterialError(ERROR_CODES["PARSE_FAILED"], "openpyxl not installed") from exc
+    except Exception as exc:
+        raise MaterialError(ERROR_CODES["CORRUPT_FILE"], f"Cannot open Excel: {exc}") from exc
+
+    parts = []
+    for sheet_name in wb.sheetnames:
+        sheet = wb[sheet_name]
+        parts.append(f"### 工作表: {sheet_name}")
+        rows_data = []
+        for row in sheet.iter_rows(values_only=True):
+            cells = [str(val).strip() if val is not None else "" for val in row]
+            if any(cells):
+                rows_data.append(cells)
+        if rows_data:
+            header = rows_data[0]
+            parts.append("| " + " | ".join(header) + " |")
+            parts.append("| " + " | ".join(["---"] * len(header)) + " |")
+            for r in rows_data[1:]:
+                if len(r) < len(header):
+                    r = r + [""] * (len(header) - len(r))
+                parts.append("| " + " | ".join(r[:len(header)]) + " |")
+            parts.append("")
+    return [PageResult(1, "xlsx", "\n\n".join(parts), text_density=1.0)]
 
 
 def _extract_image(path: Path) -> list[PageResult]:
@@ -1584,6 +2072,8 @@ def parse_file_to_pages(path: Path | str, max_retries: int | None = None) -> lis
     extractors = {
         ".pdf": _extract_pdf,
         ".docx": _extract_docx,
+        ".xlsx": _extract_xlsx,
+        ".xls": _extract_xlsx,
         ".txt": _extract_txt,
         ".png": _extract_image,
         ".jpg": _extract_image,
@@ -1765,49 +2255,6 @@ class MaterialService:
         self.auth_check = auth_check or _default_auth()
         init_db(self.db_path)
 
-    def _init_analyzer(self) -> AnalyzerEngine | None:
-        try:
-            from presidio_analyzer import AnalyzerEngine, PatternRecognizer, Pattern
-            from presidio_analyzer.nlp_engine import NlpEngineProvider
-
-            configuration = {
-                "nlp_engine_name": "spacy",
-                "models": [{"lang_code": "zh", "model_name": "zh_core_web_trf"}],
-            }
-            provider = NlpEngineProvider(nlp_configuration=configuration)
-            nlp_engine = provider.create_engine()
-            analyzer = AnalyzerEngine(nlp_engine=nlp_engine)
-
-            chinese_name_pattern = Pattern(
-                name="chinese_name_pattern",
-                regex=r"(?:姓名|被告人|嫌疑人|当事人|原告|被告|证人|辩护人|被害人|申诉人|被申诉人|法定代表人|负责人|联系人|申请人|被申请人)[:：\s]*([\u4e00-\u9fa5·]{2,4})",
-                score=0.9,
-            )
-            chinese_name_recognizer = PatternRecognizer(
-                supported_entity="PERSON",
-                name="chinese_name_recognizer",
-                patterns=[chinese_name_pattern],
-                context=["姓名", "被告人", "原告", "被告", "证人", "受害人", "当事人"],
-            )
-            analyzer.registry.add_recognizer(chinese_name_recognizer)
-
-            bare_name_pattern = Pattern(
-                name="bare_chinese_name_pattern",
-                regex=r"(?<![\u4e00-\u9fa5])([\u4e00-\u9fa5]{2,3})(?![\u4e00-\u9fa5])",
-                score=0.4,
-            )
-            bare_name_recognizer = PatternRecognizer(
-                supported_entity="PERSON",
-                name="bare_chinese_name_recognizer",
-                patterns=[bare_name_pattern],
-            )
-            analyzer.registry.add_recognizer(bare_name_recognizer)
-
-            return analyzer
-        except Exception as e:
-            print(f"⚠️ AnalyzerEngine 初始化失败，将使用正则降级: {e}")
-            return None
-
     def _authorize(self, user_id: str | None, case_id: str | None, action: str) -> None:
         allowed, reason = self.auth_check(user_id, case_id, action)
         if not allowed:
@@ -1949,7 +2396,13 @@ class MaterialService:
                         "status": "UPLOADED",
                         "current_version_id": None,
                         "deleted_at": None,
-                        "quality_summary_json": "{}",
+                        "quality_summary_json": json.dumps(
+                            {
+                                "material_type": infer_material_type(safe_name),
+                                "material_type_source": "heuristic",
+                            },
+                            ensure_ascii=False,
+                        ),
                     },
                 )
 
@@ -2269,6 +2722,9 @@ class MaterialService:
         document_version_id: str,
         chunk_id: str | None = None,
         user_id: str | None = None,
+        quote: str | None = None,
+        quote_hash: str | None = None,
+        restore_original: bool = False,
     ) -> dict[str, Any]:
         with db_session(self.db_path) as conn:
             version = get_version(conn, document_version_id)
@@ -2342,6 +2798,30 @@ class MaterialService:
                     {"chunk_id": chunk["id"]},
                 )
 
+            quote_ok = None
+            if quote or quote_hash:
+                from tools.entities import quote_hash as compute_quote_hash, verify_quote_hash
+
+                if not quote or not quote_hash:
+                    raise deny(
+                        "quote_incomplete",
+                        "引用失效：缺少原文片段或哈希",
+                        ERROR_CODES["CITATION_STALE"],
+                        {"chunk_id": chunk["id"]},
+                    )
+                if not verify_quote_hash(text, quote, quote_hash):
+                    raise deny(
+                        "quote_hash_mismatch",
+                        "引用失效：原文片段与哈希不匹配",
+                        ERROR_CODES["CITATION_STALE"],
+                        {
+                            "chunk_id": chunk["id"],
+                            "expected_hash": quote_hash,
+                            "actual_hash": compute_quote_hash(quote) if quote in text else None,
+                        },
+                    )
+                quote_ok = True
+
             add_audit(
                 conn,
                 event_type="egress_check",
@@ -2351,18 +2831,34 @@ class MaterialService:
                 document_version_id=document_version_id,
                 decision="allow",
                 reason="ok",
-                detail_json=json.dumps({"chunk_id": chunk["id"]}, ensure_ascii=False),
+                detail_json=json.dumps(
+                    {"chunk_id": chunk["id"], "quote_verified": quote_ok},
+                    ensure_ascii=False,
+                ),
             )
-            return {
+            # 校验已在存储态 text_redacted 上完成；展示层再渲染
+            if restore_original:
+                display_text = render_workbench_text(chunk["text_redacted"] or "")
+                display_quote = render_workbench_text(quote) if quote else None
+            else:
+                aliases = get_global_mapper(self.db_path).alias_map()
+                display_text = render_display_aliases(chunk["text_redacted"], aliases)
+                display_quote = render_display_aliases(quote, aliases) if quote else None
+            result = {
                 "chunk_id": chunk["id"],
                 "document_version_id": document_version_id,
                 "ordinal": chunk["ordinal"],
                 "page_start": chunk["page_start"],
                 "page_end": chunk["page_end"],
-                "text": chunk["text_redacted"],
+                "text": display_text,
                 "quality_flags": json.loads(chunk.get("quality_flags_json") or "[]"),
-                "redacted": True,
+                "redacted": not restore_original,
             }
+            if quote_ok:
+                result["quote"] = display_quote
+                result["quote_hash"] = quote_hash
+                result["quote_verified"] = True
+            return result
 
     # ----- 人工修正 -----
     def apply_correction(

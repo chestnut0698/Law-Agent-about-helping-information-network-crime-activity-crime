@@ -16,6 +16,8 @@
         plus: '<path d="M5 12h14M12 5v14"/>',
         search: '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
         upload: '<path d="M12 3v12"/><path d="m7 8 5-5 5 5"/><path d="M5 21h14"/>',
+        trash: '<path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M10 11v6M14 11v6"/>',
+        cloudUpload: '<path d="M4 14.9A7 7 0 1 1 15.7 8h1.8a4.5 4.5 0 0 1 2.5 8.2"/><path d="M12 12v9"/><path d="m16 16-4-4-4 4"/>',
         filter: '<polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>',
         calendar: '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>',
         info: '<circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/>',
@@ -36,7 +38,12 @@
         fileText: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h8M8 9h2"/>',
         arrowUpRight: '<path d="M7 17 17 7"/><path d="M7 7h10v10"/>',
         chevronRight: '<path d="m9 18 6-6-6-6"/>',
-        paperclip: '<path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>'
+        chevronDown: '<path d="m6 9 6 6 6-6"/>',
+        paperclip: '<path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>',
+        sparkles: '<path d="M12 3l1.5 4.5L18 9l-4.5 1.5L12 15l-1.5-4.5L6 9l4.5-1.5L12 3z"/><path d="M19 14l.8 2.2L22 17l-2.2.8L19 20l-.8-2.2L16 17l2.2-.8L19 14z"/><path d="M5 15l.6 1.8L7.4 17.4 5.6 18 5 19.8l-.6-1.8L2.6 17.4 4.4 16.8 5 15z"/>',
+        building2: '<path d="M6 22V4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v18"/><path d="M6 12h12"/><path d="M10 6h.01M14 6h.01M10 10h.01M14 10h.01M10 14h.01M14 14h.01M10 18h.01M14 18h.01"/><path d="M2 22h20"/>',
+        globe: '<circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>',
+        idCard: '<rect x="2" y="5" width="20" height="14" rx="2"/><circle cx="8" cy="12" r="2.5"/><path d="M14 10h4M14 14h4"/>'
     };
 
     const VIEW_ICONS = {
@@ -74,8 +81,12 @@
         forEntityType(type) {
             const t = String(type || '').toUpperCase();
             if (t.includes('PHONE') || t.includes('手机')) return 'phone';
-            if (t.includes('ACCOUNT') || t.includes('银行') || t.includes('卡')) return 'banknote';
+            if (t.includes('BANK_ACCOUNT') || t.includes('ACCOUNT') || t.includes('银行') || t.includes('卡')) return 'banknote';
             if (t.includes('DEVICE') || t.includes('IMEI') || t.includes('设备')) return 'cpu';
+            if (t.includes('ORG') || t.includes('MERCHANT') || t.includes('组织') || t.includes('商户')) return 'building2';
+            if (t.includes('IP')) return 'globe';
+            if (t.includes('ID_CARD') || t.includes('证件')) return 'idCard';
+            if (t.includes('PERSON') || t.includes('NAME') || t.includes('人物')) return 'users';
             return 'users';
         }
     };

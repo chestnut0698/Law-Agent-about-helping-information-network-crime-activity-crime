@@ -200,11 +200,14 @@ async def preview_material(
     document_id: str,
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
-    from app.files import db_session, _rows
+    from app.files import db_session, _rows, _row, render_workbench_text, infer_structure_markdown
 
     with db_session() as conn:
+        doc = _row(conn, "SELECT filename FROM documents WHERE id = ?", (document_id,))
+        filename = doc["filename"] if doc else ""
+
         rows = _rows(conn, """
-            SELECT c.text_redacted, c.ordinal
+            SELECT c.text_redacted, c.ordinal, c.page_start, c.page_end
             FROM document_chunks c
             JOIN document_versions v ON v.id = c.document_version_id
             JOIN documents d ON d.id = v.document_id
@@ -217,12 +220,17 @@ async def preview_material(
             ORDER BY c.ordinal
         """, (document_id,))
 
-        full_text = "\n".join(row['text_redacted'] or '' for row in rows)
+        raw_full_text = "\n".join(row['text_redacted'] or '' for row in rows)
+        # 预览：还原真实原文 + 结构推断；不回写存储
+        structured = infer_structure_markdown(render_workbench_text(raw_full_text))
 
         return JSONResponse(content={
             'ok': True,
             'document_id': document_id,
-            'text': full_text,
+            'filename': filename,
+            'text': structured,
+            'format': 'markdown',
+            'raw_text': raw_full_text,
             'chunk_count': len(rows)
         })
 
@@ -267,11 +275,19 @@ async def resolve_material_duplicate(
 async def read_material_chunk_api(
     version_id: str,
     chunk_id: str,
+    quote: Optional[str] = None,
+    quote_hash: Optional[str] = None,
+    restore: int = 1,
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
     try:
         return get_material_service().read_redacted_chunk(
-            version_id, chunk_id=chunk_id, user_id=x_user_id
+            version_id,
+            chunk_id=chunk_id,
+            user_id=x_user_id,
+            quote=quote,
+            quote_hash=quote_hash,
+            restore_original=bool(restore),
         )
     except MaterialError as exc:
         return material_error_response(exc)
@@ -380,6 +396,24 @@ async def review_task_entity_candidate(task_id: str, candidate_id: str, payload:
         )
     except TaskError as exc:
         return task_error_response(exc)
+
+
+@app.post("/api/tasks/{task_id}/entity-candidates/review")
+async def run_entity_review_agent_api(
+    task_id: str,
+    payload: dict | None = None,
+):
+    """触发 DeepSeek 实体复核 Agent（单候选或批量待核）。"""
+    try:
+        from agents.entity_review_agent import run_entity_review_for_task
+
+        body = payload or {}
+        return run_entity_review_for_task(task_id, candidate_id=body.get("candidate_id"))
+    except Exception as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"error_code": "ENTITY_REVIEW_FAILED", "message": str(exc)},
+        )
 
 
 @app.post("/api/tasks/{task_id}/clues/{artifact_id}/disposition")

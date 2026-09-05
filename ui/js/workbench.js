@@ -900,11 +900,14 @@
                 materials.forEach(row => panel.appendChild(this._materialRow(row)));
             });
 
-            panel.appendChild(this._uploadBox(payload));
+            panel.appendChild(this._iconBtn('wb-btn wb-btn-ghost', 'upload', '上传材料'));
+            const lastBtn = panel.lastChild;
+            lastBtn.addEventListener('click', () => this._openUploadModal());
             this._schedulePoll(payload);
         },
 
         _renderEntityCandidates(panel, payload, status, artifact, version) {
+            // deprecated: 产物面板旧卡片流；主入口已改为 _viewEntities
             const summary = payload.summary || {};
             panel.appendChild(Utils.create('div', { class: 'wb-callout' }, [
                 Utils.create('span', {
@@ -1216,6 +1219,7 @@
             const params = new URLSearchParams();
             if (source.quote_hash) params.set('quote_hash', source.quote_hash);
             if (source.quote) params.set('quote', source.quote);
+            params.set('restore', '1');
             const pane = Utils.$('#wb-cite-drawer');
             if (pane) {
                 this._openCiteDrawerShell();
@@ -1246,7 +1250,7 @@
                     text: data.text || source.quote || '无文本',
                     meta: [source.filename || source.document_name, source.page_start || source.page_no ? `第 ${source.page_start || source.page_no} 页` : '']
                         .filter(Boolean).join(' · ')
-                }, source);
+                }, { ...source, quote: data.quote || source.quote });
             } catch (e) {
                 Toast.error('回链失败：' + e.message);
                 this._renderCitePane({
@@ -1279,7 +1283,11 @@
             const body = Utils.create('div', { class: `wb-cite-body${view.error ? ' is-error' : ''}` });
             const quote = (source && source.quote) || '';
             const text = view.text || '';
-            if (quote && text.includes(quote) && !view.error) {
+            // 材料预览走 Markdown 结构渲染；带精确 quote 高亮时仍用纯文本，避免 HTML 偏移
+            if (!view.error && !quote && window.Markdown) {
+                body.classList.add('md-content');
+                body.innerHTML = Markdown.parse(text);
+            } else if (quote && text.includes(quote) && !view.error) {
                 const idx = text.indexOf(quote);
                 body.appendChild(document.createTextNode(text.slice(0, idx)));
                 body.appendChild(Utils.create('mark', { class: 'wb-cite-mark', text: quote }));
@@ -1599,7 +1607,7 @@
             items.forEach(item => {
                 if (item.sens_type) typeSet.add(item.sens_type);
             });
-            // 补充常见脱敏类型（与系统 REDACTION_PATTERNS 保持一致）
+            // 补充常见脱敏类型
             const commonTypes = ['PERSON', 'PHONE', 'ID', 'BANK_CARD', 'EMAIL', 'URL', 'IP'];
             commonTypes.forEach(t => typeSet.add(t));
             const allTypes = Array.from(typeSet).sort();
@@ -1609,6 +1617,7 @@
             const thead = Utils.create('thead', {}, [
                 Utils.create('tr', {}, [
                     Utils.create('th', { text: '匿名ID' }),
+                    Utils.create('th', { text: '化名' }),
                     Utils.create('th', { text: '原文样例' }),
                     Utils.create('th', { text: '类型' }),
                     Utils.create('th', { text: '最后出现' }),
@@ -1626,7 +1635,16 @@
                 if (isDeleted) tr.style.opacity = '0.5';
 
                 // 匿名ID
-                tr.appendChild(Utils.create('td', { text: item.anonymous_id || '' }));
+                tr.appendChild(Utils.create('td', {
+                    text: item.anonymous_id || '',
+                    style: 'font-family: monospace; font-size: 12px;'
+                }));
+
+                // 化名（对外展示用）
+                tr.appendChild(Utils.create('td', {
+                    text: item.display_alias || '—',
+                    style: 'font-weight: 600; color: var(--text-primary);'
+                }));
 
                 // 原文
                 tr.appendChild(Utils.create('td', {
@@ -1788,6 +1806,17 @@
                 modal.remove();
             });
         },
+        _renderMarkdownBody(text, className = 'wb-doc-preview md-content') {
+            const el = Utils.create('div', { class: className });
+            if (window.Markdown && typeof Markdown.parse === 'function') {
+                el.innerHTML = Markdown.parse(text || '');
+            } else {
+                el.classList.add('wb-doc-preview');
+                el.textContent = text || '';
+            }
+            return el;
+        },
+
         async _renderMaterialDoc(panel, artifact, payload) {
 
             // 1. 先获取 documentId
@@ -1828,19 +1857,16 @@
 
                 // 显示文件名和元信息
                 const head = Utils.create('div', { class: 'wb-panel-head' }, [
-                    Utils.create('div', { class: 'wb-panel-sub', text: `脱敏全文 · ${data.chunk_count} 处片段` })
+                    Utils.create('div', { class: 'wb-panel-sub', text: `结构化预览 · ${data.chunk_count} 处片段` })
                 ]);
                 panel.appendChild(head);
 
-                // 脱敏文本主体：字体与排版保持原样，颜色走主题变量
-                const pre = Utils.create('pre', { class: 'wb-doc-preview' });
-                pre.textContent = data.text;
-                panel.appendChild(pre);
+                panel.appendChild(this._renderMarkdownBody(data.text || ''));
 
                 // 底部提示
                 panel.appendChild(Utils.create('div', {
                     class: 'wb-file-meta',
-                    text: '以上内容已脱敏，与智能体看到的一致。',
+                    text: '以上为结构化预览（标题/表格分级显示）。存储原文未改动。',
                     style: 'margin-top: 8px; text-align: right;'
                 }));
 
@@ -1918,6 +1944,7 @@
 
         async _deleteMaterial(documentId) {
             if (!documentId || !this.task) return;
+            if (!confirm('确定删除该材料？删除后下游分析产物将标记为过期。')) return;
             try {
                 const resp = await fetch(
                     `/api/tasks/${this.task.id}/materials/${documentId}`,
@@ -1943,6 +1970,10 @@
                     this.task = await taskResp.json();
                 }
                 this._renderDirectory();
+                if (this.currentView === 'materials') {
+                    await this._renderCurrentView();
+                    return;
+                }
                 const batchId = data.batch_artifact_id
                     || (this.task.artifacts || []).find(a => a.type === 'MATERIAL_BATCH')?.id;
                 if (batchId) await this.openArtifact(batchId);
@@ -1960,61 +1991,196 @@
         },
 
         _uploadBox() {
-            const select = Utils.create('select', { id: 'wb-upload-case' });
-            (this.task.cases || []).forEach(c => {
-                const opt = Utils.create('option', { value: c.case_id, text: c.display_name });
-                select.appendChild(opt);
-            });
+            // 兼容旧入口：改为打开上传弹窗
+            this._openUploadModal();
+            return Utils.create('div');
+        },
 
+        _openUploadModal() {
+            if (!this.task) {
+                Toast.error('任务尚未创建，无法上传材料');
+                return;
+            }
+            const existing = document.querySelector('.wb-upload-modal-overlay');
+            if (existing) existing.remove();
+
+            const overlay = Utils.create('div', { class: 'wb-modal-overlay wb-upload-modal-overlay' });
+            const modal = Utils.create('div', { class: 'wb-modal-content wb-upload-modal' });
+
+            const head = Utils.create('div', { class: 'wb-upload-modal-head' }, [
+                Utils.create('div', {}, [
+                    Utils.create('div', { class: 'wb-upload-modal-title', text: '上传案件材料' }),
+                    Utils.create('div', {
+                        class: 'wb-upload-modal-sub',
+                        text: '支持 PDF、Word、Excel、图片与文本，上传后将自动排队处理'
+                    })
+                ])
+            ]);
+            const closeBtn = this._iconBtn('wb-btn wb-btn-ghost wb-upload-modal-close', 'x', '');
+            closeBtn.title = '关闭';
+            closeBtn.addEventListener('click', () => overlay.remove());
+            head.appendChild(closeBtn);
+            modal.appendChild(head);
+
+            const caseLabel = Utils.create('label', { class: 'wb-upload-field-label', text: '所属案件' });
+            const select = Utils.create('select', { class: 'wb-upload-select' });
+            (this.task.cases || []).forEach((c) => {
+                select.appendChild(Utils.create('option', {
+                    value: c.case_id,
+                    text: c.display_name || c.name || c.case_id
+                }));
+            });
+            if (this.materialsCaseFilter && this.materialsCaseFilter !== 'all') {
+                select.value = this.materialsCaseFilter;
+            }
+            modal.appendChild(caseLabel);
+            modal.appendChild(select);
+
+            const fileLabel = Utils.create('label', { class: 'wb-upload-field-label', text: '材料文件' });
             const input = Utils.create('input', {
                 type: 'file',
                 multiple: 'multiple',
-                accept: '.pdf,.docx,.txt,.png,.jpg,.jpeg'
+                accept: '.pdf,.docx,.txt,.png,.jpg,.jpeg,.xlsx,.xls',
+                class: 'wb-upload-file-input'
             });
-            input.style.fontSize = '12px';
+            input.hidden = true;
+            const drop = Utils.create('div', { class: 'wb-upload-dropzone' });
+            const dropInner = Utils.create('div', { class: 'wb-upload-drop-inner' });
+            if (window.Icons) dropInner.appendChild(Icons.el('cloudUpload', 'wb-upload-cloud'));
+            dropInner.appendChild(Utils.create('div', {
+                class: 'wb-upload-drop-title',
+                text: '点击选择文件或拖拽到此处'
+            }));
+            dropInner.appendChild(Utils.create('div', {
+                class: 'wb-upload-drop-hint',
+                text: '支持 PDF、DOCX、XLSX、JPG、PNG，单个文件不超过 100MB'
+            }));
+            const fileList = Utils.create('div', { class: 'wb-upload-file-list' });
+            drop.appendChild(dropInner);
+            drop.appendChild(fileList);
+            drop.appendChild(input);
 
-            const btn = this._iconBtn('wb-btn wb-btn-primary', 'upload', '上传到该案件');
-            btn.addEventListener('click', () => this._uploadMaterials(select.value, input.files, btn));
-
-            const refresh = this._iconBtn('wb-btn wb-btn-ghost', 'refresh', '刷新进度');
-            refresh.addEventListener('click', () => this._refreshBatch());
-
-            const box = Utils.create('div', { class: 'wb-upload-box' }, [
-                Utils.create('span', { class: 'wb-file-meta', text: '材料必须归属案件：' }),
-                select, input, btn, refresh
-            ]);
-
-            // 拖拽上传支持
-            let dragCounter = 0;
-            box.addEventListener('dragover', (e) => {
+            const syncFileList = () => {
+                fileList.innerHTML = '';
+                const files = input.files ? Array.from(input.files) : [];
+                if (!files.length) {
+                    dropInner.hidden = false;
+                    return;
+                }
+                dropInner.hidden = true;
+                files.forEach((f) => {
+                    fileList.appendChild(Utils.create('div', {
+                        class: 'wb-upload-file-item',
+                        text: `${f.name}（${this._sizeText(f.size)}）`
+                    }));
+                });
+            };
+            drop.addEventListener('click', () => input.click());
+            input.addEventListener('change', syncFileList);
+            drop.addEventListener('dragover', (e) => {
                 e.preventDefault();
-                e.stopPropagation();
-                box.classList.add('wb-upload-dragover');
+                drop.classList.add('dragover');
             });
-            box.addEventListener('dragleave', (e) => {
+            drop.addEventListener('dragleave', () => drop.classList.remove('dragover'));
+            drop.addEventListener('drop', (e) => {
                 e.preventDefault();
-                e.stopPropagation();
-                dragCounter--;
-                if (dragCounter <= 0) {
-                    dragCounter = 0;
-                    box.classList.remove('wb-upload-dragover');
+                drop.classList.remove('dragover');
+                if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
+                    const dt = new DataTransfer();
+                    Array.from(e.dataTransfer.files).forEach((f) => dt.items.add(f));
+                    input.files = dt.files;
+                    syncFileList();
                 }
             });
-            box.addEventListener('drop', (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                box.classList.remove('wb-upload-dragover');
-                dragCounter = 0;
-                const files = e.dataTransfer.files;
-                if (files && files.length > 0) {
-                    // 拖拽文件自动上传到当前选中的案件
-                    this._uploadMaterials(select.value, files, null);
+
+            modal.appendChild(fileLabel);
+            modal.appendChild(drop);
+
+            const foot = Utils.create('div', { class: 'wb-upload-modal-foot' });
+            const notice = Utils.create('div', { class: 'wb-upload-legal' });
+            if (window.Icons) notice.appendChild(Icons.el('fileText', 'wb-upload-legal-ico'));
+            notice.appendChild(Utils.create('span', {
+                text: '上传即视为您确认已获得该材料的合法查阅与分析授权'
+            }));
+            const actions = Utils.create('div', { class: 'wb-upload-modal-actions' });
+            const cancel = this._iconBtn('wb-btn wb-btn-outline', 'x', '取消');
+            cancel.addEventListener('click', () => overlay.remove());
+            const start = this._iconBtn('wb-btn wb-btn-primary', 'upload', '开始上传');
+            start.addEventListener('click', async () => {
+                const ok = await this._uploadMaterials(select.value, input.files, start);
+                if (ok) {
+                    overlay.remove();
+                    if (this.currentView === 'materials') await this._renderCurrentView();
                 }
             });
+            actions.appendChild(cancel);
+            actions.appendChild(start);
+            foot.appendChild(notice);
+            foot.appendChild(actions);
+            modal.appendChild(foot);
 
-            return box;
+            overlay.appendChild(modal);
+            overlay.addEventListener('click', (e) => {
+                if (e.target === overlay) overlay.remove();
+            });
+            document.body.appendChild(overlay);
         },
 
+        async _uploadMaterials(caseId, files, btn) {
+            if (!files || !files.length) {
+                Toast.warning('请先选择材料文件');
+                return false;
+            }
+            Toast.info('正在上传文件，请稍候…');
+            const form = new FormData();
+            form.append('case_id', caseId);
+            Array.from(files).forEach(f => form.append('files', f));
+
+            const taskId = (this.task && this.task.id) || this.draftTaskId;
+            if (!taskId) {
+                Toast.error('任务尚未创建，无法上传材料');
+                return false;
+            }
+            if (btn) {
+                btn.disabled = true;
+                const label = btn.querySelector('span:last-child');
+                if (label) label.textContent = '上传中…';
+                else btn.textContent = '上传中…';
+            }
+            try {
+                const resp = await fetch(`/api/tasks/${taskId}/materials`, {
+                    method: 'POST',
+                    body: form
+                });
+                const data = await resp.json();
+                if (data.error_code) {
+                    Toast.error(data.message || '上传失败');
+                    return false;
+                }
+                this.task = data.task;
+                this._renderDirectory();
+                const batch = (this.task.artifacts || []).find(a => a.type === 'MATERIAL_BATCH');
+                if (batch) {
+                    delete this.artifactCache[batch.id];
+                    if (!Utils.$('#wb-workspace').hidden && this.currentView !== 'materials') {
+                        await this.openArtifact(batch.id);
+                        this._postArtifactCard(batch.id, '材料接入与质量', `已接收 ${files.length} 份材料，可在此查看逐份处理进度。`);
+                    }
+                }
+                Toast.success('材料已接入，正在处理');
+                this._maybeOfferRerun();
+                return true;
+            } catch (e) {
+                Toast.error('上传失败：' + e.message);
+                return false;
+            } finally {
+                if (btn) {
+                    btn.disabled = false;
+                    const label = btn.querySelector('span:last-child');
+                    if (label) label.textContent = '开始上传';
+                }
+            }
+        },
         async _executeAnalysis(button) {
             if (!this.draftTaskId && this.task) this.draftTaskId = this.task.id;
             if (!this.draftTaskId && !(this.task && this.task.id)) return;
@@ -2098,56 +2264,6 @@
         async _postJson(url) {
             const resp = await fetch(url, { method: 'POST' });
             return resp.json();
-        },
-
-        async _uploadMaterials(caseId, files, btn) {
-            if (!files || !files.length) {
-                Toast.warning('请先选择材料文件');
-                return;
-            }
-            Toast.info('正在上传文件，请稍候…');
-            const form = new FormData();
-            form.append('case_id', caseId);
-            Array.from(files).forEach(f => form.append('files', f));
-
-            const taskId = (this.task && this.task.id) || this.draftTaskId;
-            if (!taskId) {
-                Toast.error('任务尚未创建，无法上传材料');
-                return false;
-            }
-            if (btn) {
-                btn.disabled = true;
-                btn.textContent = '上传中…';
-            }
-            try {
-                const resp = await fetch(`/api/tasks/${taskId}/materials`, {
-                    method: 'POST',
-                    body: form
-                });
-                const data = await resp.json();
-                if (data.error_code) {
-                    Toast.error(data.message || '上传失败');
-                    return false;
-                }
-                this.task = data.task;
-                this._renderDirectory();
-                const batch = (this.task.artifacts || []).find(a => a.type === 'MATERIAL_BATCH');
-                if (batch && !Utils.$('#wb-workspace').hidden) {
-                    await this.openArtifact(batch.id);
-                    this._postArtifactCard(batch.id, '材料接入与质量', `已接收 ${files.length} 份材料，可在此查看逐份处理进度。`);
-                }
-                Toast.success('材料已接入，正在处理');
-                this._maybeOfferRerun();
-                return true;
-            } catch (e) {
-                Toast.error('上传失败：' + e.message);
-                return false;
-            } finally {
-                if (btn) {
-                    btn.disabled = false;
-                    btn.textContent = '上传到该案件';
-                }
-            }
         },
 
         async _refreshBatch() {
@@ -2422,15 +2538,18 @@
         },
 
         async _ensureMaterialBatch() {
+            if (!this.task || !this.task.id) return null;
+            // 每次进入材料中心都刷新批次，保证上传时间/材料类型等字段最新
+            try {
+                await fetch(`/api/tasks/${this.task.id}/materials`);
+            } catch (_) { /* ignore */ }
+            const taskResp = await fetch(`/api/tasks/${this.task.id}`);
+            const task = await taskResp.json();
+            if (!task.error_code) this.task = task;
             const batch = (this.task.artifacts || []).find((a) => a.type === 'MATERIAL_BATCH');
             if (!batch) return null;
-            if (!this.artifactCache[batch.id]) {
-                await fetch(`/api/tasks/${this.task.id}/materials`).catch(() => null);
-                await this._fetchArtifact(batch.id);
-            } else {
-                await this._fetchArtifact(batch.id);
-            }
-            return this.artifactCache[batch.id];
+            delete this.artifactCache[batch.id];
+            return this._fetchArtifact(batch.id);
         },
 
         async _viewMaterials(root) {
@@ -2448,16 +2567,25 @@
                 });
             });
             const blocked = rows.filter((m) => ATTENTION.includes(m.status)).length;
+            const actions = Utils.create('div', { class: 'wb-page-actions' });
             const uploadBtn = this._iconBtn('wb-btn wb-btn-primary', 'upload', '上传材料');
-            uploadBtn.addEventListener('click', () => {
-                const box = this._uploadBox(payload);
-                root.appendChild(box);
-                box.scrollIntoView({ behavior: 'smooth' });
+            uploadBtn.addEventListener('click', () => this._openUploadModal());
+            const refreshBtn = this._iconBtn('wb-btn wb-btn-ghost', 'refresh', '刷新进度');
+            refreshBtn.addEventListener('click', async () => {
+                refreshBtn.disabled = true;
+                try {
+                    await this._refreshBatch();
+                    Toast.success('进度已刷新');
+                } finally {
+                    refreshBtn.disabled = false;
+                }
             });
+            actions.appendChild(uploadBtn);
+            actions.appendChild(refreshBtn);
             root.appendChild(this._pageHead(
                 '材料中心',
                 `共 ${rows.length} 份材料 · ${blocked} 份存在处理阻断问题，需处理后才能纳入分析`,
-                uploadBtn,
+                actions,
                 blocked ? `${blocked} 待处理` : `${rows.length} 份`
             ));
 
@@ -2508,14 +2636,15 @@
                     Utils.create('th', { text: '版本' }),
                     Utils.create('th', { text: '处理状态' }),
                     Utils.create('th', { text: '脱敏' }),
-                    Utils.create('th', { text: '分析可用性' }),
-                    Utils.create('th', { text: '上传时间' })
+                    Utils.create('th', { text: '分析授权' }),
+                    Utils.create('th', { text: '上传时间' }),
+                    Utils.create('th', { text: '操作', class: 'wb-th-actions' })
                 ])
             ]));
             const tbody = Utils.create('tbody');
             if (!filtered.length) {
                 tbody.appendChild(Utils.create('tr', {}, [
-                    Utils.create('td', { text: '暂无材料，请上传卷宗', colspan: '8' })
+                    Utils.create('td', { text: '暂无材料，请点击右上角上传', colspan: '9' })
                 ]));
             }
             filtered.forEach((m) => {
@@ -2525,13 +2654,13 @@
                 const fail = m.status === 'FAILED' || m.status === 'OCR_FAILED';
                 const statusTone = fail ? 'danger' : (warn ? 'warn' : (ready ? 'ok' : 'neutral'));
                 const availTone = ready ? 'ok' : (warn || fail ? 'danger' : 'warn');
-                const availText = ready ? '可用于分析' : (warn || fail ? '暂不允许' : '处理中');
+                const availText = ready ? '允许分析' : (warn || fail ? '暂不允许' : '处理中');
                 const redacted = m.redacted !== false;
                 const tr = Utils.create('tr');
                 tr.appendChild(Utils.create('td', { text: m.filename || '—' }));
                 tr.appendChild(Utils.create('td', { text: m.case_name || '—' }));
-                tr.appendChild(Utils.create('td', { text: m.doc_type || m.material_type || '卷宗' }));
-                tr.appendChild(Utils.create('td', { text: m.version != null ? `v${m.version}` : '—' }));
+                tr.appendChild(Utils.create('td', { text: m.material_type || m.doc_type || '其他材料' }));
+                tr.appendChild(Utils.create('td', { text: m.version != null ? `v${m.version}` : (m.version_count != null ? `v${m.version_count}` : '—') }));
                 tr.appendChild(Utils.create('td', {}, [this._statusTag(statusText, statusTone)]));
                 const shield = Utils.create('td');
                 if (window.Icons) {
@@ -2543,9 +2672,20 @@
                 tr.appendChild(shield);
                 tr.appendChild(Utils.create('td', {}, [this._statusTag(availText, availTone)]));
                 tr.appendChild(Utils.create('td', {
-                    text: (m.uploaded_at || m.created_at || '—').toString().slice(0, 19)
+                    text: (m.uploaded_at || m.created_at || '—').toString().replace('T', ' ').slice(0, 16)
                 }));
-                tr.addEventListener('click', async () => {
+                const actionsTd = Utils.create('td', { class: 'wb-td-actions' });
+                const delBtn = this._iconBtn('wb-btn wb-btn-ghost wb-btn-icon-danger', 'trash', '');
+                delBtn.title = '删除材料';
+                delBtn.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    this._deleteMaterial(m.document_id);
+                });
+                actionsTd.appendChild(delBtn);
+                tr.appendChild(actionsTd);
+                tr.addEventListener('click', async (e) => {
+                    if (e.target.closest('.wb-td-actions')) return;
                     if (m.document_id) {
                         const preview = await fetch(`/api/materials/${m.document_id}/preview`).then((r) => r.json()).catch(() => null);
                         if (preview && !preview.error_code) {
@@ -2565,29 +2705,191 @@
             table.appendChild(tbody);
             wrap.appendChild(table);
             root.appendChild(wrap);
-            root.appendChild(this._uploadBox(payload));
             this._schedulePoll(payload);
         },
 
         async _ensureEntitySet() {
             const art = (this.task.artifacts || []).find((a) => a.type === 'ENTITY_CANDIDATE_SET');
             if (!art) return null;
-            return this.artifactCache[art.id] || this._fetchArtifact(art.id);
+            let data = this.artifactCache[art.id] || await this._fetchArtifact(art.id);
+            const ver = (((data || {}).payload || {}).summary || {}).extractor_version || '';
+            // 旧产物用过时抽取器时自动重跑，否则页面会一直显示噪声人名
+            if (!this._entityRefreshTried && this.task && this.task.id && ver !== 'stage7-fuzzy-v2') {
+                this._entityRefreshTried = true;
+                try {
+                    Toast.info('实体识别规则已升级，正在重新抽取比对…');
+                    const resp = await fetch(`/api/tasks/${this.task.id}/collision/run`, { method: 'POST' });
+                    const result = await resp.json();
+                    if (!result.error_code && result.ok !== false) {
+                        await this.refreshTask();
+                        const next = (this.task.artifacts || []).find((a) => a.type === 'ENTITY_CANDIDATE_SET');
+                        if (next) {
+                            delete this.artifactCache[next.id];
+                            data = await this._fetchArtifact(next.id);
+                        }
+                        Toast.success(`已按新规则更新，待核 ${result.candidate_count || 0} 条`);
+                    }
+                } catch (e) {
+                    Toast.warning('自动重抽未完成，仍显示旧结果：' + (e.message || ''));
+                }
+            }
+            return data;
         },
 
         async _viewEntities(root) {
             const data = await this._ensureEntitySet();
             const payload = (data && data.payload) || {};
-            const candidates = payload.candidates || [];
+            const entityConfig = {
+                BANK_ACCOUNT: {
+                    label: '银行账户',
+                    fields: [['account_no', '账号'], ['holder_name', '开户姓名'], ['bank_name', '开户行'], ['reserved_phone', '预留电话'], ['merchant', '关联商户']]
+                },
+                PHONE: {
+                    label: '手机号码',
+                    fields: [['phone_no', '号码'], ['registrant', '登记人'], ['linked_account', '关联账户'], ['linked_device', '关联设备'], ['contact_context', '联络语境']]
+                },
+                PERSON: {
+                    label: '人物',
+                    fields: [['name', '姓名'], ['id_card', '证件'], ['phone', '手机号'], ['account', '账户'], ['organization', '组织'], ['role_in_material', '材料记载角色']]
+                },
+                DEVICE: {
+                    label: '电子设备',
+                    fields: [['device_id', '设备号'], ['linked_phone', '关联手机号'], ['linked_account', '关联账户'], ['linked_person', '关联人员'], ['login_time', '登录时间']]
+                },
+                ORGANIZATION: {
+                    label: '组织主体',
+                    fields: [['org_name', '名称'], ['credit_code', '统一社会信用代码'], ['legal_person', '法人'], ['address', '地址'], ['phone', '电话'], ['account', '账户']]
+                },
+                MERCHANT: {
+                    label: '商户',
+                    fields: [['merchant_id', '商户号'], ['merchant_name', '商户名称'], ['settle_account', '结算账户'], ['pay_channel', '支付通道'], ['linked_org', '关联组织']]
+                },
+                ID_CARD: { label: '身份证件', fields: [['id_no', '证件号'], ['name', '姓名'], ['address', '地址']] },
+                IP: { label: '网络地址', fields: [['ip_address', 'IP 地址'], ['linked_account', '关联账户'], ['linked_device', '关联设备']] }
+            };
+            const publicType = (raw) => ({
+                ACCOUNT: 'BANK_ACCOUNT',
+                NAME: 'PERSON',
+                ORG: 'ORGANIZATION'
+            }[String(raw || '').toUpperCase()] || String(raw || 'PERSON').toUpperCase());
+                const candidateName = (candidate, type) => {
+                const existing = String(candidate.display_name || candidate.title || '').trim();
+                if (existing && !/^同一.+跨案出现$/.test(existing) && !/^(实体)?候选/.test(existing)) return existing;
+                const first = (candidate.records || [])[0] || {};
+                const raw = String(first.value || candidate.value || '').trim();
+                const digits = raw.replace(/\D/g, '');
+                if (type === 'BANK_ACCOUNT') return digits.length >= 4 ? `尾号 ${digits.slice(-4)} 银行账户` : '银行账户（同一脱敏标识）';
+                if (type === 'PHONE') return digits.length >= 4 ? `尾号 ${digits.slice(-4)} 手机号码` : '手机号码（同一脱敏标识）';
+                if (type === 'DEVICE') return digits.length >= 4 ? `IMEI 尾号 ${digits.slice(-4)} 设备` : '电子设备（同一设备标识）';
+                if (type === 'ID_CARD') return digits.length >= 4 ? `尾号 ${digits.slice(-4)} 身份证件` : '身份证件（同一脱敏标识）';
+                if (type === 'MERCHANT') return raw ? `商户号 ${raw} 商户` : '商户（同一商户标识）';
+                if (type === 'IP') return raw ? `${raw} 网络地址` : '网络地址（同一脱敏标识）';
+                if (type === 'ORGANIZATION') return raw ? `“${raw}”组织` : '组织主体（同一脱敏名称）';
+                return raw ? `“${raw}”人物` : '人物（同一脱敏姓名）';
+            };
+            const normalizeCandidate = (raw) => {
+                const candidate = { ...raw };
+                candidate.entity_type = publicType(candidate.entity_type || candidate.object_type);
+                candidate.match_tier = candidate.match_tier || 'STRONG';
+                candidate.aliases = candidate.aliases || [];
+                candidate.display_name = candidateName(candidate, candidate.entity_type);
+                const cases = candidate.cases && candidate.cases.length
+                    ? candidate.cases
+                    : (candidate.records || []).reduce((acc, rec) => {
+                        if (rec.case_id && !acc.some((item) => item.case_id === rec.case_id)) {
+                            acc.push({ case_id: rec.case_id, case_name: rec.case_name || rec.case_id });
+                        }
+                        return acc;
+                    }, []);
+                candidate.cases = cases;
+                if (!(candidate.field_compare || []).length) {
+                    const config = entityConfig[candidate.entity_type] || entityConfig.PERSON;
+                    candidate.field_compare = config.fields.map(([fieldKey, label], index) => ({
+                        field_key: fieldKey,
+                        label,
+                        per_case: cases.map((caseItem) => {
+                            const values = index === 0
+                                ? (candidate.records || [])
+                                    .filter((rec) => rec.case_id === caseItem.case_id)
+                                    .map((rec) => rec.value)
+                                    .filter(Boolean)
+                                : [];
+                            const value = [...new Set(values)].join('、') || null;
+                            return {
+                                case_id: caseItem.case_id,
+                                case_name: caseItem.case_name,
+                                value,
+                                status: value ? 'same' : 'missing'
+                            };
+                        })
+                    }));
+                }
+                return candidate;
+            };
+            const candidates = (payload.candidates || []).map(normalizeCandidate);
             const version = data ? data.version : 1;
             const artifact = data ? data.artifact : null;
             const status = data ? data.status : 'DRAFT';
 
             const pendingCount = candidates.filter((c) => !c.decision || c.decision === 'PENDING' || c.decision === 'DEFER').length;
+            const typeFilter = this.entityTypeFilter || 'all';
+            const entitySearch = String(this.entitySearchQuery || '').trim().toLowerCase();
+            const typeLabel = {
+                BANK_ACCOUNT: '银行账户', ACCOUNT: '银行账户',
+                PHONE: '手机号码', PERSON: '人物', NAME: '人物',
+                DEVICE: '电子设备', ORGANIZATION: '组织主体', MERCHANT: '商户',
+                ID_CARD: '身份证件', IP: '网络地址'
+            };
+            let filtered = typeFilter === 'all'
+                ? candidates
+                : candidates.filter((c) => {
+                    const t = c.entity_type || '';
+                    if (typeFilter === 'BANK_ACCOUNT') return t === 'BANK_ACCOUNT' || t === 'ACCOUNT';
+                    if (typeFilter === 'PERSON') return t === 'PERSON' || t === 'NAME';
+                    return t === typeFilter;
+                });
+            if (entitySearch) {
+                filtered = filtered.filter((candidate) => {
+                    const searchable = [
+                        candidate.display_name,
+                        candidate.entity_type,
+                        ...(candidate.cases || []).map((item) => item.case_name || item.case_id),
+                        ...(candidate.records || []).map((item) => item.value)
+                    ].filter(Boolean).join(' ').toLowerCase();
+                    return searchable.includes(entitySearch);
+                });
+            }
+
+            const reviewBtn = this._iconBtn('wb-btn wb-btn-outline', 'sparkles', 'Agent 复核建议');
+            reviewBtn.addEventListener('click', async () => {
+                reviewBtn.disabled = true;
+                try {
+                    const resp = await fetch(`/api/tasks/${this.task.id}/entity-candidates/review`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            candidate_id: this.selectedEntityId || null
+                        })
+                    });
+                    const result = await resp.json();
+                    if (result.error_code || result.ok === false) {
+                        Toast.error(result.message || result.error || '复核未能完成');
+                        return;
+                    }
+                    Toast.success('复核建议已更新');
+                    await this.refreshTask();
+                    this._renderCurrentView();
+                } catch (e) {
+                    Toast.error(e.message || '复核未能完成');
+                } finally {
+                    reviewBtn.disabled = false;
+                }
+            });
+
             root.appendChild(this._pageHead(
                 '实体复核',
                 '逐条核验跨案实体是否为同一主体；确认结果影响线索与图谱。',
-                null,
+                reviewBtn,
                 `${pendingCount} 个待选`
             ));
             root.appendChild(Utils.create('div', { class: 'wb-alert warn' }, [
@@ -2606,24 +2908,93 @@
                 return;
             }
 
-            if (!this.selectedEntityId || !candidates.some((c) => c.candidate_id === this.selectedEntityId)) {
-                this.selectedEntityId = candidates[0].candidate_id;
+            const tabs = Utils.create('div', { class: 'wb-toolbar', style: 'margin-bottom:10px;gap:6px;flex-wrap:wrap' });
+            [
+                ['all', '全部'],
+                ['BANK_ACCOUNT', '银行账户'],
+                ['PHONE', '手机号码'],
+                ['PERSON', '人物'],
+                ['DEVICE', '设备'],
+                ['ORGANIZATION', '组织']
+            ].forEach(([key, label]) => {
+                const count = key === 'all' ? candidates.length : candidates.filter((c) => {
+                    const t = c.entity_type || '';
+                    if (key === 'BANK_ACCOUNT') return t === 'BANK_ACCOUNT' || t === 'ACCOUNT';
+                    if (key === 'PERSON') return t === 'PERSON' || t === 'NAME';
+                    return t === key;
+                }).length;
+                const btn = Utils.create('button', {
+                    type: 'button',
+                    class: `wb-btn ${typeFilter === key ? 'wb-btn-primary' : 'wb-btn-ghost'}`,
+                    text: `${label} ${count}`
+                });
+                btn.addEventListener('click', () => {
+                    this.entityTypeFilter = key;
+                    this._renderCurrentView();
+                });
+                tabs.appendChild(btn);
+            });
+            root.appendChild(tabs);
+
+            if (!filtered.length) {
+                const empty = Utils.create('div', { class: 'wb-empty' }, [
+                    Utils.create('div', { text: entitySearch ? '没有找到匹配的候选实体。' : '当前类型下无候选。' })
+                ]);
+                if (entitySearch) {
+                    const clear = this._iconBtn('wb-btn wb-btn-ghost', 'x', '清除搜索');
+                    clear.style.marginTop = '8px';
+                    clear.addEventListener('click', () => {
+                        this.entitySearchQuery = '';
+                        this._renderCurrentView();
+                    });
+                    empty.appendChild(clear);
+                }
+                root.appendChild(empty);
+                return;
             }
-            const selected = candidates.find((c) => c.candidate_id === this.selectedEntityId) || candidates[0];
+
+            if (!this.selectedEntityId || !filtered.some((c) => c.candidate_id === this.selectedEntityId)) {
+                this.selectedEntityId = filtered[0].candidate_id;
+            }
+            const selected = filtered.find((c) => c.candidate_id === this.selectedEntityId) || filtered[0];
 
             const split = Utils.create('div', { class: 'wb-split-view' });
             const listCard = Utils.create('div', { class: 'wb-list-card' });
             listCard.appendChild(Utils.create('div', { class: 'wb-list-card-head' }, [
-                Utils.create('div', { class: 'wb-entity-title', text: '候选列表' })
+                Utils.create('div', { class: 'wb-entity-title', text: '候选实体' }),
+                Utils.create('div', { class: 'wb-file-meta', text: `${pendingCount} 个待核` })
             ]));
             const listBody = Utils.create('div', { class: 'wb-list-card-body' });
-            candidates.forEach((c) => {
+            const searchBox = Utils.create('div', { class: 'wb-entity-search' }, [
+                window.Icons ? Icons.el('search') : Utils.create('span', { text: '⌕' })
+            ]);
+            const searchInput = Utils.create('input', {
+                type: 'search',
+                placeholder: '搜索实体、案件或召回方式',
+                value: this.entitySearchQuery || ''
+            });
+            searchInput.addEventListener('input', (event) => {
+                this.entitySearchQuery = event.target.value;
+                clearTimeout(this.entitySearchTimer);
+                this.entitySearchTimer = setTimeout(() => this._renderCurrentView(), 180);
+            });
+            searchBox.appendChild(searchInput);
+            listBody.appendChild(searchBox);
+            filtered.forEach((c) => {
                 const decision = c.decision || 'PENDING';
                 const label = { PENDING: '待确认', MERGE: '视为同一', KEEP_SEPARATE: '保留独立', CORRECT: '已更正', DEFER: '待重新核验' }[decision] || decision;
                 const tone = decision === 'PENDING' || decision === 'DEFER' ? 'warn' : (decision === 'KEEP_SEPARATE' ? 'danger' : 'ok');
                 const typeIcon = window.Icons
-                    ? Icons.el(Icons.forEntityType(c.object_type || c.title), 'wb-list-type-ico')
+                    ? Icons.el(Icons.forEntityType(c.entity_type || c.object_type || c.title), 'wb-list-type-ico')
                     : null;
+                const cases = c.cases && c.cases.length
+                    ? c.cases
+                    : (c.records || []).reduce((acc, r) => {
+                        if (!acc.find((x) => x.case_id === r.case_id)) {
+                            acc.push({ case_id: r.case_id, case_name: r.case_name });
+                        }
+                        return acc;
+                    }, []);
                 const titleRow = Utils.create('div', {
                     style: 'display:flex;justify-content:space-between;gap:8px;align-items:center'
                 });
@@ -2633,7 +3004,7 @@
                 if (typeIcon) titleLeft.appendChild(typeIcon);
                 titleLeft.appendChild(Utils.create('div', {
                     class: 'wb-list-item-title',
-                    text: c.title || c.display_name || '跨案对象'
+                    text: c.display_name || c.title || '跨案对象'
                 }));
                 titleRow.appendChild(titleLeft);
                 titleRow.appendChild(this._statusTag(label, tone));
@@ -2644,7 +3015,13 @@
                     titleRow,
                     Utils.create('div', {
                         class: 'wb-list-item-meta',
-                        text: `${(c.cases || []).length || 1} 案件 · ${(c.cases || []).map((x) => x.case_name || x.case_id).slice(0, 2).join(' · ') || '多案'}`
+                        text: (() => {
+                            const tier = c.match_tier === 'SUSPECTED' ? '疑似化名' : '强标识';
+                            const aliasPart = (c.aliases || []).length > 1
+                                ? ` · ${(c.aliases || []).slice(0, 3).join('/')}`
+                                : '';
+                            return `${typeLabel[c.entity_type] || c.entity_type || '对象'} · ${tier} · ${cases.length} 案件 · ${cases.map((x) => x.case_name || x.case_id).slice(0, 2).join(' · ') || '多案'}${aliasPart}`;
+                        })()
                     })
                 ]);
                 item.addEventListener('click', () => {
@@ -2656,82 +3033,168 @@
             listCard.appendChild(listBody);
             split.appendChild(listCard);
 
-            const detail = Utils.create('div', { class: 'wb-detail-card' });
-            detail.appendChild(Utils.create('div', { class: 'wb-detail-card-head' }, [
-                Utils.create('div', { class: 'wb-entity-title', text: selected.title || selected.display_name || '对象详情' }),
-                Utils.create('div', { class: 'wb-file-meta', text: selected.confidence_label || '待核验' })
-            ]));
-            const detailBody = Utils.create('div', { class: 'wb-detail-card-body' });
-            detailBody.appendChild(Utils.create('div', {
-                class: 'wb-callout warn',
-                style: 'margin-bottom:10px'
-            }, [
-                Utils.create('span', {
-                    text: selected.question || `请核验：相关案件中该标识是否指向同一对象？`
-                })
-            ]));
-
-            const fields = selected.field_compare || selected.fields || [];
-            if (fields.length) {
-                const grid = Utils.create('div', { class: 'wb-field-grid' });
-                fields.forEach((f) => {
-                    const diff = f.same === false || f.status === 'diff';
-                    const miss = f.status === 'missing' || (!f.detail && !f.values);
-                    grid.appendChild(Utils.create('div', { class: 'wb-field-row-cmp' }, [
-                        Utils.create('span', { text: f.label || f.name || '字段' }),
-                        Utils.create('span', {
-                            class: miss ? 'wb-match-na' : (diff ? 'wb-match-bad' : 'wb-match-ok'),
-                            text: miss ? '未记载' : (diff ? '不一致' : '一致')
-                        }),
-                        Utils.create('span', { text: f.detail || f.values || '—' })
-                    ]));
-                });
-                detailBody.appendChild(grid);
-            } else if (selected.evidence || selected.records) {
-                (selected.evidence || selected.records || []).slice(0, 6).forEach((rec) => {
-                    const row = Utils.create('div', { class: 'wb-entity-record' }, [
-                        Utils.create('div', { class: 'case', text: rec.case_name || rec.case_id || '案件' }),
-                        Utils.create('div', { class: 'value', text: rec.display_value || rec.value || selected.display_name || '标识' }),
-                        Utils.create('div', { class: 'source', text: rec.filename || rec.quote || '' })
-                    ]);
-                    if (rec.chunk_id && rec.quote_hash) {
-                        row.style.cursor = 'pointer';
-                        row.addEventListener('click', () => this._openCitation(rec));
-                    }
-                    detailBody.appendChild(row);
-                });
-            }
-
-            const openCite = this._iconBtn('wb-btn wb-btn-outline', 'externalLink', '打开原文');
-            const firstEv = ((selected.evidence || selected.records || [])[0]) || null;
-            openCite.addEventListener('click', () => {
-                if (firstEv) this._openCitation(firstEv);
-                else Toast.info('暂无可用原文定位');
-            });
-            detailBody.appendChild(openCite);
-
+            const detail = Utils.create('div', { class: 'wb-entity-detail-stack' });
+            const overview = Utils.create('section', { class: 'wb-detail-card wb-entity-overview-card' });
+            const overviewHead = Utils.create('div', { class: 'wb-detail-card-head wb-entity-overview-head' });
+            const heading = Utils.create('div', { class: 'wb-entity-heading' }, [
+                window.Icons ? Icons.el(Icons.forEntityType(selected.entity_type), 'wb-entity-main-icon') : Utils.create('span'),
+                Utils.create('div', {}, [
+                    Utils.create('div', { class: 'wb-entity-title wb-entity-main-title', text: selected.display_name }),
+                    Utils.create('div', {
+                        class: 'wb-file-meta',
+                        text: `${typeLabel[selected.entity_type] || selected.entity_type || '对象'} · ${selected.confidence_label || '待核验'}${selected.match_tier === 'SUSPECTED' ? ' · 疑似化名' : ''}`
+                    })
+                ])
+            ]);
+            overviewHead.appendChild(heading);
+            const overviewActions = Utils.create('div', { class: 'wb-entity-actions' });
             if (artifact && (selected.decision || 'PENDING') === 'PENDING' && status !== 'STALE') {
-                const actions = Utils.create('div', { class: 'wb-entity-actions', style: 'justify-content:flex-start;margin-top:12px' });
                 [
-                    ['MERGE', '确认关联', 'check', 'wb-btn wb-btn-primary'],
-                    ['KEEP_SEPARATE', '保留为独立主体', 'x', 'wb-btn wb-btn-outline'],
-                    ['CORRECT', '更正', 'fileCheck2', 'wb-btn wb-btn-ghost'],
-                    ['DEFER', '暂缓', 'info', 'wb-btn wb-btn-ghost']
+                    ['KEEP_SEPARATE', '保留为独立主体', 'shield', 'wb-btn wb-btn-outline'],
+                    ['MERGE', '确认关联', 'link2', 'wb-btn wb-btn-primary']
                 ].forEach(([decision, label, icon, cls]) => {
                     const btn = this._iconBtn(cls, icon, label);
                     btn.addEventListener('click', () => {
-                        this._showEntityDecisionForm(detailBody, selected, decision, label, version);
+                        this._showEntityDecisionForm(overviewBody, selected, decision, label, version);
                     });
-                    actions.appendChild(btn);
+                    overviewActions.appendChild(btn);
                 });
-                detailBody.appendChild(actions);
-            } else if (selected.decision && selected.decision !== 'PENDING') {
-                detailBody.appendChild(Utils.create('div', {
+            }
+            overviewHead.appendChild(overviewActions);
+            overview.appendChild(overviewHead);
+
+            const overviewBody = Utils.create('div', { class: 'wb-detail-card-body' });
+            const impact = selected.impact || {};
+            const caseCount = impact.case_count || (selected.cases || []).length || 0;
+            const relationCount = impact.relation_count || 0;
+            const clueCount = impact.clue_count || (selected.generated_clues || []).length || 0;
+            overviewBody.appendChild(Utils.create('div', { class: 'wb-entity-metrics' }, [
+                this._metric('涉及案件', caseCount),
+                this._metric('受影响关联', relationCount),
+                this._metric('生成线索', clueCount)
+            ]));
+            if (selected.agent_summary) {
+                overviewBody.appendChild(Utils.create('div', { class: 'wb-agent-summary' }, [
+                    Utils.create('span', { class: 'wb-agent-summary-label', text: 'Agent 复核：' }),
+                    Utils.create('span', { text: selected.agent_summary })
+                ]));
+            }
+            if ((selected.decision || 'PENDING') !== 'PENDING') {
+                overviewBody.appendChild(Utils.create('div', {
                     class: 'wb-file-meta',
                     text: `已记录：${selected.decision} · ${selected.reason || ''}`
                 }));
             }
-            detail.appendChild(detailBody);
+            overview.appendChild(overviewBody);
+            detail.appendChild(overview);
+
+            // 模块二：字段 × 案件矩阵。即使字段未记载也明确展示“未记载”。
+            const compareCard = Utils.create('section', { class: 'wb-detail-card wb-entity-section-card' });
+            compareCard.appendChild(Utils.create('div', { class: 'wb-detail-card-head' }, [
+                Utils.create('div', { class: 'wb-entity-title', text: '字段对照与差异说明' })
+            ]));
+            const compareBody = Utils.create('div', { class: 'wb-detail-card-body wb-compare-body' });
+            const compareCases = selected.cases || [];
+            const fields = selected.field_compare || [];
+            const compareTable = Utils.create('div', { class: 'wb-compare-table' });
+            const columns = `150px repeat(${Math.max(compareCases.length, 1)}, minmax(150px, 1fr))`;
+            const tableHead = Utils.create('div', { class: 'wb-compare-row wb-compare-head' });
+            tableHead.style.gridTemplateColumns = columns;
+            tableHead.appendChild(Utils.create('div', { text: '字段' }));
+            compareCases.forEach((caseItem, index) => {
+                tableHead.appendChild(Utils.create('div', {
+                    text: `来源 ${String.fromCharCode(65 + index)}${caseItem.case_name ? ` · ${caseItem.case_name}` : ''}`
+                }));
+            });
+            compareTable.appendChild(tableHead);
+            fields.forEach((field) => {
+                const row = Utils.create('div', { class: 'wb-compare-row' });
+                row.style.gridTemplateColumns = columns;
+                row.appendChild(Utils.create('div', {
+                    class: 'wb-compare-field-name',
+                    text: field.label || field.field_key || '字段'
+                }));
+                compareCases.forEach((caseItem) => {
+                    const value = (field.per_case || []).find((item) => item.case_id === caseItem.case_id) || {};
+                    const state = !value.value || value.status === 'missing'
+                        ? 'missing'
+                        : (value.status === 'diff' ? 'diff' : 'same');
+                    const stateLabel = { same: '一致', diff: '不一致', missing: '未记载' }[state];
+                    row.appendChild(Utils.create('div', { class: 'wb-compare-cell' }, [
+                        Utils.create('span', { class: `wb-compare-status ${state}`, text: stateLabel }),
+                        Utils.create('span', { class: state === 'missing' ? 'wb-match-na' : '', text: value.value || '未记载' })
+                    ]));
+                });
+                compareTable.appendChild(row);
+            });
+            compareBody.appendChild(compareTable);
+            if ((selected.supporting_facts || []).length || (selected.conflicts || []).length) {
+                const explanation = Utils.create('div', { class: 'wb-compare-explanation' });
+                (selected.supporting_facts || []).forEach((fact) => {
+                    explanation.appendChild(Utils.create('span', { class: 'wb-match-ok', text: `一致：${fact}` }));
+                });
+                (selected.conflicts || []).forEach((fact) => {
+                    explanation.appendChild(Utils.create('span', { class: 'wb-match-bad', text: `差异：${fact}` }));
+                });
+                compareBody.appendChild(explanation);
+            }
+            compareCard.appendChild(compareBody);
+            detail.appendChild(compareCard);
+
+            // 模块三：每案关键原文，可回链打开原材料。
+            const evidenceCard = Utils.create('section', { class: 'wb-detail-card wb-entity-section-card' });
+            evidenceCard.appendChild(Utils.create('div', { class: 'wb-detail-card-head' }, [
+                Utils.create('div', { class: 'wb-entity-title', text: '依据材料与原文片段' })
+            ]));
+            const evidenceBody = Utils.create('div', { class: 'wb-detail-card-body wb-evidence-list' });
+            const evidence = selected.evidence || [];
+            const records = selected.records || [];
+            const evidenceList = evidence.length ? evidence : records.map((rec) => ({
+                case_name: rec.case_name,
+                case_id: rec.case_id,
+                filename: (rec.source || {}).document_name,
+                page_start: (rec.source || {}).page_no,
+                quote: (rec.source || {}).quote,
+                quote_hash: (rec.source || {}).quote_hash,
+                chunk_id: (rec.source || {}).chunk_id,
+                document_version_id: (rec.source || {}).document_version_id,
+                value: rec.value
+            }));
+            const showAllEvidence = this.expandedEntityEvidenceId === selected.candidate_id;
+            evidenceList.slice(0, showAllEvidence ? 99 : 4).forEach((ev) => {
+                const row = Utils.create('article', { class: 'wb-evidence-card' }, [
+                    Utils.create('div', { class: 'wb-evidence-card-head' }, [
+                        Utils.create('strong', { text: ev.case_name || ev.case_id || '案件材料' }),
+                        Utils.create('span', {
+                            class: 'wb-evidence-page',
+                            text: ev.page_start ? `第 ${ev.page_start} 页` : '已定位'
+                        })
+                    ]),
+                    Utils.create('blockquote', { text: `“${(ev.quote || ev.value || '脱敏片段').slice(0, 180)}”` }),
+                    Utils.create('div', { class: 'wb-evidence-card-foot' }, [
+                        Utils.create('span', { text: ev.filename || '材料原文' }),
+                        Utils.create('span', { class: 'wb-open-source', text: ev.chunk_id && ev.quote_hash ? '打开原文 ↗' : '待补定位' })
+                    ])
+                ]);
+                if (ev.chunk_id && ev.quote_hash) {
+                    row.classList.add('clickable');
+                    row.addEventListener('click', () => this._openCitation(ev));
+                }
+                evidenceBody.appendChild(row);
+            });
+            if (!evidenceList.length) {
+                evidenceBody.appendChild(Utils.create('div', { class: 'wb-empty', text: '暂无可回链原文，本候选不应确认关联。' }));
+            }
+            if (evidenceList.length > 4 && !showAllEvidence) {
+                const more = this._iconBtn('wb-btn wb-btn-ghost', 'chevronDown', `展开全部 ${evidenceList.length} 条`);
+                more.addEventListener('click', () => {
+                    this.expandedEntityEvidenceId = selected.candidate_id;
+                    this._renderCurrentView();
+                });
+                evidenceBody.appendChild(more);
+            }
+            evidenceCard.appendChild(evidenceBody);
+            detail.appendChild(evidenceCard);
             split.appendChild(detail);
             root.appendChild(split);
         },

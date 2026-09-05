@@ -89,6 +89,82 @@ def refresh_task_materials(task_id: str, user_id: str | None = None) -> str:
         return _tool_json(exc.to_dict())
 
 
+def delete_task_material(
+    task_id: str,
+    document_id: str | None = None,
+    filename: str | None = None,
+    user_id: str | None = None,
+) -> str:
+    """删除任务范围内的材料。可按 document_id，或按文件名关键词匹配后删除。
+
+    用户在对话中说「删掉某某材料」时应先 get_task_overview / 核对文件名，再调用本工具。
+    匹配到多份时不直接删，返回候选清单请用户确认。
+    """
+    try:
+        service = get_task_service()
+        uid = user_id or "system"
+        resolved_id = (document_id or "").strip() or None
+        keyword = (filename or "").strip() or None
+
+        if not resolved_id and not keyword:
+            return _tool_json(
+                {
+                    "ok": False,
+                    "message": "请提供 document_id，或提供 filename（文件名关键词）",
+                }
+            )
+
+        if not resolved_id and keyword:
+            overview = service.material_overview(task_id, user_id=uid)
+            matches = []
+            for group in overview.get("groups") or []:
+                for item in group.get("materials") or []:
+                    name = item.get("filename") or ""
+                    if item.get("status") == "DELETED":
+                        continue
+                    if keyword in name or name == keyword:
+                        matches.append(
+                            {
+                                "document_id": item.get("document_id"),
+                                "filename": name,
+                                "case_id": group.get("case_id"),
+                                "case_name": group.get("case_name"),
+                                "status": item.get("status"),
+                            }
+                        )
+            if not matches:
+                return _tool_json(
+                    {
+                        "ok": False,
+                        "message": f"未找到文件名包含「{keyword}」的材料",
+                        "hint": "可先调用 get_task_overview 查看 materials",
+                    }
+                )
+            if len(matches) > 1:
+                return _tool_json(
+                    {
+                        "ok": False,
+                        "need_confirm": True,
+                        "message": f"匹配到 {len(matches)} 份材料，请指定 document_id 后再删",
+                        "candidates": matches,
+                    }
+                )
+            resolved_id = matches[0]["document_id"]
+
+        result = service.remove_material(task_id, resolved_id, user_id=uid)
+        return _tool_json(
+            {
+                "ok": True,
+                "message": "材料已删除",
+                "document_id": result.get("document_id") or resolved_id,
+                "batch_artifact_id": result.get("batch_artifact_id"),
+                "status": result.get("status"),
+            }
+        )
+    except TaskError as exc:
+        return _tool_json(exc.to_dict())
+
+
 def run_task_collision(task_id: str, user_id: str | None = None) -> str:
     """对任务范围内材料执行强标识确定性碰撞，写入实体候选产物。"""
     try:

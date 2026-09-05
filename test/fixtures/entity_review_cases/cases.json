@@ -1,0 +1,84 @@
+{
+  "cases": [
+    {
+      "id": "same_account_cross_case",
+      "expect_candidates": 1,
+      "expect_types": ["BANK_ACCOUNT"],
+      "mentions": [
+        {"object_type": "ACCOUNT", "surface": "6222021234567890128", "case_id": "A", "chunk_id": "a1"},
+        {"object_type": "ACCOUNT", "surface": "6222021234567890128", "case_id": "B", "chunk_id": "b1"}
+      ]
+    },
+    {
+      "id": "tail_only_no_match",
+      "expect_candidates": 0,
+      "mentions": [
+        {"object_type": "ACCOUNT", "surface": "尾号1234", "case_id": "A", "chunk_id": "a1", "masked": true},
+        {"object_type": "ACCOUNT", "surface": "尾号1234", "case_id": "B", "chunk_id": "b1", "masked": true}
+      ]
+    },
+    {
+      "id": "same_name_different_person",
+      "expect_candidates": 0,
+      "mentions": [
+        {"object_type": "NAME", "surface": "赵敏", "case_id": "A", "chunk_id": "a1"},
+        {"object_type": "NAME", "surface": "赵敏", "case_id": "B", "chunk_id": "b1"}
+      ]
+    },
+    {
+      "id": "name_variant_same_id",
+      "expect_candidates": 1,
+      "expect_types": ["PERSON"],
+      "mentions": [
+        {"object_type": "NAME", "surface": "赵敏", "case_id": "A", "chunk_id": "a1"},
+        {"object_type": "ID_CARD", "surface": "110101199001011234", "case_id": "A", "chunk_id": "a2"},
+        {"object_type": "NAME", "surface": "赵敏", "case_id": "B", "chunk_id": "b1"},
+        {"object_type": "PHONE", "surface": "13812345678", "case_id": "B", "chunk_id": "b2"}
+      ]
+    },
+    {
+      "id": "same_company_different_entity",
+      "expect_candidates": 0,
+      "mentions": [
+        {"object_type": "ORGANIZATION", "surface": "星河科技有限公司", "case_id": "A", "chunk_id": "a1"},
+        {"object_type": "ORGANIZATION", "surface": "星河科技有限公司", "case_id": "B", "chunk_id": "b1"}
+      ]
+    },
+    {
+      "id": "merchant_id_same_name_diff",
+      "expect_candidates": 1,
+      "expect_types": ["MERCHANT"],
+      "mentions": [
+        {"object_type": "MERCHANT", "surface": "MCH10086ABC", "case_id": "A", "chunk_id": "a1"},
+        {"object_type": "MERCHANT", "surface": "MCH10086ABC", "case_id": "B", "chunk_id": "b1"}
+      ]
+    },
+    {
+      "id": "phone_account_cross",
+      "expect_candidates": 2,
+      "mentions": [
+        {"object_type": "PHONE", "surface": "13812345678", "case_id": "A", "chunk_id": "a1"},
+        {"object_type": "PHONE", "surface": "13812345678", "case_id": "B", "chunk_id": "b1"},
+        {"object_type": "ACCOUNT", "surface": "6222021234567890128", "case_id": "A", "chunk_id": "a2"},
+        {"object_type": "ACCOUNT", "surface": "6222021234567890128", "case_id": "B", "chunk_id": "b2"}
+      ]
+    },
+    {
+      "id": "duplicate_in_same_material",
+      "expect_candidates": 1,
+      "mentions": [
+        {"object_type": "PHONE", "surface": "13900001111", "case_id": "A", "chunk_id": "a1"},
+        {"object_type": "PHONE", "surface": "13900001111", "case_id": "A", "chunk_id": "a1"},
+        {"object_type": "PHONE", "surface": "13900001111", "case_id": "B", "chunk_id": "b1"}
+      ]
+    },
+    {
+      "id": "missing_quote_hash",
+      "expect_candidates": 0,
+      "mentions": [
+        {"object_type": "PHONE", "surface": "13700001111", "case_id": "A", "chunk_id": "a1"},
+        {"object_type": "PHONE", "surface": "13700001111", "case_id": "B", "chunk_id": "b1", "drop_hash": true}
+      ]
+    }
+  ]
+}

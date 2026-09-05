@@ -280,6 +280,27 @@
   {
     "type": "function",
     "function": {
+      "name": "delete_task_material",
+      "description": "删除当前监督分析任务范围内的一份电子卷宗材料。用户说「删掉某份材料/去掉某某笔录」时使用。优先传 document_id；若只有文件名，可传 filename 关键词匹配。匹配到多份时会返回候选清单，需再用 document_id 确认删除。删除后下游分析产物会标记过期。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "document_id": {
+            "type": "string",
+            "description": "材料 document_id（精确删除时优先）"
+          },
+          "filename": {
+            "type": "string",
+            "description": "文件名或文件名关键词，例如「讯问笔录」「银行流水」"
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "run_task_collision",
       "description": "对任务范围内已解析材料执行强标识确定性碰撞，生成实体候选产物（ENTITY_CANDIDATE_SET）。",
       "parameters": {
@@ -362,6 +383,114 @@
           }
         },
         "required": ["artifact_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_entity_candidates",
+      "description": "列出跨案实体候选摘要。默认仅返回待核（PENDING）对象，避免一次读入全部产物。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "decision": {"type": "string", "description": "过滤决策状态，默认 PENDING"},
+          "entity_type": {"type": "string", "description": "可选实体类型过滤"},
+          "limit": {"type": "integer", "description": "最多返回条数，默认 30"}
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_entity_candidate_context",
+      "description": "读取单个实体候选的复核上下文：类型、案件、字段对照、证据与影响统计。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "candidate_id": {"type": "string", "description": "候选 ID"}
+        },
+        "required": ["candidate_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "compare_candidate_fields",
+      "description": "返回指定候选的逐字段跨案对照表。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "candidate_id": {"type": "string"}
+        },
+        "required": ["candidate_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "search_candidate_evidence",
+      "description": "返回候选的脱敏原文证据片段及定位信息。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "candidate_id": {"type": "string"},
+          "limit": {"type": "integer"}
+        },
+        "required": ["candidate_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_candidate_relations",
+      "description": "列出候选关联线索与影响统计。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "candidate_id": {"type": "string"}
+        },
+        "required": ["candidate_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "validate_candidate_evidence",
+      "description": "服务端校验 chunk+quote+quote_hash 是否真实可回链。提出建议前必须调用。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "chunk_id": {"type": "string"},
+          "document_version_id": {"type": "string"},
+          "quote": {"type": "string"},
+          "quote_hash_value": {"type": "string", "description": "quote 的 SHA-256 哈希"}
+        },
+        "required": ["chunk_id", "document_version_id", "quote", "quote_hash_value"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "propose_entity_review",
+      "description": "写入 AI 实体复核建议（不改变人工 decision）。suggestion 须含 recommendation、agent_summary，证据须已通过 validate_candidate_evidence。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "candidate_id": {"type": "string"},
+          "suggestion": {
+            "type": "object",
+            "description": "结构化建议：recommendation、agent_summary、supporting_facts、conflicts、missing_fields、field_compare、evidence"
+          }
+        },
+        "required": ["candidate_id", "suggestion"]
       }
     }
   }
