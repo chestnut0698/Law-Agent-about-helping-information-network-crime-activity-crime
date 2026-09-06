@@ -28,8 +28,8 @@ from app.files import (
     _COMPOUND_SURNAMES,
 )
 
-EXTRACTOR_VERSION = "stage7-fuzzy-v2"
-EVENT_EXTRACTOR_VERSION = "stage5-event-v1"
+EXTRACTOR_VERSION = "stage9-quote-v1"
+EVENT_EXTRACTOR_VERSION = "stage6-party-v2"
 STRONG_TYPES = ("PHONE", "ACCOUNT", "DEVICE", "ID_CARD", "NAME", "ORGANIZATION", "MERCHANT", "IP")
 RULE_TYPE_MAP = {
     "ACCOUNT": "R001",
@@ -294,8 +294,8 @@ def _mask_collide_ok(object_type: str, normalized: str) -> bool:
         # 前三后四：至少 7 位可见数字，且以 1 开头
         return len(digits) >= 7 and normalized.startswith("1") and normalized.endswith(digits[-4:])
     if object_type == "ACCOUNT":
-        # 前四后四或总可见位≥6
-        return len(digits) >= 6
+        # 前四后四可见位不足时会拼出假「8 位卡号」；至少 10 位可见数字
+        return len(digits) >= 10
     return False
 
 
@@ -321,34 +321,221 @@ def public_surface(surface_raw: str, object_type: str | None = None) -> str:
             return f"{parts[0]}.{parts[1]}.*.*"
     return text
 
-def redacted_quote(chunk: dict[str, Any], start: int, end: int) -> tuple[str, str]:
-    """从整段脱敏文本中切窗口，避免窗口重脱敏导致占位符序号错位。
+_QUOTE_BREAK_RE = re.compile(r"[。！？；\n]")
+_PLACEHOLDER_IN_TEXT_RE = re.compile(
+    r"(?:PERSON|NAME|PHONE|ACCOUNT|ID|ORG|ORGANIZATION|DEVICE|BANK_CARD|CREDIT_CARD)_[a-f0-9]{8}",
+    re.I,
+)
 
-    前提：chunk 中必须已包含 'text_redacted' 和 '_hits' 字段，
-          这些由上层预处理（extract_task_mentions）在事务外填充。
-    """
-    target = chunk.get("text_redacted")
+
+def _anchor_positions(text: str, anchors: list[str]) -> list[tuple[int, int, str]]:
+    """在脱敏正文中定位所有可用锚点（实体字面值或占位符）。"""
+    found: list[tuple[int, int, str]] = []
+    seen: set[tuple[int, int]] = set()
+    for anchor in anchors:
+        token = (anchor or "").strip()
+        if len(token) < 2:
+            continue
+        start = 0
+        while True:
+            idx = text.find(token, start)
+            if idx < 0:
+                break
+            key = (idx, idx + len(token))
+            if key not in seen:
+                seen.add(key)
+                found.append((idx, idx + len(token), token))
+            start = idx + max(1, len(token))
+    return found
+
+
+def _expand_quote_window(
+    text: str,
+    anchor_start: int,
+    anchor_end: int,
+    *,
+    min_side: int = 48,
+    max_total: int = 180,
+) -> str:
+    """以锚点为中心扩到整句，保证可读上下文且总长受控。"""
+    n = len(text)
+    lo = anchor_start
+    hi = anchor_end
+    # 向左扩到句读或至少 min_side
+    left_limit = max(0, anchor_start - min_side)
+    left_break = -1
+    for match in _QUOTE_BREAK_RE.finditer(text, 0, anchor_start):
+        left_break = match.end()
+    if left_break >= 0 and left_break <= anchor_start:
+        lo = min(left_break, left_limit) if left_break > left_limit else left_break
+    else:
+        lo = left_limit
+    # 向右扩
+    right_limit = min(n, anchor_end + min_side)
+    right_break = -1
+    match = _QUOTE_BREAK_RE.search(text, anchor_end)
+    if match:
+        right_break = match.end()
+    if right_break >= 0 and right_break >= anchor_end:
+        hi = max(right_break, right_limit) if right_break < right_limit else right_break
+    else:
+        hi = right_limit
+    # 过短则继续居中扩展；过长则裁切但保住锚点
+    while hi - lo < min(max_total, n) and (lo > 0 or hi < n):
+        if lo > 0:
+            lo -= 1
+        if hi - lo >= max_total:
+            break
+        if hi < n:
+            hi += 1
+        if hi - lo >= max_total:
+            break
+    if hi - lo > max_total:
+        # 锚点尽量落在窗口中部偏左
+        room = max_total - (anchor_end - anchor_start)
+        left_room = min(anchor_start - lo, max(24, room // 3))
+        lo = max(0, anchor_start - left_room)
+        hi = min(n, lo + max_total)
+        if hi < anchor_end:
+            hi = min(n, anchor_end + 8)
+            lo = max(0, hi - max_total)
+    snippet = text[lo:hi].strip("\n")
+    return snippet
+
+
+def _quote_covers_surface(quote: str, surface: str) -> bool:
+    """窗口是否覆盖该实体（字面值或对应占位符）。"""
+    if not surface:
+        return True
+    if not quote:
+        return False
+    if surface in quote:
+        return True
+    if _PLACEHOLDER_IN_TEXT_RE.fullmatch(surface):
+        return surface in quote
+    try:
+        originals = get_global_mapper().original_map() or {}
+        for anon_id, original in originals.items():
+            if not anon_id or not original:
+                continue
+            if original == surface and anon_id in quote:
+                return True
+            if len(surface) >= 3 and (
+                original.startswith(surface) or surface.startswith(original)
+            ) and anon_id in quote:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def locate_quote_in_text(
+    text: str,
+    *,
+    surface: str | None = None,
+    preferred_start: int | None = None,
+    extra_anchors: list[str] | None = None,
+) -> str:
+    """在脱敏正文中定位实体并切出可回链原文窗口；找不到则返回空串。"""
+    target = text or ""
     if not target:
-        # 容错：如果没有预脱敏，则直接返回原始文本片段
-        raw = chunk.get("text_raw") or ""
-        snippet = raw[start:end]
-        return snippet, quote_hash(snippet)
+        return ""
+    anchors: list[str] = []
+    surface = (surface or "").strip()
+    if surface:
+        anchors.append(surface)
+    for item in extra_anchors or []:
+        if item and item not in anchors:
+            anchors.append(item)
+    # 人名等已被替换为占位符时，用原文→占位符反查
+    if surface and not _PLACEHOLDER_IN_TEXT_RE.fullmatch(surface):
+        try:
+            originals = get_global_mapper().original_map() or {}
+            for anon_id, original in originals.items():
+                if not anon_id or not original:
+                    continue
+                # 只做精确/近似全名匹配，避免短姓氏误挂到别人的占位符
+                if original == surface:
+                    anchors.append(anon_id)
+                elif len(surface) >= 3 and (
+                    original.startswith(surface) or surface.startswith(original)
+                ):
+                    anchors.append(anon_id)
+        except Exception:
+            pass
+    # 去重且保序
+    deduped: list[str] = []
+    for token in anchors:
+        if token and token not in deduped:
+            deduped.append(token)
+    anchors = deduped
+    positions = _anchor_positions(target, anchors)
+    if not positions:
+        return ""
+    # 优先选「字面 surface」命中；占位符仅作回退
+    preferred_positions = (
+        [item for item in positions if item[2] == surface] if surface else []
+    ) or positions
+    if preferred_start is None:
+        anchor_start, anchor_end, _ = preferred_positions[0]
+    else:
+        anchor_start, anchor_end, _ = min(
+            preferred_positions, key=lambda item: abs(item[0] - preferred_start)
+        )
+    snippet = _expand_quote_window(target, anchor_start, anchor_end)
+    if not _quote_covers_surface(snippet, surface):
+        # 扩窗后仍看不到实体，退回「锚点±最小上下文」再试一次
+        loose = target[max(0, anchor_start - 48) : min(len(target), anchor_end + 48)]
+        if _quote_covers_surface(loose, surface):
+            snippet = loose.strip("\n")
+        else:
+            return ""
+    if len(snippet.strip()) < 4:
+        return ""
+    return snippet
 
-    # 优先尝试精确匹配占位符（根据 start/end）
+
+def redacted_quote(
+    chunk: dict[str, Any],
+    start: int,
+    end: int,
+    *,
+    surface: str | None = None,
+) -> tuple[str, str]:
+    """从脱敏正文定位实体并切可回链窗口。
+
+    禁止用 text_raw 坐标硬切 text_redacted（脱敏后坐标会漂移，会切出「问：取过什么」这类噪声）。
+    """
+    target = chunk.get("text_redacted") or ""
+    raw = chunk.get("text_raw") or ""
+    surface = (surface or "").strip() or (raw[start:end] if raw and start < end <= len(raw) else "")
+    # 命中本身已是占位符时，直接当锚点
+    extra: list[str] = []
     hits = chunk.get("_hits") or []
     for hit in hits:
-        if hit.start == start and hit.end == end:
-            placeholder = hit.placeholder
-            idx = target.find(placeholder)
-            if idx != -1:
-                lo = max(0, idx - 16)
-                hi = min(len(target), idx + len(placeholder) + 16)
-                snippet = target[lo:hi]
+        try:
+            if int(getattr(hit, "start", -1)) == start and int(getattr(hit, "end", -1)) == end:
+                placeholder = getattr(hit, "placeholder", None)
+                if placeholder:
+                    extra.append(str(placeholder))
+        except Exception:
+            continue
+    if target:
+        snippet = locate_quote_in_text(
+            target,
+            surface=surface,
+            preferred_start=start,
+            extra_anchors=extra,
+        )
+        if snippet:
                 return snippet, quote_hash(snippet)
-
-    # 没有精确匹配，直接截取脱敏文本中的对应区间
-    snippet = target[start:end]
+        return "", ""
+    # 无脱敏正文时退回 raw（仍按实体定位，不用裸切片）
+    if raw and surface:
+        snippet = locate_quote_in_text(raw, surface=surface, preferred_start=start)
+        if snippet:
     return snippet, quote_hash(snippet)
+    return "", ""
 
 
 def is_excluded(object_type: str, normalized: str, exclusions: dict[str, Any]) -> bool:
@@ -450,12 +637,76 @@ _COMPOUND_SURNAME_SET = frozenset(_COMPOUND_SURNAMES)
 _PERSON_RIGHT_STOP = frozenset(
     "于在向对把将从与和及的了着过来说道讲问答称供辩述到案犯所部庭级记诉判书曾又再则即并或而由用拿借凭"
 )
+# 「赵瑞/明知」「赵某陈述」类：法律常用词不可吞进姓名（多字优先匹配）
+_LEGAL_PERSON_RIGHT_TOKENS = (
+    "明知",
+    "应知",
+    "得知",
+    "涉嫌",
+    "供认",
+    "供述",
+    "陈述",
+    "辩称",
+    "表示",
+    "承认",
+    "否认",
+    "不如实",
+    "拒不",
+    "依法",
+    "予以",
+    "被依法",
+    "称其",
+    "说到",
+)
+_PERSON_INLINE_SEPS = frozenset("/／\\｜|")
+# 时间线主体视角允许的 party 类型
+_TIMELINE_PARTY_TYPES = frozenset(
+    {"NAME", "ACCOUNT", "PHONE", "DEVICE", "ORGANIZATION", "MERCHANT"}
+)
+
+
+def _legal_token_at(source: str, pos: int) -> str | None:
+    if pos < 0 or pos >= len(source):
+        return None
+    for tok in _LEGAL_PERSON_RIGHT_TOKENS:
+        if source.startswith(tok, pos):
+            return tok
+    return None
+
+
+def _clamp_person_span(source: str, start: int, end: int) -> tuple[int, int]:
+    """裁掉斜线右侧与法律词重叠：赵瑞/明知、赵瑞明知 → 赵瑞。"""
+    if start < 0 or end <= start or end > len(source):
+        return start, end
+    for i in range(start, end):
+        if source[i] in _PERSON_INLINE_SEPS:
+            end = i
+            break
+    if end <= start:
+        return start, start
+    for tok in _LEGAL_PERSON_RIGHT_TOKENS:
+        # 含完整后缀：overlap 必须到 len(tok)（旧 range 漏掉整词裁切，如「赵某陈述」）
+        for overlap in range(1, len(tok) + 1):
+            cut = end - overlap
+            if cut < start:
+                break
+            if source.startswith(tok, cut):
+                end = cut
+                break
+        if end <= start:
+            return start, start
+    while end > start and source[end - 1] in _PERSON_INLINE_SEPS:
+        end -= 1
+    return start, end
 
 
 def _extend_person_span(source: str, start: int, end: int) -> tuple[int, int]:
     """补全 spaCy 残缺人名：裸姓向右并入；两字名若左侧是姓且贴角色边界则向左并入一字。"""
     if start < 0 or end <= start or end > len(source):
         return start, end
+    start, end = _clamp_person_span(source, start, end)
+    if end <= start:
+        return start, start
     span = source[start:end]
 
     def _is_cjk(ch: str) -> bool:
@@ -464,7 +715,7 @@ def _extend_person_span(source: str, start: int, end: int) -> tuple[int, int]:
     bare_single = len(span) == 1 and span in _COMMON_SURNAMES
     bare_compound = len(span) == 2 and span in _COMPOUND_SURNAME_SET
     if bare_single or bare_compound:
-        # 单姓最多 3 字、复姓最多 4 字；遇右侧停字立即停
+        # 单姓最多 3 字、复姓最多 4 字；遇右侧停字/法律词立即停
         max_len = 4 if bare_compound else 3
         while (
             end < len(source)
@@ -472,9 +723,11 @@ def _extend_person_span(source: str, start: int, end: int) -> tuple[int, int]:
             and _is_cjk(source[end])
             and source[end] not in _BAD_PERSON_SUFFIX
             and source[end] not in _PERSON_RIGHT_STOP
+            and source[end] not in _PERSON_INLINE_SEPS
+            and not _legal_token_at(source, end)
         ):
             end += 1
-        return start, end
+        return _clamp_person_span(source, start, end)
 
     # 「博元」←「侯」：仅当左侧一字是单姓，且再左侧不是姓名续写
     if len(span) == 2 and start > 0 and _is_cjk(source[start - 1]):
@@ -485,7 +738,7 @@ def _extend_person_span(source: str, start: int, end: int) -> tuple[int, int]:
             )
             if boundary_ok and (end - (start - 1)) <= 4:
                 start -= 1
-    return start, end
+    return _clamp_person_span(source, start, end)
 
 
 def _person_surface_ok(raw: str, exclusions: dict[str, Any]) -> bool:
@@ -495,6 +748,11 @@ def _person_surface_ok(raw: str, exclusions: dict[str, Any]) -> bool:
         return False
     if raw[-1] in _BAD_PERSON_SUFFIX:
         return False
+    if any(sep in raw for sep in _PERSON_INLINE_SEPS):
+        return False
+    for tok in _LEGAL_PERSON_RIGHT_TOKENS:
+        if raw.endswith(tok):
+            return False
     # 「某某案」「审讯」类非人名
     if raw.endswith(("公司", "银行", "公安", "法院", "检察院")):
         return False
@@ -597,6 +855,8 @@ def extract_rule_mentions(text: str, mapper: GlobalEntityMapper | None = None) -
             extended_persons = []
             for r in person_only:
                 s, e = _extend_person_span(source, r.start, r.end)
+                if e <= s:
+            continue
                 extended_persons.append(
                     RecognizerResult(
                         entity_type="PERSON",
@@ -605,16 +865,33 @@ def extract_rule_mentions(text: str, mapper: GlobalEntityMapper | None = None) -
                         score=float(r.score),
                     )
                 )
-            person_only = merge_person_spans(
-                source, sorted(extended_persons, key=lambda r: (r.start, r.end))
-            )
+            if extended_persons:
+                person_only = merge_person_spans(
+                    source, sorted(extended_persons, key=lambda r: (r.start, r.end))
+                )
+                clamped = []
+                for r in person_only:
+                    s, e = _clamp_person_span(source, r.start, r.end)
+                    if e - s < 2:
+            continue
+                    clamped.append(
+                        RecognizerResult(
+                            entity_type="PERSON",
+                            start=s,
+                            end=e,
+                            score=float(r.score),
+                        )
+                    )
+                person_only = clamped
+            else:
+                person_only = []
         results = list(person_only) + list(other_results)
 
         # 高分优先，避免重叠切片互相抢占
         for result in sorted(results, key=lambda r: (-float(r.score), r.start, -(r.end - r.start))):
             object_type = _ANALYZER_TYPE_MAP.get(result.entity_type)
             if not object_type:
-                continue
+            continue
             start, end = result.start, result.end
             raw = source[start:end].strip()
             if not raw or not take(start, end):
@@ -645,7 +922,7 @@ def extract_rule_mentions(text: str, mapper: GlobalEntityMapper | None = None) -
                         raw = trimmed
                         if not take(start, end):
                             continue
-                    else:
+        else:
                         raw = trimmed
                 if not _org_surface_ok(raw, exclusions):
                     occupied.pop()
@@ -699,14 +976,14 @@ def extract_rule_mentions(text: str, mapper: GlobalEntityMapper | None = None) -
                     continue
                 if not luhn_ok(digits):
                     hit = _mention_hit("ACCOUNT", raw, start, end, producer="PRESIDIO")
-                    hit["normalized_value"] = ""
-                    hit["mask_info"] = {
-                        "masked": True,
-                        "positions": list(range(len(raw))),
-                        "kind": "luhn_failed",
-                    }
-                    hit["possible_forms"] = []
-                    found.append(hit)
+            hit["normalized_value"] = ""
+            hit["mask_info"] = {
+                "masked": True,
+                "positions": list(range(len(raw))),
+                "kind": "luhn_failed",
+            }
+            hit["possible_forms"] = []
+            found.append(hit)
                     continue
             elif object_type == "ID_CARD":
                 if not id_card_ok(raw):
@@ -737,8 +1014,8 @@ def extract_rule_mentions(text: str, mapper: GlobalEntityMapper | None = None) -
                         "positions": [i for i, ch in enumerate(raw) if ch in "*＊xX×ｘ"],
                         "kind": "phone_mask",
                     }
-                    hit["possible_forms"] = []
-                    found.append(hit)
+            hit["possible_forms"] = []
+            found.append(hit)
                     continue
             elif object_type == "MERCHANT":
                 m = re.search(r"([A-Za-z0-9_-]{6,32})\s*$", raw)
@@ -766,14 +1043,14 @@ def extract_rule_mentions(text: str, mapper: GlobalEntityMapper | None = None) -
         if not take(match.start(0), match.end(0)):
             continue
         hit = _mention_hit("NAME", raw, match.start(0), match.end(0), producer="PLACEHOLDER")
-        hit["mask_info"] = {"masked": True, "positions": list(range(len(raw))), "kind": "placeholder"}
-        hit["possible_forms"] = []
-        if mapper:
-            fp = mapper.get_fingerprint_by_anonymous_id(raw)
+            hit["mask_info"] = {"masked": True, "positions": list(range(len(raw))), "kind": "placeholder"}
+            hit["possible_forms"] = []
+            if mapper:
+                fp = mapper.get_fingerprint_by_anonymous_id(raw)
             hit["normalized_value"] = fp or ""
-        else:
-            hit["normalized_value"] = ""
-        found.append(hit)
+            else:
+                hit["normalized_value"] = ""
+            found.append(hit)
 
     return _drop_nested_person_mentions(found)
 
@@ -826,18 +1103,105 @@ def _event_channel(sentence: str) -> str:
     return ""
 
 
-def _event_parties(sentence: str) -> list[str]:
-    parties: list[str] = []
+def _party_display_label(object_type: str, surface: str, normalized: str = "") -> str:
+    value = (normalized or surface or "").strip()
+    digits = re.sub(r"\D", "", value)
+    if object_type == "PHONE":
+        return f"尾号 {digits[-4:]} 手机" if len(digits) >= 4 else (surface or "手机号码")
+    if object_type == "ACCOUNT":
+        return f"尾号 {digits[-4:]} 账户" if len(digits) >= 4 else (surface or "银行账户")
+    if object_type == "DEVICE":
+        return f"IMEI 尾号 {digits[-4:]} 设备" if len(digits) >= 4 else (surface or "电子设备")
+    if object_type in {"ORGANIZATION", "MERCHANT"}:
+        return f"“{surface}”组织" if surface else "组织主体"
+    return surface or "人物"
+
+
+def _event_parties(sentence: str) -> list[dict[str, Any]]:
+    parties: list[dict[str, Any]] = []
     for hit in extract_rule_mentions(sentence or ""):
-        if hit["object_type"] in {"ACCOUNT", "PHONE", "NAME"}:
-            parties.append(hit["surface_raw"]) # 直接使用原文
+        object_type = hit.get("object_type")
+        if object_type not in _TIMELINE_PARTY_TYPES:
+            continue
+        surface = (hit.get("surface_raw") or "").strip()
+        if not surface:
+            continue
+        if object_type == "NAME" and not _person_surface_ok(surface, load_exclusions()):
+            continue
+        normalized = (hit.get("normalized_value") or "").strip()
+        parties.append(
+            {
+                "object_type": object_type,
+                "surface": surface,
+                "normalized_value": normalized,
+                "display_name": _party_display_label(object_type, surface, normalized),
+                "subject_id": "",
+            }
+        )
     seen = set()
     deduped = []
     for item in parties:
-        if item and item not in seen:
-            seen.add(item)
+        key = (item["object_type"], item.get("normalized_value") or item["surface"])
+        if key in seen:
+            continue
+        seen.add(key)
             deduped.append(item)
-    return deduped[:4]
+    return deduped[:6]
+
+
+def empty_subject_resolve() -> dict[str, Any]:
+    return {"subjects": {}, "surface_index": {}, "keep_separate": []}
+
+
+def apply_subject_resolve(
+    parties: list[Any],
+    resolve: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """把 party（字符串或结构化）归一到 subject_id / display_name。"""
+    resolve = resolve or empty_subject_resolve()
+    surface_index = resolve.get("surface_index") or {}
+    subjects = resolve.get("subjects") or {}
+    out: list[dict[str, Any]] = []
+    for party in parties or []:
+        if isinstance(party, str):
+            surface = party.strip()
+            if not surface:
+                continue
+            obj: dict[str, Any] = {
+                "object_type": "NAME",
+                "surface": surface,
+                "normalized_value": "",
+                "display_name": surface,
+                "subject_id": "",
+            }
+        elif isinstance(party, dict):
+            surface = (party.get("surface") or party.get("display_name") or "").strip()
+            if not surface:
+                continue
+            object_type = party.get("object_type") or "NAME"
+            normalized = (party.get("normalized_value") or "").strip()
+            obj = {
+                "object_type": object_type,
+                "surface": surface,
+                "normalized_value": normalized,
+                "display_name": party.get("display_name")
+                or _party_display_label(object_type, surface, normalized),
+                "subject_id": party.get("subject_id") or "",
+            }
+        else:
+            continue
+        sid = surface_index.get(obj["surface"]) or surface_index.get(obj.get("display_name") or "")
+        if sid and sid in subjects:
+            sub = subjects[sid]
+            obj["subject_id"] = sid
+            obj["display_name"] = sub.get("display_name") or obj["display_name"]
+            if sub.get("object_type"):
+                obj["object_type"] = sub["object_type"]
+        else:
+            key_val = obj.get("normalized_value") or obj["surface"]
+            obj["subject_id"] = obj.get("subject_id") or f"auto:{obj['object_type']}:{key_val}"
+        out.append(obj)
+    return out
 
 
 def extract_event_mentions(text: str) -> list[dict[str, Any]]:
@@ -933,16 +1297,20 @@ def persist_mentions(
 ) -> int:
     inserted = 0
     now = utc_now()
-    for hit in hits:
-        if hit.get("quote_redacted") and hit.get("quote_hash"):
-            quote = hit["quote_redacted"]
-            qhash = hit["quote_hash"]
-        else:
-            quote, qhash = redacted_quote(
-                chunk,
-                int(hit["char_start"]),
-                int(hit["char_end"]),
-            )
+        for hit in hits:
+            if hit.get("quote_redacted") and hit.get("quote_hash"):
+                quote = hit["quote_redacted"]
+                qhash = hit["quote_hash"]
+            else:
+                quote, qhash = redacted_quote(
+                    chunk,
+                    int(hit["char_start"]),
+                    int(hit["char_end"]),
+                surface=str(hit.get("surface_raw") or ""),
+                )
+        # 无法在脱敏正文定位到实体的命中：仍入库供碰撞计数，但不挂可回链 quote
+        if not quote or not qhash:
+            quote, qhash = "", ""
         payload_hash = canonical_hash(
             {
                 "type": hit["object_type"],
@@ -1035,7 +1403,14 @@ def persist_events(conn, *, task_id: str, chunk: dict[str, Any], hits: list[dict
     inserted = 0
     now = utc_now()
     for hit in hits:
-        quote, qhash = redacted_quote(chunk, int(hit["char_start"]), int(hit["char_end"]))
+        quote, qhash = redacted_quote(
+            chunk,
+            int(hit["char_start"]),
+            int(hit["char_end"]),
+            surface=str(hit.get("summary_text") or hit.get("surface_raw") or ""),
+        )
+        if not quote or not qhash:
+            quote, qhash = "", ""
         payload_hash = canonical_hash(
             {
                 "event_type": hit["event_type"],
@@ -1091,6 +1466,10 @@ def extract_task_events(task_id: str, case_ids: list[str], db_path=None) -> dict
     with db_session(db_path) as conn:
         chunks = list_task_raw_chunks(conn, case_ids)
         scanned = len(chunks)
+        conn.execute(
+            "DELETE FROM event_mentions WHERE task_id = ? AND extractor_version != ?",
+            (task_id, EVENT_EXTRACTOR_VERSION),
+        )
         for chunk in chunks:
             hits = extract_event_mentions(chunk.get("text_raw") or "")
             inserted += persist_events(conn, task_id=task_id, chunk=chunk, hits=hits)
@@ -1101,16 +1480,18 @@ def extract_task_events(task_id: str, case_ids: list[str], db_path=None) -> dict
             FROM event_mentions e
             JOIN documents d ON d.id = e.document_id
             WHERE e.task_id = ?
+              AND e.extractor_version = ?
               AND d.deleted_at IS NULL
             ORDER BY
                 CASE WHEN e.time_precision = 'UNKNOWN' THEN 1 ELSE 0 END,
                 e.time_text,
                 e.created_at
             """,
-            (task_id,),
+            (task_id, EVENT_EXTRACTOR_VERSION),
         )
     public_events = []
     for item in events:
+        parties = json.loads(item.get("parties_json") or "[]")
         public_events.append(
             {
                 "event_id": item["id"],
@@ -1120,7 +1501,7 @@ def extract_task_events(task_id: str, case_ids: list[str], db_path=None) -> dict
                 "amount_text": item.get("amount_text") or "",
                 "channel": item.get("channel") or "",
                 "summary_text": item.get("summary_text") or "",
-                "parties": json.loads(item.get("parties_json") or "[]"),
+                "parties": parties,
                 "case_id": item["case_id"],
                 "document_id": item["document_id"],
                 "document_version_id": item["document_version_id"],
@@ -1336,7 +1717,7 @@ def _review_field_for_related(primary_type: str, item: dict[str, Any]) -> str | 
             "NAME": "linked_person",
         },
         "ORGANIZATION": {
-            "NAME": "legal_person",
+            # 法人只认「法定代表人/法人」标签句，不把同页所有人名塞进法人
             "PHONE": "phone",
             "ACCOUNT": "account",
         },
@@ -1414,12 +1795,317 @@ def _context_label_values(object_type: str, text: str) -> dict[str, str]:
     return values
 
 
+def _mention_source_ref(item: dict[str, Any]) -> dict[str, Any]:
+    """字段对照单元格可回链的出处（不新增库表字段，挂在 field_compare JSON）。"""
+    quote = (item.get("quote_redacted") or item.get("quote") or "").strip()
+    return {
+        "case_id": item.get("case_id") or "",
+        "filename": item.get("filename") or "",
+        "page_start": item.get("page_start"),
+        "page_end": item.get("page_end"),
+        "chunk_id": item.get("chunk_id") or "",
+        "document_version_id": item.get("document_version_id") or "",
+        "document_id": item.get("document_id") or "",
+        "quote": quote,
+        "quote_display": _review_display_value(quote)[:240],
+        "quote_hash": item.get("quote_hash") or "",
+    }
+
+
+_PLACEHOLDER_TOKEN_RE = re.compile(
+    r"(?:PERSON|NAME|PHONE|ACCOUNT|ID|ORG|ORGANIZATION|DEVICE|BANK_CARD|CREDIT_CARD)_[a-f0-9]{4,16}",
+    re.I,
+)
+_PLACEHOLDER_LOOSE_RE = re.compile(
+    r"(?:PERSON|NAME|PHONE|ACCOUNT|ID|ORG|ORGANIZATION|DEVICE|BANK_CARD|CREDIT_CARD)_[a-f0-9]{1,16}",
+    re.I,
+)
+_STORAGE_FIELD_KEYS = frozenset(
+    {
+        "quote",
+        "quote_hash",
+        "quote_storage",
+        "chunk_id",
+        "document_version_id",
+        "document_id",
+        "candidate_id",
+        "case_id",
+        "id",
+        "artifact_id",
+        "task_id",
+        "fingerprint",
+        "ref_key",
+    }
+)
+
+
+def safe_clip_storage_quote(text: str, max_len: int = 40) -> str:
+    """裁短存储态摘录时不切碎 PERSON_xxx 占位符。"""
+    raw = text or ""
+    if len(raw) <= max_len:
+        return raw
+    cut = raw[:max_len]
+    for match in _PLACEHOLDER_LOOSE_RE.finditer(raw):
+        if match.start() < max_len < match.end():
+            if match.end() - match.start() <= max_len:
+                # 占位符本身不超长：整段从占位符起取
+                start = match.start()
+                return raw[start : start + max_len] if start + max_len <= len(raw) else raw[start:match.end()]
+            # 超长则退到占位符之前
+            before = raw[: match.start()].rstrip()
+            return before[-max_len:] if len(before) > max_len else (before or cut)
+    return cut
+
+
+def _org_style_quote_snippet(text: str, term: str = "", *, max_len: int = 40) -> str:
+    """短摘录且保持为原文连续子串；避免切碎占位符。"""
+    raw = str(text or "")
+    if not raw:
+        return ""
+    if len(raw) <= max_len:
+        return raw
+    needle = str(term or "").strip()
+    if needle:
+        for wrap in (f"“{needle}”", f'"{needle}"', f"「{needle}」"):
+            at = raw.find(wrap)
+            if at >= 0:
+                return safe_clip_storage_quote(raw[at : at + max(len(wrap), max_len)], max_len)
+        idx = raw.find(needle)
+        if idx >= 0:
+            left = max(0, idx - max(0, (max_len - len(needle)) // 4))
+            right = min(len(raw), left + max_len)
+            left = max(0, right - max_len)
+            return safe_clip_storage_quote(raw[left:right], max_len)
+    return safe_clip_storage_quote(raw, max_len)
+
+
+def _review_display_value(
+    raw: str,
+    object_type: str | None = None,
+    aliases: dict[str, str] | None = None,
+) -> str:
+    """工作台展示值：占位符→化名；残留 PERSON_xxx 不落屏。"""
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    if aliases is None:
+        try:
+            aliases = get_global_mapper().alias_map()
+        except Exception:
+            aliases = {}
+    from app.files import render_display_aliases
+
+    text = render_display_aliases(text, aliases or {})
+
+    def _repl(match: re.Match[str]) -> str:
+        token = match.group(0).upper()
+        if token.startswith(("PERSON", "NAME")):
+            return "脱敏人员"
+        if token.startswith("PHONE"):
+            return "脱敏手机号"
+        if token.startswith(("ACCOUNT", "BANK_CARD", "CREDIT_CARD")):
+            return "脱敏账户"
+        if token.startswith(("ORG", "ORGANIZATION")):
+            return "脱敏组织"
+        return "脱敏标识"
+
+    # 完整与残片占位符都替换，禁止前端落屏
+    text = _PLACEHOLDER_LOOSE_RE.sub(_repl, text)
+    text = re.sub(r"[、,，]\s*(?=脱敏)", "", text)
+    text = re.sub(r"(脱敏(?:人员|手机号|账户|组织|标识))(?:[、,，]\s*\1)+", r"\1", text)
+    if object_type in {"PHONE", "ACCOUNT", "ID_CARD", "DEVICE", "IP"}:
+        return public_surface(text, object_type)
+    return text.strip("、,， ")
+
+
+def hydrate_payload_for_display(payload: Any, parent_key: str | None = None) -> Any:
+    """产物下发给前端前：存储态 quote 迁到 quote_storage；展示字段去掉 PERSON_xxx。
+
+    注意：下发后的 `quote` 改为展示态，避免界面误用；回链请用 `quote_storage` + `quote_hash`。
+    """
+    if isinstance(payload, list):
+        return [hydrate_payload_for_display(item, parent_key) for item in payload]
+    if isinstance(payload, dict):
+        out: dict[str, Any] = {}
+        for key, value in payload.items():
+            out[key] = hydrate_payload_for_display(value, parent_key=key)
+        quote = out.get("quote")
+        if isinstance(quote, str) and quote.strip():
+            storage = out.get("quote_storage")
+            if not (isinstance(storage, str) and storage.strip()):
+                # 若 quote 仍像存储态占位符，则视为存储态
+                storage = quote if _PLACEHOLDER_LOOSE_RE.search(quote) else (out.get("quote_storage") or quote)
+            # 已是展示态的旧数据：尽量保留 storage 字段
+            if not storage:
+                storage = quote
+            display = _review_display_value(out.get("quote_display") or quote)
+            out["quote_storage"] = storage if _PLACEHOLDER_LOOSE_RE.search(storage) or storage == quote else storage
+            # 若原 quote 含占位符，storage 用原 quote；display 用映射
+            if _PLACEHOLDER_LOOSE_RE.search(quote):
+                out["quote_storage"] = quote
+            out["quote_display"] = display
+            out["quote"] = display
+        return out
+    if isinstance(payload, str):
+        if parent_key in _STORAGE_FIELD_KEYS:
+            return payload
+        if parent_key == "quote_storage":
+            return payload
+        if _PLACEHOLDER_LOOSE_RE.search(payload):
+            return _review_display_value(payload)
+        return payload
+    return payload
+
+
+def canonicalize_evidence_citation(
+    *,
+    document_version_id: str,
+    chunk_id: str,
+    quote: str | None,
+    anchor_terms: list[str] | None = None,
+    db_path=None,
+    max_len: int = 80,
+) -> dict[str, Any]:
+    """线索/证据写入时：忽略模型自造 hash，按存储原文重锚并重算 hash。"""
+    with db_session(db_path) as conn:
+        row = _row(
+            conn,
+            """
+            SELECT c.id AS chunk_id, c.text_redacted, c.page_start, c.page_end,
+                   c.document_version_id, d.id AS document_id, d.filename, d.case_id
+            FROM document_chunks c
+            JOIN document_versions v ON v.id = c.document_version_id
+            JOIN documents d ON d.id = v.document_id
+            WHERE c.id = ? AND c.document_version_id = ?
+            """,
+            (chunk_id, document_version_id),
+        )
+    if not row:
+        raise ValueError("材料片段不存在或版本不匹配")
+    text = row.get("text_redacted") or ""
+    raw_quote = (quote or "").strip()
+    candidates = []
+    if raw_quote:
+        candidates.append(raw_quote)
+        # 模型常把中英文引号写错
+        candidates.append(raw_quote.replace('"', "“").replace('"', "”"))
+        candidates.append(raw_quote.replace("“", '"').replace("”", '"'))
+        candidates.append(re.sub(r"\s+", "", raw_quote))
+    located = None
+    for cand in candidates:
+        if not cand:
+            continue
+        if cand in text:
+            located = cand
+            break
+        located = whitespace_locate_quote(text, cand)
+        if located:
+            break
+    anchors = [str(a).strip() for a in (anchor_terms or []) if str(a or "").strip()]
+    if raw_quote:
+        anchors.extend(re.findall(r"[“「\"']([^”」\"']{2,40})[”」\"']", raw_quote))
+        anchors.extend(re.findall(r"[\u4e00-\u9fff]{2,12}(?:有限公司|公司|银行|账户)?", raw_quote))
+    # 去重保序
+    dedup_anchors: list[str] = []
+    for a in anchors:
+        if a and a not in dedup_anchors and len(a) >= 2:
+            dedup_anchors.append(a)
+    if not located:
+        recovered = reanchor_citation(
+            text,
+            quote=raw_quote or None,
+            expected_hash=None,
+            anchor_terms=dedup_anchors,
+        )
+        if recovered:
+            located = recovered[0]
+    if not located:
+        raise ValueError("无法在材料原文中定位该摘录，请改用材料中的连续原文")
+    if len(located) > max_len:
+        # 优先围着锚点裁短
+        term = next((a for a in dedup_anchors if a in located), "")
+        located2 = _org_style_quote_snippet(located, term, max_len=max_len)
+        if located2 and located2 in text:
+            located = located2
+        else:
+            located2 = safe_clip_storage_quote(located, max_len)
+            if located2 in text:
+                located = located2
+    return {
+        "chunk_id": row["chunk_id"],
+        "document_version_id": row["document_version_id"],
+        "document_id": row.get("document_id") or "",
+        "filename": row.get("filename") or "",
+        "case_id": row.get("case_id") or "",
+        "page_start": row.get("page_start"),
+        "page_end": row.get("page_end"),
+        "quote": located,
+        "quote_hash": quote_hash(located),
+        "quote_display": _review_display_value(located),
+    }
+
+
+def _related_mention_value_ok(object_type: str, mention: dict[str, Any]) -> bool:
+    """关联字段准入：拒绝尾号/Luhn 失败/过短卡号片段。"""
+    info = _mention_mask_info(mention)
+    kind = info.get("kind") or ""
+    if kind in {"tail_only", "luhn_failed"}:
+        return False
+    surface = mention.get("surface_raw") or ""
+    normalized = mention.get("normalized_value") or ""
+    digits = re.sub(r"\D", "", normalized or surface)
+    if object_type == "ACCOUNT":
+        if kind == "account_mask":
+            return _mask_collide_ok("ACCOUNT", normalized)
+        # 明文卡号须 16–19 位；拒绝 8 位 BIN/碎片
+        return 16 <= len(digits) <= 19 and luhn_ok(digits)
+    if object_type == "PHONE":
+        if kind == "phone_mask":
+            return _mask_collide_ok("PHONE", normalized)
+        return len(digits) == 11 and digits.startswith("1")
+    if object_type == "NAME":
+        # 允许占位符人名（展示层再化名）；拒绝明显非人名
+        if _PLACEHOLDER_TOKEN_RE.fullmatch((surface or "").strip()):
+            return True
+        return _person_surface_ok(surface, load_exclusions()) or bool(
+            re.fullmatch(r"[\u4e00-\u9fff·]{2,4}", surface or "")
+        )
+    return bool((normalized or surface or "").strip())
+
+
+def _field_cell_status(
+    case_ids: list[str],
+    rendered: dict[str, str],
+) -> dict[str, str]:
+    """一致仅当各案均有值且相同；一侧缺失不得标一致。"""
+    present = [rendered.get(cid) or "" for cid in case_ids if rendered.get(cid)]
+    unique = {item for item in present if item}
+    all_filled = len(present) == len(case_ids) and all(rendered.get(cid) for cid in case_ids)
+    out: dict[str, str] = {}
+    for cid in case_ids:
+        value = rendered.get(cid) or ""
+        if not value:
+            out[cid] = "missing"
+        elif len(unique) > 1:
+            out[cid] = "diff"
+        elif all_filled:
+            out[cid] = "same"
+        else:
+            out[cid] = "partial"
+    return out
+
+
 def _build_review_field_compare(
     object_type: str,
     items: list[dict[str, Any]],
     all_mentions: list[dict[str, Any]],
     case_names: dict[str, str],
 ) -> list[dict[str, Any]]:
+    """构建字段×案件矩阵。
+
+    空单元格语义：在「候选命中句窗口 + 同 chunk 已抽取关联实体」范围内未找到，
+    展示为「未记载」——不是没检索。出处挂在 per_case.sources，不新增库表列。
+    """
     case_ids = sorted({item["case_id"] for item in items})
     primary_key, _ = _primary_field_key(object_type)
     if object_type == "ORGANIZATION" and any(
@@ -1427,47 +2113,116 @@ def _build_review_field_compare(
     ):
         primary_key = "credit_code"
 
-    values: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
+    try:
+        aliases = get_global_mapper().alias_map()
+    except Exception:
+        aliases = {}
 
-    def add(field_key: str, case_id: str, value: str | None) -> None:
-        clean = str(value or "").strip()
-        if clean and clean not in values[field_key][case_id]:
-            values[field_key][case_id].append(clean)
+    # field -> case -> list[{value, source}]
+    buckets: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+
+    def add(
+        field_key: str,
+        case_id: str,
+        value: str | None,
+        source_item: dict[str, Any] | None = None,
+        value_type: str | None = None,
+    ) -> None:
+        display = _review_display_value(value or "", value_type or object_type, aliases)
+        if not display:
+            return
+        entry = {
+            "value": display,
+            "source": _mention_source_ref(source_item or {}),
+        }
+        exists = buckets[field_key][case_id]
+        if any(item["value"] == display for item in exists):
+            # 同值补出处
+            for item in exists:
+                if item["value"] == display and entry["source"].get("quote_hash"):
+                    srcs = item.setdefault("sources", [])
+                    if entry["source"] not in srcs and entry["source"].get("chunk_id"):
+                        srcs.append(entry["source"])
+            return
+        entry["sources"] = [entry["source"]] if entry["source"].get("chunk_id") else []
+        exists.append(entry)
 
     for item in items:
         add(
             primary_key,
             item["case_id"],
-            public_surface(item.get("surface_raw") or "", object_type),
+            item.get("surface_raw") or "",
+            item,
+            object_type,
         )
         for key, context_value in _context_label_values(
             object_type, item.get("quote_redacted") or ""
         ).items():
-            add(key, item["case_id"], context_value)
+            related_type = (
+                "NAME"
+                if key in {"holder_name", "legal_person", "registrant", "name", "linked_person"}
+                else (
+                    "PHONE"
+                    if "phone" in key
+                    else ("ACCOUNT" if "account" in key else None)
+                )
+            )
+            add(key, item["case_id"], context_value, item, related_type)
 
-    # 只使用同一 chunk 中已抽取出的其他实体作为关联字段，避免跨段误关联。
     item_chunks = {(item["case_id"], item.get("chunk_id")) for item in items}
     for related in all_mentions:
         if (related.get("case_id"), related.get("chunk_id")) not in item_chunks:
             continue
+        related_type = related.get("object_type") or ""
+        if not _related_mention_value_ok(related_type, related):
+            continue
         field_key = _review_field_for_related(object_type, related)
-        if field_key:
-            add(
-                field_key,
-                related["case_id"],
-                public_surface(related.get("surface_raw") or "", related.get("object_type")),
-            )
+        if not field_key:
+            continue
+        add(
+            field_key,
+            related["case_id"],
+            related.get("surface_raw") or "",
+            related,
+            related_type,
+        )
 
     rows = []
     for field_key, label in _REVIEW_FIELD_ORDER.get(
         object_type, [(_primary_field_key(object_type))]
     ):
-        rendered = {
-            case_id: "、".join(values[field_key].get(case_id) or [])
-            for case_id in case_ids
-        }
-        present = [item for item in rendered.values() if item]
-        differs = len(set(present)) > 1
+        rendered = {}
+        sources_by_case: dict[str, list[dict[str, Any]]] = {}
+        for case_id in case_ids:
+            entries = buckets[field_key].get(case_id) or []
+            vals = [item["value"] for item in entries if item.get("value")]
+            rendered[case_id] = "、".join(dict.fromkeys(vals))
+            srcs: list[dict[str, Any]] = []
+            for item in entries:
+                cell_val = item.get("value") or ""
+                for src in item.get("sources") or (
+                    [item["source"]] if item.get("source") else []
+                ):
+                    if not src or not src.get("chunk_id") or src in srcs:
+            continue
+                    # 出处窗口必须覆盖该单元格值（展示态或存储态）
+                    q = src.get("quote") or ""
+                    qd = src.get("quote_display") or ""
+                    if cell_val and not (
+                        _quote_covers_surface(q, cell_val)
+                        or cell_val in qd
+                        or any(
+                            part and (part in q or part in qd)
+                            for part in re.split(r"[、,，;/]", cell_val)
+                            if len(part.strip()) >= 2
+                        )
+                    ):
+            continue
+                    srcs.append(src)
+            sources_by_case[case_id] = srcs[:3]
+        status_map = _field_cell_status(case_ids, rendered)
         per_case = []
         for case_id in case_ids:
             field_value = rendered[case_id] or None
@@ -1476,10 +2231,19 @@ def _build_review_field_compare(
                     "case_id": case_id,
                     "case_name": case_names.get(case_id) or case_id,
                     "value": field_value,
-                    "status": "missing" if field_value is None else ("diff" if differs else "same"),
+                    "status": status_map[case_id],
+                    "sources": sources_by_case.get(case_id) or [],
+                    "search_scope": "hit_quote_and_same_chunk",
                 }
             )
-        rows.append({"field_key": field_key, "label": label, "per_case": per_case})
+        rows.append(
+            {
+                "field_key": field_key,
+                "label": label,
+                "per_case": per_case,
+                "empty_means": "未记载（在命中句与同页片段内未找到，非未检索）",
+            }
+        )
     return rows
 
 
@@ -1499,29 +2263,47 @@ def _enrich_candidate_for_review(
     case_ids = sorted({item["case_id"] for item in items})
     cases = [{"case_id": cid, "case_name": case_names.get(cid) or cid} for cid in case_ids]
 
-    # 每案保留一条最佳证据
+    # 每案保留一条最佳证据（必须可回链且片段含实体）
     evidence = []
     per_case_values = []
     seen_cases = set()
-    for item in items:
+    for item in sorted(
+        items,
+        key=lambda row: (
+            0 if (row.get("quote_redacted") and row.get("quote_hash")) else 1,
+            -len(row.get("quote_redacted") or ""),
+        ),
+    ):
         cid = item["case_id"]
-        display = public_surface(item.get("surface_raw") or "", object_type)
+        display = _review_display_value(item.get("surface_raw") or "", object_type)
+        quote = item.get("quote_redacted") or ""
+        surface = (item.get("surface_raw") or "").strip()
+        quote_usable = bool(
+            quote
+            and item.get("quote_hash")
+            and _quote_covers_surface(quote, surface)
+        )
         if cid not in seen_cases:
             seen_cases.add(cid)
-            evidence.append(
-                {
-                    "case_id": cid,
-                    "case_name": case_names.get(cid) or cid,
-                    "chunk_id": item["chunk_id"],
-                    "document_version_id": item.get("document_version_id") or "",
-                    "document_id": item.get("document_id"),
-                    "filename": item.get("filename"),
-                    "page_start": item.get("page_start"),
-                    "page_end": item.get("page_end"),
-                    "quote": item.get("quote_redacted") or display,
-                    "quote_hash": item.get("quote_hash") or "",
-                }
-            )
+            if quote_usable:
+                evidence.append(
+                    {
+                        "case_id": cid,
+                        "case_name": case_names.get(cid) or cid,
+                        "chunk_id": item["chunk_id"],
+                        "document_version_id": item.get("document_version_id") or "",
+                        "document_id": item.get("document_id"),
+                        "filename": item.get("filename"),
+                        "page_start": item.get("page_start"),
+                        "page_end": item.get("page_end"),
+                        "ocr_confidence": item.get("ocr_confidence"),
+                        "quote": quote,
+                        "quote_display": _review_display_value(quote)[:240],
+                        "quote_hash": item.get("quote_hash") or "",
+                        "value": display,
+                        "field_label": "主标识",
+                    }
+                )
             per_case_values.append(
                 {
                     "case_id": cid,
@@ -1533,6 +2315,20 @@ def _enrich_candidate_for_review(
 
     type_label = ENTITY_TYPE_LABELS.get(public_type, object_type)
     display_name = _candidate_display_name(object_type, value, items)
+    recall_method = {
+        "ACCOUNT": "账户号码强标识匹配",
+        "PHONE": "号码强标识匹配",
+        "DEVICE": "设备标识强匹配",
+        "ID_CARD": "证件号强标识匹配",
+        "IP": "网络地址强标识匹配",
+        "MERCHANT": "商户标识强匹配",
+        "NAME": "姓名相似 + 关联字段召回",
+        "ORGANIZATION": "组织名称相似匹配",
+    }.get(object_type, "跨案标识召回")
+    if object_type == "ORGANIZATION" and any(
+        _mention_mask_info(item).get("kind") == "credit_code" for item in items
+    ):
+        recall_method = "统一社会信用代码强标识匹配"
     field_compare = _build_review_field_compare(
         object_type, items, all_mentions, case_names
     )
@@ -1547,42 +2343,77 @@ def _enrich_candidate_for_review(
     primary_statuses = {
         row["status"] for row in (primary_row or {}).get("per_case", []) if row.get("value")
     }
-    status = "diff" if "diff" in primary_statuses else "same"
+    status = "diff" if "diff" in primary_statuses else (
+        "partial" if "partial" in primary_statuses else "same"
+    )
     field_label = (primary_row or {}).get("label") or _primary_field_key(object_type)[1]
 
-    records = []
-    for item in items:
-        records.append(
-            {
-                "case_id": item["case_id"],
-                "case_name": case_names.get(item["case_id"]) or item["case_id"],
-                "value": public_surface(item.get("surface_raw") or "", object_type),
-                "source": {
-                    "document_name": item.get("filename") or item.get("document_id"),
-                    "page_no": item.get("page_start"),
-                    "chunk_id": item["chunk_id"],
-                    "document_version_id": item.get("document_version_id"),
-                    "document_id": item.get("document_id"),
-                    "quote": item.get("quote_redacted") or "",
-                    "quote_hash": item.get("quote_hash") or "",
-                },
-            }
-        )
+        records = []
+        for item in items:
+            records.append(
+                {
+                    "case_id": item["case_id"],
+                    "case_name": case_names.get(item["case_id"]) or item["case_id"],
+                "value": _review_display_value(
+                    item.get("surface_raw") or "", object_type
+                ),
+                    "source": {
+                        "document_name": item.get("filename") or item.get("document_id"),
+                        "page_no": item.get("page_start"),
+                        "chunk_id": item["chunk_id"],
+                        "document_version_id": item.get("document_version_id"),
+                        "document_id": item.get("document_id"),
+                    "ocr_confidence": item.get("ocr_confidence"),
+                        "quote": item.get("quote_redacted") or "",
+                    "quote_display": _review_display_value(item.get("quote_redacted") or ""),
+                        "quote_hash": item.get("quote_hash") or "",
+                    },
+                }
+            )
 
-    supporting = [f"{field_label}一致"] if status == "same" else []
-    conflicts = [f"{field_label}记载存在差异"] if status == "diff" else []
+    supporting = []
+    conflicts = []
+    missing_fields = []
+    for row in field_compare:
+        label = row.get("label") or row.get("field_key")
+        statuses = {cell.get("status") for cell in (row.get("per_case") or [])}
+        values = [cell.get("value") for cell in (row.get("per_case") or []) if cell.get("value")]
+        if statuses == {"same"} and values:
+            supporting.append(f"{label}一致")
+        elif "diff" in statuses:
+            conflicts.append(f"{label}记载存在差异")
+        elif "partial" in statuses:
+            missing_cases = [
+                cell.get("case_name") or cell.get("case_id")
+                for cell in (row.get("per_case") or [])
+                if cell.get("status") == "missing"
+            ]
+            if missing_cases:
+                missing_fields.append(
+                    f"{'、'.join(missing_cases)} 未记载{label}"
+                )
+            conflicts.append(f"{label}仅部分案件有记载，不能视为一致")
+        elif statuses == {"missing"}:
+            missing_fields.append(f"各案均未记载{label}")
+
+    if status == "same" and not supporting and primary_row:
+        supporting = [f"{field_label}一致"]
+    if status == "diff" and not conflicts:
+        conflicts = [f"{field_label}记载存在差异"]
 
     return {
-        "candidate_id": new_id(),
-        "fingerprint": fingerprint,
+                "candidate_id": new_id(),
+                "fingerprint": fingerprint,
         "entity_type": public_type.value,
         "display_name": display_name,
+        "recall_method": recall_method,
+        "recalled_at": utc_now()[:10],
         "cases": cases,
         "field_compare": field_compare,
         "evidence": evidence,
         "supporting_facts": supporting,
         "conflicts": conflicts,
-        "missing_fields": [],
+        "missing_fields": missing_fields,
         "impact": {
             "case_count": len(case_ids),
             "relation_count": 0,
@@ -1595,17 +2426,18 @@ def _enrich_candidate_for_review(
         "generated_clues": [],
         "decision": "PENDING",
         "reason": "",
-        "confidence_label": "待核验",
+                "confidence_label": "待核验",
         "match_tier": "STRONG",
         "aliases": [],
-        "match_basis": [
-            f"规范化值在 {len(case_ids)} 起案件中等值出现",
+                "match_basis": [
+                    f"规范化值在 {len(case_ids)} 起案件中等值出现",
             "每案至少一条可定位原文证据",
-        ],
+            "字段对照仅在命中句与同页片段内检索；空为未记载而非未检索",
+                ],
         "differences": conflicts or ["系统不自动合并，是否同一对象由人工决定"],
-        "records": records,
+                "records": records,
         "question": f"请核验：相关案件中该{type_label}是否指向同一主体？",
-        "correction": None,
+                "correction": None,
         # 内部兼容字段
         "_internal_type": object_type,
         "_normalized_value": value,
@@ -1912,18 +2744,26 @@ def build_alias_suspect_candidates(
         )
         for row in cand.get("field_compare") or []:
             if row.get("field_key") == "name":
+                rendered = {}
                 for per in row.get("per_case") or []:
                     cid = per.get("case_id")
                     vals = sorted(
                         {
-                            public_surface(it.get("surface_raw") or "", "NAME")
+                            _review_display_value(it.get("surface_raw") or "", "NAME")
                             for it in items
                             if it.get("case_id") == cid
                         }
                     )
-                    if vals:
-                        per["value"] = "、".join(vals)
-                        per["status"] = "diff" if len(vals) > 1 else "same"
+                    vals = [v for v in vals if v]
+                    rendered[cid] = "、".join(vals)
+                status_map = _field_cell_status(
+                    [per.get("case_id") for per in (row.get("per_case") or [])],
+                    rendered,
+                )
+                for per in row.get("per_case") or []:
+                    cid = per.get("case_id")
+                    per["value"] = rendered.get(cid) or None
+                    per["status"] = status_map.get(cid) or "missing"
 
         cand["display_name"] = display_name
         cand["confidence_label"] = confidence
@@ -2048,7 +2888,13 @@ def extract_and_collide(
         mentions = _rows(
             conn,
             """
-            SELECT m.*, d.filename FROM entity_mentions m
+            SELECT m.*, d.filename,
+                   (SELECT AVG(p.avg_confidence) FROM document_pages p
+                     WHERE p.document_version_id = m.document_version_id
+                       AND p.page_no BETWEEN COALESCE(m.page_start, 1)
+                                         AND COALESCE(m.page_end, m.page_start, 1)
+                   ) AS ocr_confidence
+            FROM entity_mentions m
             JOIN documents d ON d.id = m.document_id
             WHERE m.task_id = ?
               AND m.extractor_version = ?
@@ -2110,6 +2956,75 @@ def extract_and_collide(
         "alias_seed_count": len(alias_seeds),
         "suspect_count": len(suspects),
     }
+
+
+def _load_chunks_for_field_enrichment(
+    *,
+    case_id: str,
+    hint: str,
+    seed_chunk_ids: list[str],
+    db_path=None,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    """为 DeepSeek 准备脱敏材料片段（优先证据 chunk，再按关键词扩展）。"""
+    with db_session(db_path) as conn:
+        rows: list[dict[str, Any]] = []
+        seen = set()
+        for chunk_id in seed_chunk_ids:
+            if not chunk_id or chunk_id in seen:
+                continue
+            row = _row(
+                conn,
+                """
+                SELECT c.id AS chunk_id, v.document_id, c.document_version_id, v.version_no,
+                       c.page_start, c.page_end, c.text_redacted, d.filename, d.case_id,
+                       (SELECT AVG(p.avg_confidence) FROM document_pages p
+                         WHERE p.document_version_id = c.document_version_id
+                           AND p.page_no BETWEEN c.page_start AND c.page_end
+                       ) AS ocr_confidence
+                FROM document_chunks c
+                JOIN document_versions v ON v.id = c.document_version_id
+                JOIN documents d ON d.id = v.document_id
+                WHERE c.id = ? AND d.case_id = ? AND d.deleted_at IS NULL
+                """,
+                (chunk_id, case_id),
+            )
+            if row:
+                seen.add(chunk_id)
+                rows.append(dict(row))
+        if hint and len(rows) < limit:
+            like = f"%{(hint or '')[:40]}%"
+            extra = _rows(
+                conn,
+                """
+                SELECT c.id AS chunk_id, v.document_id, c.document_version_id, v.version_no,
+                       c.page_start, c.page_end, c.text_redacted, d.filename, d.case_id,
+                       (SELECT AVG(p.avg_confidence) FROM document_pages p
+                         WHERE p.document_version_id = c.document_version_id
+                           AND p.page_no BETWEEN c.page_start AND c.page_end
+                       ) AS ocr_confidence
+                FROM document_chunks c
+                JOIN document_versions v ON v.id = c.document_version_id
+                JOIN documents d ON d.id = v.document_id
+                WHERE d.case_id = ?
+                  AND d.deleted_at IS NULL
+                  AND v.is_active = 1
+                  AND c.is_active = 1
+                  AND c.text_redacted LIKE ?
+                ORDER BY c.ordinal
+                LIMIT ?
+                """,
+                (case_id, like, limit),
+            )
+            for row in extra:
+                cid = row["chunk_id"]
+                if cid in seen:
+                    continue
+                seen.add(cid)
+                rows.append(dict(row))
+                if len(rows) >= limit:
+                    break
+    return rows
 
 
 # ---------- 规则命中 ----------
@@ -2371,3 +3286,58 @@ def verify_quote_hash(chunk_text: str, quote: str, expected_hash: str) -> bool:
     if not quote or quote not in (chunk_text or ""):
         return False
     return quote_hash(quote) == expected_hash
+
+
+def whitespace_locate_quote(text: str, quote: str) -> str | None:
+    """允许空白差异，把片段对回存储原文。"""
+    if not text or not quote:
+        return None
+    if quote in text:
+        return quote
+    compact_chars: list[str] = []
+    index_map: list[int] = []
+    for pos, ch in enumerate(text):
+        if ch.isspace():
+            continue
+        compact_chars.append(ch)
+        index_map.append(pos)
+    compact_text = "".join(compact_chars)
+    compact_quote = re.sub(r"\s+", "", quote)
+    if not compact_quote:
+        return None
+    at = compact_text.find(compact_quote)
+    if at < 0:
+        return None
+    start = index_map[at]
+    end = index_map[at + len(compact_quote) - 1] + 1
+    return text[start:end]
+
+
+def reanchor_citation(
+    text: str,
+    *,
+    quote: str | None = None,
+    expected_hash: str | None = None,
+    anchor_terms: list[str] | None = None,
+) -> tuple[str, str] | None:
+    """校验失败时尝试重锚：空白对齐 → 按字段值/实体重切窗口。"""
+    target = text or ""
+    if not target:
+        return None
+    if quote and quote in target:
+        actual = quote_hash(quote)
+        if not expected_hash or actual == expected_hash:
+            return quote, actual
+    if quote:
+        located = whitespace_locate_quote(target, quote)
+        if located:
+            return located, quote_hash(located)
+    for term in anchor_terms or []:
+        term = str(term or "").strip()
+        if len(term) < 2:
+            continue
+        # 展示名可能对应占位符
+        window = locate_quote_in_text(target, surface=term)
+        if window:
+            return window, quote_hash(window)
+    return None

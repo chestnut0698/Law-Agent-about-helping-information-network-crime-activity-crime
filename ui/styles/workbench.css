@@ -1129,9 +1129,75 @@ body,
     color: var(--wb-accent-ink, inherit);
     padding: 0 2px;
     border-radius: 3px;
+    font-weight: 700;
+}
+
+.wb-cite-mark strong {
+    font-weight: 700;
 }
 
 .wb-cite-loading { font-size: 12px; color: var(--text-muted); padding: 20px 0; }
+
+/* 原文核验抽屉：卷宗抬头 + 高亮原句 + 逐条翻阅 */
+.wb-cite-desc { font-size: 11.5px; color: var(--text-muted); margin-bottom: 10px; }
+.wb-cite-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 16px;
+    padding: 10px 12px;
+    border: 1px solid var(--border-color);
+    border-radius: 7px;
+    background: var(--bg-tertiary);
+    font-size: 11.5px;
+}
+.wb-cite-meta-label { color: var(--text-muted); }
+.wb-cite-meta b { color: var(--text-primary); font-weight: 600; }
+.wb-cite-invalid {
+    margin-top: 12px;
+    padding: 10px 12px;
+    border: 1px solid var(--wb-danger-line);
+    border-radius: 7px;
+    background: var(--wb-danger-pale);
+    color: var(--wb-danger-text);
+    font-size: 11.5px;
+    line-height: 1.6;
+}
+.wb-cite-invalid-title { font-weight: 650; margin-bottom: 2px; }
+.wb-cite-panel {
+    margin-top: 14px;
+    padding: 12px;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    background: var(--bg-primary);
+}
+.wb-cite-panel-head { font-size: 11.5px; color: var(--text-muted); font-weight: 600; }
+.wb-cite-panel .wb-cite-body { margin-top: 8px; background: var(--bg-tertiary); }
+.wb-cite-omit { color: var(--text-muted); }
+.wb-cite-lowconf {
+    margin-top: 8px;
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 10.5px;
+    background: var(--wb-warn-pale, #fff4e5);
+    color: var(--wb-warn-text, #9a5b00);
+}
+.wb-cite-nav {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border-color);
+}
+.wb-cite-drawer.is-fullscreen {
+    position: fixed;
+    inset: 0;
+    width: 100% !important;
+    max-width: none;
+    z-index: 60;
+}
 
 .wb-upload-box.wb-upload-dragover {
     border-color: #409eff;
@@ -2403,9 +2469,9 @@ body,
 .wb-compare-field-name { color: var(--text-primary); font-weight: 650; }
 .wb-compare-cell {
     display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 8px;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
 }
 .wb-compare-status {
     display: inline-flex;
@@ -2417,7 +2483,29 @@ body,
 }
 .wb-compare-status.same { color: var(--success); background: color-mix(in srgb, var(--success) 12%, transparent); }
 .wb-compare-status.diff { color: var(--destructive); background: color-mix(in srgb, var(--destructive) 12%, transparent); }
+.wb-compare-status.partial { color: var(--wb-warn-text, #9a5b00); background: var(--wb-warn-pale, #fff4e5); }
 .wb-compare-status.missing { color: var(--text-muted); background: var(--bg-tertiary); }
+.wb-compare-value { font-variant-numeric: tabular-nums; word-break: break-all; }
+.wb-compare-value.is-diff { color: var(--destructive); }
+.wb-compare-cite {
+    display: block;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--accent, #2563eb);
+    font-size: 12px;
+    line-height: 1.35;
+    text-align: left;
+    cursor: pointer;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
+.wb-compare-cite:disabled {
+    color: var(--text-muted);
+    cursor: not-allowed;
+    text-decoration: none;
+}
 .wb-compare-explanation {
     display: flex;
     flex-wrap: wrap;
@@ -2450,6 +2538,19 @@ body,
     background: var(--bg-tertiary);
     font-size: 10.5px;
 }
+.wb-evidence-page.is-invalid {
+    color: #fff;
+    background: var(--wb-danger);
+}
+.wb-entity-title-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.wb-entity-type-badge {
+    padding: 1px 8px;
+    border: 1px solid var(--border-color);
+    border-radius: 999px;
+    font-size: 10.5px;
+    color: var(--text-secondary);
+}
+.wb-btn-sm { padding: 3px 8px; font-size: 11.5px; }
 .wb-evidence-card blockquote {
     margin: 12px 0;
     padding-left: 11px;
@@ -3011,7 +3112,19 @@ body,
     color: var(--warning-foreground);
 }
 [data-theme="dark"] .wb-alert.warn { color: #f5e6d3; }
+.wb-alert.info {
+    border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+    color: var(--text-primary);
+}
+.wb-alert.ok {
+    border-color: color-mix(in srgb, var(--success, #2f9e44) 30%, transparent);
+    background: color-mix(in srgb, var(--success, #2f9e44) 10%, transparent);
+    color: var(--text-primary);
+}
 .wb-alert .wb-ico { color: var(--warning); margin-top: 2px; }
+.wb-alert.info .wb-ico { color: var(--accent); }
+.wb-alert.ok .wb-ico { color: var(--success, #2f9e44); }
 
 .ref-meta-stat-k {
     display: flex;

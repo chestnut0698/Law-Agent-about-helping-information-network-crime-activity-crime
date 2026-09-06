@@ -569,6 +569,8 @@ class TaskService:
                     "fingerprint": item.get("fingerprint") or "",
                     "entity_type": item.get("entity_type") or "OTHER",
                     "display_name": item.get("display_name") or f"候选 {index + 1}",
+                    "recall_method": item.get("recall_method") or "",
+                    "recalled_at": item.get("recalled_at") or "",
                     "confidence_label": item.get("confidence_label") or "待核验",
                     "match_basis": item.get("match_basis") or [],
                     "match_tier": item.get("match_tier") or "STRONG",
@@ -608,6 +610,7 @@ class TaskService:
                     **(summary or {}),
                 },
                 "candidates": normalized,
+                "subject_resolve": {"subjects": {}, "surface_index": {}, "keep_separate": []},
                 "boundary": "标识重合仅为待核验提示，不代表系统已认定同一人、同一账户或共同犯罪。",
             },
             run_id=run_id,
@@ -668,15 +671,25 @@ class TaskService:
                 db_path=self.db_path,
             )
 
+        if decision in {"MERGE", "KEEP_SEPARATE"}:
+            payload["subject_resolve"] = self._update_subject_resolve(
+                payload.get("subject_resolve"),
+                found,
+                decision=decision,
+            )
+
         candidates = payload.get("candidates", [])
         reviewed = sum(1 for item in candidates if item.get("decision") != "PENDING")
         pending = len(candidates) - reviewed
+        analysis_gate = "ENTITY_REVIEW" if pending else ""
         payload["summary"] = {
             **(payload.get("summary") or {}),
             "total": len(candidates),
             "reviewed": reviewed,
             "pending": pending,
+            "analysis_gate": analysis_gate,
         }
+        payload["analysis_gate"] = analysis_gate
         status = "VALID" if pending == 0 else "PENDING_REVIEW"
         artifact = self.write_artifact(
             task_id=task_id,
@@ -701,10 +714,17 @@ class TaskService:
         followup = self.continue_after_entity_decision(
             task_id, candidate_id, decision=decision, user_id=None
         )
+        actions = list(followup.get("actions") or [])
+        if pending == 0:
+            actions.append("实体复核已全部确认，可继续整理线索与报告")
+        elif analysis_gate == "ENTITY_REVIEW":
+            actions.append(f"仍有 {pending} 条待核实体，确认后方可继续后续分析")
         return {
             "artifact": artifact,
             "task": self.get_task(task_id),
-            "followup_actions": followup.get("actions") or [],
+            "followup_actions": actions,
+            "analysis_gate": analysis_gate,
+            "pending": pending,
         }
 
     def propose_entity_review(
@@ -879,8 +899,14 @@ class TaskService:
                     payload=payload,
                 )
                 actions.append(f"升格线索：{art.get('title')}")
+            refreshed = self.refresh_timeline_subjects(task_id)
+            if refreshed.get("ok"):
+                actions.append("角色时间线主体已按确认关联归一")
             actions.append("确认关联已写入留痕")
         elif decision == "KEEP_SEPARATE":
+            refreshed = self.refresh_timeline_subjects(task_id)
+            if refreshed.get("ok"):
+                actions.append("角色时间线已应用保留独立")
             actions.append("已记录排除，后续碰撞将跳过该指纹")
         elif decision == "CORRECT":
             actions.append("已记录更正，建议重新执行标识比对")
@@ -900,6 +926,149 @@ class TaskService:
             },
         )
         return {"actions": actions, "task": self.get_task(task_id)}
+
+    def _candidate_surfaces(self, candidate: dict[str, Any]) -> list[str]:
+        import re
+
+        surfaces: list[str] = []
+
+        def push(text: str | None) -> None:
+            raw = (text or "").strip()
+            if not raw:
+                return
+            # 「“赵瑞”人物」→ 赵瑞
+            m = re.match(r"^[“\"](.+?)[”\"](?:人物|组织)?$", raw)
+            if m:
+                raw = m.group(1).strip()
+            if len(raw) > 40:
+                return
+            surfaces.append(raw)
+
+        push(candidate.get("display_name"))
+        for alias in candidate.get("aliases") or []:
+            push(alias if isinstance(alias, str) else str(alias or ""))
+        for rec in candidate.get("records") or []:
+            for key in ("value", "surface", "display_name", "surface_raw"):
+                push(rec.get(key))
+        for case in candidate.get("cases") or []:
+            for key in ("value", "display_name"):
+                push(case.get(key))
+        for ev in candidate.get("evidence") or []:
+            push(ev.get("value") or ev.get("surface"))
+
+        seen = set()
+        out = []
+        for s in surfaces:
+            if s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+        return out
+
+    def _update_subject_resolve(
+        self,
+        resolve: dict[str, Any] | None,
+        candidate: dict[str, Any],
+        *,
+        decision: str,
+    ) -> dict[str, Any]:
+        from tools.entities import empty_subject_resolve
+
+        resolve = dict(resolve or empty_subject_resolve())
+        subjects = dict(resolve.get("subjects") or {})
+        surface_index = dict(resolve.get("surface_index") or {})
+        keep_separate = list(resolve.get("keep_separate") or [])
+        surfaces = self._candidate_surfaces(candidate)
+        object_type = (
+            candidate.get("entity_type")
+            or candidate.get("object_type")
+            or "NAME"
+        )
+        if object_type in {"PERSON", "NAME"}:
+            object_type = "NAME"
+        display_name = (candidate.get("display_name") or (surfaces[0] if surfaces else "")).strip()
+        subject_id = candidate.get("candidate_id") or new_id()
+
+        if decision == "MERGE" and surfaces:
+            subjects[subject_id] = {
+                "subject_id": subject_id,
+                "display_name": display_name or surfaces[0],
+                "object_type": object_type,
+                "surfaces": surfaces,
+                "candidate_id": candidate.get("candidate_id"),
+                "fingerprint": candidate.get("fingerprint") or "",
+                "source": "MERGE",
+            }
+            for surface in surfaces:
+                surface_index[surface] = subject_id
+            # 从 keep_separate 中移除已合并表面
+            keep_separate = [
+                group
+                for group in keep_separate
+                if not any(s in surfaces for s in (group if isinstance(group, list) else []))
+            ]
+        elif decision == "KEEP_SEPARATE" and surfaces:
+            keep_separate.append(surfaces)
+            # 各表面各自独立 subject，避免后续误并展示
+            for surface in surfaces:
+                sid = f"sep:{candidate.get('candidate_id') or new_id()}:{surface}"
+                subjects[sid] = {
+                    "subject_id": sid,
+                    "display_name": surface,
+                    "object_type": object_type,
+                    "surfaces": [surface],
+                    "candidate_id": candidate.get("candidate_id"),
+                    "fingerprint": candidate.get("fingerprint") or "",
+                    "source": "KEEP_SEPARATE",
+                }
+                surface_index[surface] = sid
+
+        resolve["subjects"] = subjects
+        resolve["surface_index"] = surface_index
+        resolve["keep_separate"] = keep_separate
+        return resolve
+
+    def get_subject_resolve(self, task_id: str) -> dict[str, Any]:
+        from tools.entities import empty_subject_resolve
+
+        current = self.find_artifact(task_id, "ENTITY_CANDIDATE_SET", "entity-candidates")
+        if not current:
+            return empty_subject_resolve()
+        detail = self.get_artifact(task_id, current["id"])
+        return (detail.get("payload") or {}).get("subject_resolve") or empty_subject_resolve()
+
+    def refresh_timeline_subjects(self, task_id: str) -> dict[str, Any]:
+        """用 subject_resolve 重写已有角色时间线的 parties / 主体，不重抽事件。"""
+        from tools.entities import apply_subject_resolve
+
+        art = self.find_artifact(task_id, "ROLE_TIMELINE", "role-timeline")
+        if not art or art.get("status") in {"STALE", "INVALID"}:
+            return {"ok": False, "message": "无有效时间线"}
+        detail = self.get_artifact(task_id, art["id"])
+        payload = dict(detail.get("payload") or {})
+        resolve = self.get_subject_resolve(task_id)
+        items = []
+        for item in payload.get("items") or []:
+            row = dict(item)
+            parties = apply_subject_resolve(row.get("parties") or [], resolve)
+            row["parties"] = parties
+            primary = parties[0] if parties else None
+            if primary:
+                row["subject_id"] = primary.get("subject_id") or ""
+                row["subject"] = primary.get("display_name") or primary.get("surface") or ""
+            items.append(row)
+        payload["items"] = items
+        payload["subject_resolve_applied"] = True
+        self.write_artifact(
+            task_id=task_id,
+            type="ROLE_TIMELINE",
+            title=art.get("title") or "角色时间线·转账与联络事件",
+            ref_key="role-timeline",
+            status="VALID",
+            parent_ids=json.loads(art.get("parent_ids_json") or "[]"),
+            payload=payload,
+        )
+        return {"ok": True, "item_count": len(items)}
 
     def dispose_clue_item(
         self,
@@ -1216,11 +1385,75 @@ class TaskService:
             )
 
         artifact["parent_ids"] = json.loads(artifact["parent_ids_json"] or "[]")
+        payload = json.loads(row["payload_json"]) if row else {}
+        try:
+            from tools.entities import (
+                canonicalize_evidence_citation,
+                hydrate_payload_for_display,
+            )
+
+            # 线索旧数据常含模型自造 hash：读取时重锚，保证原文核验可用
+            if artifact.get("type") == "CLUE_ITEM":
+                evidence = list(payload.get("evidence") or [])
+                repaired: list[dict[str, Any]] = []
+                changed = False
+                for ev in evidence:
+                    if not isinstance(ev, dict):
+                        continue
+                    if not ev.get("chunk_id") or not ev.get("document_version_id"):
+                        repaired.append(ev)
+                        continue
+                    try:
+                        canon = canonicalize_evidence_citation(
+                            document_version_id=ev["document_version_id"],
+                            chunk_id=ev["chunk_id"],
+                            quote=ev.get("quote"),
+                            anchor_terms=[
+                                x
+                                for x in [
+                                    ev.get("value"),
+                                    ev.get("extracted_value"),
+                                    payload.get("title"),
+                                    ev.get("quote_display"),
+                                ]
+                                if x
+                            ],
+                            db_path=self.db_path,
+                        )
+                        merged = {**ev, **canon}
+                        if (
+                            merged.get("quote") != ev.get("quote")
+                            or merged.get("quote_hash") != ev.get("quote_hash")
+                        ):
+                            changed = True
+                        repaired.append(merged)
+                    except Exception:
+                        repaired.append(ev)
+                if repaired:
+                    payload["evidence"] = repaired
+                if changed:
+                    # 静默落盘修好的引用，避免每次打开都失效
+                    try:
+                        self.write_artifact(
+                            task_id=task_id,
+                            type="CLUE_ITEM",
+                            title=payload.get("title") or artifact.get("title") or "线索",
+                            ref_key=artifact.get("ref_key"),
+                            status=artifact.get("status") or "DRAFT",
+                            parent_ids=artifact.get("parent_ids") or [],
+                            payload=payload,
+                            input_snapshot={"repaired": "citation-on-read"},
+                        )
+                    except Exception:
+                        pass
+            payload = hydrate_payload_for_display(payload)
+        except Exception:
+            pass
         return {
             "artifact": artifact,
             "version": target,
             "status": artifact["status"],
-            "payload": json.loads(row["payload_json"]) if row else {},
+            "payload": payload,
             "input_snapshot": json.loads(row["input_snapshot_json"]) if row else {},
             "history": history,
         }
@@ -1452,35 +1685,50 @@ class TaskService:
             if not evidence:
                 raise TaskError(TASK_ERROR_CODES["INVALID_SCOPE"], f"第 {idx + 1} 条线索至少需要一条 evidence")
 
-            # 校验每条 evidence，并强制服务端校验 quote_hash
+            # 校验并规范化每条 evidence：忽略模型自造 hash，按存储原文重锚
+            from tools.entities import canonicalize_evidence_citation
+
+            normalized_evidence: list[dict[str, Any]] = []
             for ev in evidence:
                 if not ev.get("chunk_id"):
                     raise TaskError(TASK_ERROR_CODES["INVALID_SCOPE"], f"第 {idx + 1} 条线索的 evidence 缺少 chunk_id")
-                if not ev.get("quote_hash"):
-                    raise TaskError(TASK_ERROR_CODES["INVALID_SCOPE"],
-                                    f"第 {idx + 1} 条线索的 evidence 缺少 quote_hash")
-                if not ev.get("quote"):
-                    raise TaskError(TASK_ERROR_CODES["INVALID_SCOPE"],
-                                    f"第 {idx + 1} 条线索的 evidence 缺少 quote")
                 version_id = ev.get("document_version_id")
                 if not version_id:
                     raise TaskError(
                         TASK_ERROR_CODES["INVALID_SCOPE"],
                         f"第 {idx + 1} 条线索的 evidence 缺少 document_version_id",
                     )
+                anchors = [
+                    a
+                    for a in [
+                        ev.get("value"),
+                        ev.get("extracted_value"),
+                        title,
+                    ]
+                    if a
+                ]
                 try:
-                    get_material_service().read_redacted_chunk(
-                        version_id,
+                    canon = canonicalize_evidence_citation(
+                        document_version_id=version_id,
                         chunk_id=ev["chunk_id"],
-                        user_id=user_id or "system",
                         quote=ev.get("quote"),
-                        quote_hash=ev.get("quote_hash"),
+                        anchor_terms=anchors,
+                        db_path=self.db_path,
                     )
-                except MaterialError as exc:
+                except ValueError as exc:
                     raise TaskError(
                         TASK_ERROR_CODES["INVALID_SCOPE"],
-                        f"第 {idx + 1} 条线索引用校验失败：{exc.message}",
+                        f"第 {idx + 1} 条线索引用无法回链：{exc}",
                     ) from exc
+                normalized_evidence.append(
+                    {
+                        **ev,
+                        **canon,
+                        "case_name": ev.get("case_name") or "",
+                    }
+                )
+
+            evidence = normalized_evidence
 
             # 生成唯一的 ref_key（不使用 canonical_hash）
             hash_input = f"{title}{summary}".encode("utf-8")
@@ -1605,6 +1853,7 @@ class TaskService:
             seen.add(fingerprint)
         pending = sum(1 for item in candidates if item.get("decision") == "PENDING")
         batch = self.find_artifact(task_id, "MATERIAL_BATCH", "batch")
+        analysis_gate = "ENTITY_REVIEW" if pending else ""
         artifact = self.write_artifact(
             task_id=task_id,
             type="ENTITY_CANDIDATE_SET",
@@ -1621,10 +1870,14 @@ class TaskService:
                     "scanned_chunks": result["scanned_chunks"],
                     "mode": "deterministic",
                     "extractor_version": EXTRACTOR_VERSION,
+                    "analysis_gate": analysis_gate,
                 },
                 "mentions": result["mentions"],
                 "candidates": candidates,
+                "subject_resolve": previous.get("subject_resolve")
+                or {"subjects": {}, "surface_index": {}, "keep_separate": []},
                 "boundary": "强标识等值与疑似化名均为待核验候选。系统不自动合并，是否同一对象由人工决定。",
+                "analysis_gate": analysis_gate,
             },
             input_snapshot={
                 "extractor_version": EXTRACTOR_VERSION,
@@ -1638,6 +1891,7 @@ class TaskService:
             "artifact": artifact,
             "candidate_count": len(candidates),
             "mention_count": result["mention_count"],
+            "analysis_gate": analysis_gate,
             "task": self.get_task(task_id),
         }
 
@@ -1770,7 +2024,7 @@ class TaskService:
         user_id: str | None = None,
     ) -> dict[str, Any]:
         """先把转账/联络事件落成可核验产物，为后续 R004/R005 提供事实层。"""
-        from tools.entities import EVENT_EXTRACTOR_VERSION, extract_task_events
+        from tools.entities import EVENT_EXTRACTOR_VERSION, apply_subject_resolve, extract_task_events
 
         task = self.get_task(task_id)
         if task["status"] == "SCOPE_DRAFT":
@@ -1782,6 +2036,7 @@ class TaskService:
             db_path=self.db_path,
         )
         batch = self.find_artifact(task_id, "MATERIAL_BATCH", "batch")
+        resolve = self.get_subject_resolve(task_id)
         counts: dict[str, int] = {}
         dated = 0
         undated = 0
@@ -1793,6 +2048,8 @@ class TaskService:
                 undated += 1
             else:
                 dated += 1
+            parties = apply_subject_resolve(event.get("parties") or [], resolve)
+            primary = parties[0] if parties else None
             items.append(
                 {
                     "event_id": event["event_id"],
@@ -1803,7 +2060,11 @@ class TaskService:
                     "amount_text": event.get("amount_text") or "",
                     "channel": event.get("channel") or "",
                     "summary_text": event.get("summary_text") or "",
-                    "parties": event.get("parties") or [],
+                    "parties": parties,
+                    "subject_id": (primary or {}).get("subject_id") or "",
+                    "subject": (primary or {}).get("display_name")
+                    or (primary or {}).get("surface")
+                    or "",
                     "case_id": event["case_id"],
                     "case_name": case_names.get(event["case_id"]) or event["case_id"],
                     "source": {
@@ -1842,6 +2103,7 @@ class TaskService:
                     "extractor_version": EVENT_EXTRACTOR_VERSION,
                 },
                 "items": items,
+                "subject_resolve_applied": True,
                 "boundary": "这里只记录材料中出现的转账/联络事件，供后续资金路径与共同联系人规则使用；当前不直接生成共同犯罪或控制关系结论。",
             },
             input_snapshot={

@@ -293,6 +293,31 @@ async def read_material_chunk_api(
         return material_error_response(exc)
 
 
+@app.post("/api/materials/versions/{version_id}/chunks/{chunk_id}/verify")
+async def verify_material_chunk_api(
+    version_id: str,
+    chunk_id: str,
+    payload: dict,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    """原文回链校验：quote 走 JSON body，避免 GET 编码损坏换行与长片段。"""
+    try:
+        anchors = payload.get("anchor_terms") or payload.get("highlight_terms") or []
+        if not isinstance(anchors, list):
+            anchors = [anchors]
+        return get_material_service().read_redacted_chunk(
+            version_id,
+            chunk_id=chunk_id,
+            user_id=x_user_id,
+            quote=payload.get("quote"),
+            quote_hash=payload.get("quote_hash"),
+            restore_original=bool(payload.get("restore", 0)),
+            anchor_terms=[str(x) for x in anchors if x],
+        )
+    except MaterialError as exc:
+        return material_error_response(exc)
+
+
 # ---------- 监督分析任务与产物 ----------
 def task_error_response(exc: TaskError) -> JSONResponse:
     return JSONResponse(status_code=400, content=exc.to_dict())
@@ -396,6 +421,29 @@ async def review_task_entity_candidate(task_id: str, candidate_id: str, payload:
         )
     except TaskError as exc:
         return task_error_response(exc)
+
+
+@app.post("/api/tasks/{task_id}/entity-candidates/{candidate_id}/field-table")
+async def build_candidate_field_table_api(
+    task_id: str,
+    candidate_id: str,
+    payload: dict | None = None,
+):
+    """由 DeepSeek 现场设计该候选的字段对照表并写回待核清单。"""
+    import json as _json
+
+    from tools.entity_review import build_candidate_field_table
+
+    body = payload or {}
+    result = _json.loads(
+        build_candidate_field_table(
+            task_id, candidate_id, force=bool(body.get("force"))
+        )
+    )
+    if not result.get("ok"):
+        return JSONResponse(status_code=200, content=result)
+    result["task"] = get_task_service().get_task(task_id)
+    return result
 
 
 @app.post("/api/tasks/{task_id}/entity-candidates/review")

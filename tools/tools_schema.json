@@ -326,7 +326,7 @@
     "type": "function",
     "function": {
       "name": "write_ai_clues",
-      "description": "将 AI 自主生成的跨案关联线索写入工作台。调用前应确保已阅读 ENTITY_CANDIDATE_SET 和 ROLE_TIMELINE 产物。线索需包含标题、摘要和至少一条证据引用（chunk_id + quote_hash）。",
+      "description": "将跨案关联线索写入工作台。调用前须已阅读实体候选与时间线。evidence 的 quote 必须是材料工具返回的连续原文（可含 PERSON_xxx）；quote_hash 可省略，由服务端按原文重算。禁止改写、拼接或凭记忆编造摘录。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -338,27 +338,33 @@
               "properties": {
                 "title": {
                   "type": "string",
-                  "description": "线索标题，一句话概括"
+                  "description": "线索标题：只写待核验关联现象，不写同一人/共同犯罪结论"
                 },
                 "summary": {
                   "type": "string",
-                  "description": "线索摘要，尽量详实，不超过 600 字"
+                  "description": "线索摘要（≤600字）：写清跨案重合点、不确定性与待核材料；禁止定罪并案表述"
                 },
                 "evidence": {
                   "type": "array",
-                  "description": "支撑证据列表",
+                  "description": "支撑证据；每条须可回链到材料原文",
                   "items": {
                     "type": "object",
                     "properties": {
-                      "chunk_id": {"type": "string", "description": "材料片段 ID"},
-                      "quote": {"type": "string", "description": "脱敏原文片段"},
-                      "quote_hash": {"type": "string", "description": "quote 的 SHA-256 哈希"},
+                      "chunk_id": {"type": "string", "description": "材料片段 ID（来自工具返回）"},
+                      "quote": {"type": "string", "description": "从材料正文逐字摘录的连续原文，建议≤80字"},
+                      "quote_hash": {"type": "string", "description": "可选；服务端会忽略并重算"},
                       "page_start": {"type": "integer", "description": "起始页码"},
                       "page_end": {"type": "integer", "description": "结束页码"},
-                      "document_version_id": {"type": "string", "description": "文档版本 ID"}
+                      "document_version_id": {"type": "string", "description": "材料版本 ID"},
+                      "case_name": {"type": "string", "description": "来源案件名称"}
                     },
-                    "required": ["chunk_id", "quote_hash"]
+                    "required": ["chunk_id", "quote", "document_version_id"]
                   }
+                },
+                "linked_candidate_ids": {
+                  "type": "array",
+                  "items": {"type": "string"},
+                  "description": "关联的实体候选 ID（可选）"
                 }
               },
               "required": ["title", "summary", "evidence"]
@@ -425,6 +431,21 @@
         "type": "object",
         "properties": {
           "candidate_id": {"type": "string"}
+        },
+        "required": ["candidate_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "build_candidate_field_table",
+      "description": "让模型依据该候选各案的脱敏材料，现场设计并填写字段对照表（不同实体表头不同），逐格附可回链原文；结果写回待核清单。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "candidate_id": {"type": "string"},
+          "force": {"type": "boolean", "description": "为 true 时忽略已有结果重新生成"}
         },
         "required": ["candidate_id"]
       }

@@ -25,8 +25,9 @@ def _artifact_brief(artifact: dict[str, Any] | None, **extra: Any) -> dict[str, 
 def get_task_overview(task_id: str, user_id: str | None = None) -> str:
     """查看监督分析任务范围、案件、材料与已有产物清单。"""
     try:
-        task = get_task_service().get_task(task_id)
-        overview = get_task_service().material_overview(task_id, user_id=user_id or "system")
+        service = get_task_service()
+        task = service.get_task(task_id)
+        overview = service.material_overview(task_id, user_id=user_id or "system")
         artifacts = [
             {
                 "artifact_id": a["id"],
@@ -37,6 +38,26 @@ def get_task_overview(task_id: str, user_id: str | None = None) -> str:
             for a in (task.get("artifacts") or [])
             if a.get("status") != "INVALID"
         ]
+        analysis_gate = ""
+        pending_entities = 0
+        entity_art = service.find_artifact(task_id, "ENTITY_CANDIDATE_SET", "entity-candidates")
+        if entity_art and entity_art.get("status") not in {"STALE", "INVALID"}:
+            payload = (service.get_artifact(task_id, entity_art["id"]).get("payload") or {})
+            analysis_gate = (
+                payload.get("analysis_gate")
+                or (payload.get("summary") or {}).get("analysis_gate")
+                or ""
+            )
+            pending_entities = int((payload.get("summary") or {}).get("pending") or 0)
+            if not analysis_gate and pending_entities > 0:
+                analysis_gate = "ENTITY_REVIEW"
+        gate_hint = ""
+        if analysis_gate == "ENTITY_REVIEW":
+            gate_hint = (
+                f"当前分析门闩：实体复核（仍有 {pending_entities} 条待核）。"
+                "请提示用户到中间工作区完成「视为同一 / 保留独立」确认；"
+                "在此之前不要生成线索或报告。"
+            )
         return _tool_json(
             {
                 "ok": True,
@@ -44,6 +65,9 @@ def get_task_overview(task_id: str, user_id: str | None = None) -> str:
                 "title": task.get("title"),
                 "purpose": task.get("purpose"),
                 "status": task.get("status"),
+                "analysis_gate": analysis_gate or None,
+                "pending_entity_reviews": pending_entities,
+                "gate_hint": gate_hint or None,
                 "cases": [
                     {"case_id": c["case_id"], "display_name": c.get("display_name")}
                     for c in (task.get("cases") or [])
@@ -165,18 +189,53 @@ def delete_task_material(
         return _tool_json(exc.to_dict())
 
 
+def _entity_review_gate(task_id: str) -> dict[str, Any] | None:
+    """若仍有待核实体，返回阻止后续线索/报告的提示。"""
+    service = get_task_service()
+    entity_art = service.find_artifact(task_id, "ENTITY_CANDIDATE_SET", "entity-candidates")
+    if not entity_art or entity_art.get("status") in {"STALE", "INVALID"}:
+        return None
+    payload = (service.get_artifact(task_id, entity_art["id"]).get("payload") or {})
+    pending = int((payload.get("summary") or {}).get("pending") or 0)
+    gate = (
+        payload.get("analysis_gate")
+        or (payload.get("summary") or {}).get("analysis_gate")
+        or ("" if pending == 0 else "ENTITY_REVIEW")
+    )
+    if gate != "ENTITY_REVIEW" or pending <= 0:
+        return None
+    return {
+        "ok": False,
+        "blocked_by_gate": "ENTITY_REVIEW",
+        "pending_entity_reviews": pending,
+        "message": (
+            f"跨案对象仍有 {pending} 条待人工确认。"
+            "请先提示用户在中间工作区完成「视为同一 / 保留独立」，"
+            "确认完成后再整理线索或报告。"
+        ),
+    }
+
+
 def run_task_collision(task_id: str, user_id: str | None = None) -> str:
     """对任务范围内材料执行强标识确定性碰撞，写入实体候选产物。"""
     try:
         result = get_task_service().run_collision(task_id, user_id=user_id or "system")
-        return _tool_json(
-            _artifact_brief(
-                result.get("artifact"),
-                message="跨案标识比对完成，已生成对象待核清单",
-                candidate_count=result.get("candidate_count"),
-                mention_count=result.get("mention_count"),
+        art = result.get("artifact") or {}
+        gate = result.get("analysis_gate") or ""
+        message = "跨案标识比对完成，已生成对象待核清单"
+        if gate == "ENTITY_REVIEW":
+            message = (
+                "跨案标识比对完成。请提示用户到中间工作区打开「实体复核」，"
+                "对每条候选作出「视为同一」或「保留独立」；确认完成前不要继续写线索或报告。"
             )
+        brief = _artifact_brief(
+            art,
+            message=message,
+            candidate_count=result.get("candidate_count"),
+            mention_count=result.get("mention_count"),
         )
+        brief["analysis_gate"] = gate or None
+        return _tool_json(brief)
     except TaskError as exc:
         return _tool_json(exc.to_dict())
 
@@ -215,6 +274,9 @@ def generate_task_clues(task_id: str, user_id: str | None = None) -> str:
 """
 
 def write_ai_clues(task_id: str, clues: list[dict[str, Any]], user_id: str | None = None) -> str:
+    blocked = _entity_review_gate(task_id)
+    if blocked:
+        return _tool_json(blocked)
     try:
         result = get_task_service().write_ai_clues(task_id, clues, user_id=user_id or "system")
         return _tool_json({

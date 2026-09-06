@@ -10,6 +10,7 @@ from agents.prompts.entity_review import ENTITY_REVIEW_SYSTEM_PROMPT
 from app.config import API_KEY, DEEPSEEK_EXTERNAL_CALLS_ENABLED
 from app.tasks import get_task_service
 from tools.entity_review import (
+    build_candidate_field_table,
     compare_candidate_fields,
     get_entity_candidate_context,
     list_candidate_relations,
@@ -23,6 +24,7 @@ ENTITY_REVIEW_TOOLS = {
     "list_entity_candidates": list_entity_candidates,
     "get_entity_candidate_context": get_entity_candidate_context,
     "compare_candidate_fields": compare_candidate_fields,
+    "build_candidate_field_table": build_candidate_field_table,
     "search_candidate_evidence": search_candidate_evidence,
     "list_candidate_relations": list_candidate_relations,
     "validate_candidate_evidence": validate_candidate_evidence,

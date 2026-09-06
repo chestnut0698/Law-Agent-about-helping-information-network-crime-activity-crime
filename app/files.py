@@ -1533,6 +1533,34 @@ def merge_person_spans(text: str, person_results: list) -> list:
     MERGE_STOP_WORDS = {"的", "和", "与", "及", "或", "以及", "及其", "暨"}
     VERB_PREFIXES = set("受被让给为由将把向对与同跟从在到予以用拿借凭靠沿顺朝往冲离除比")
     VERB_SUFFIXES = ["说", "道", "讲", "问", "答"]
+    # 与 entities 人名右边界一致：法律词不可并入姓名
+    LEGAL_RIGHT_TOKENS = (
+        "明知", "应知", "得知", "涉嫌", "供认", "供述", "陈述", "辩称", "表示", "承认", "否认",
+        "不如实", "拒不", "依法", "予以", "被依法", "称其", "说到",
+    )
+    INLINE_SEPS = set("/／\\｜|")
+
+    def _legal_at(pos: int) -> bool:
+        if pos < 0 or pos >= len(text):
+            return False
+        return any(text.startswith(tok, pos) for tok in LEGAL_RIGHT_TOKENS)
+
+    def _clamp(start: int, end: int) -> tuple[int, int]:
+        if start < 0 or end <= start or end > len(text):
+            return start, end
+        for i in range(start, end):
+            if text[i] in INLINE_SEPS:
+                end = i
+                break
+        for tok in LEGAL_RIGHT_TOKENS:
+            for overlap in range(1, len(tok) + 1):
+                cut = end - overlap
+                if cut >= start and text.startswith(tok, cut):
+                    end = cut
+                    break
+        while end > start and text[end - 1] in INLINE_SEPS:
+            end -= 1
+        return start, end
 
     merged = []
     current = person_results[0]
@@ -1545,7 +1573,12 @@ def merge_person_spans(text: str, person_results: list) -> list:
         )
         if clean_gap:
             second_first_char = text[r.start:r.start+1]
-            if second_first_char in VERB_PREFIXES:
+            if second_first_char in VERB_PREFIXES or _legal_at(r.start):
+                merged.append(current)
+                current = r
+                continue
+            # 间隙或邻接处已是法律词，不要并跨
+            if gap and _legal_at(current.end):
                 merged.append(current)
                 current = r
                 continue
@@ -1586,11 +1619,16 @@ def merge_person_spans(text: str, person_results: list) -> list:
         while len(name) >= 2 and name[0] in VERB_PREFIXES:
             name = name[1:]
             trim_count += 1
-        if trim_count > 0 and len(name) >= 2:
+        start = r.start + trim_count
+        end = r.end
+        start, end = _clamp(start, end)
+        if end - start < 2:
+            continue
+        if start != r.start or end != r.end:
             r = RecognizerResult(
                 entity_type="PERSON",
-                start=r.start + trim_count,
-                end=r.end,
+                start=start,
+                end=end,
                 score=r.score
             )
         trimmed.append(r)
@@ -1648,6 +1686,10 @@ def redact_text(
         spans.append((r.start, r.end, text[r.start:r.end], "PERSON"))
 
     VERB_PREFIXES = set("受被让给为由将把向对与同跟从在到予以用拿借凭靠沿顺朝往冲离除比")
+    LEGAL_RIGHT_TOKENS = (
+        "明知", "应知", "得知", "涉嫌", "供认", "供述", "陈述", "辩称", "表示", "承认", "否认",
+        "不如实", "拒不", "依法", "予以", "被依法", "称其", "说到",
+    )
     name_spans: dict[str, list[tuple[int, int]]] = {}
     for s, e, name, etype in spans:
         if etype == "PERSON":
@@ -1670,8 +1712,17 @@ def redact_text(
             remaining = long_name[len(short_name):]
             if remaining and remaining[0] in VERB_PREFIXES:
                 continue
+            # 「赵瑞」+「明」实为「明知」时，禁止扩成「赵瑞明」
+            if remaining and any(
+                tok.startswith(remaining) or remaining.startswith(tok)
+                for tok in LEGAL_RIGHT_TOKENS
+            ):
+                continue
             for sp_start, sp_end in short_positions:
                 next_start = sp_end
+                after = text[next_start:next_start + 8]
+                if any(after.startswith(tok) for tok in LEGAL_RIGHT_TOKENS):
+                    continue
                 if (next_start + len(remaining) <= len(text) and
                         text[next_start:next_start + len(remaining)] == remaining):
                     after_end = next_start + len(remaining)
@@ -2725,6 +2776,7 @@ class MaterialService:
         quote: str | None = None,
         quote_hash: str | None = None,
         restore_original: bool = False,
+        anchor_terms: list[str] | None = None,
     ) -> dict[str, Any]:
         with db_session(self.db_path) as conn:
             version = get_version(conn, document_version_id)
@@ -2799,27 +2851,61 @@ class MaterialService:
                 )
 
             quote_ok = None
+            reanchored = False
             if quote or quote_hash:
-                from tools.entities import quote_hash as compute_quote_hash, verify_quote_hash
+                from tools.entities import (
+                    quote_hash as compute_quote_hash,
+                    reanchor_citation,
+                    verify_quote_hash,
+                    _review_display_value,
+                )
 
                 if not quote or not quote_hash:
-                    raise deny(
-                        "quote_incomplete",
-                        "引用失效：缺少原文片段或哈希",
-                        ERROR_CODES["CITATION_STALE"],
-                        {"chunk_id": chunk["id"]},
+                    # 缺 hash 但有锚点时尝试重切；否则判失效
+                    recovered = reanchor_citation(
+                        text, quote=quote, expected_hash=quote_hash, anchor_terms=anchor_terms
                     )
+                    if recovered:
+                        quote, quote_hash = recovered
+                        reanchored = True
+                    else:
+                        raise deny(
+                            "quote_incomplete",
+                            "引用失效：缺少原文片段或哈希",
+                            ERROR_CODES["CITATION_STALE"],
+                            {"chunk_id": chunk["id"]},
+                        )
                 if not verify_quote_hash(text, quote, quote_hash):
-                    raise deny(
-                        "quote_hash_mismatch",
-                        "引用失效：原文片段与哈希不匹配",
-                        ERROR_CODES["CITATION_STALE"],
-                        {
-                            "chunk_id": chunk["id"],
-                            "expected_hash": quote_hash,
-                            "actual_hash": compute_quote_hash(quote) if quote in text else None,
-                        },
+                    recovered = reanchor_citation(
+                        text,
+                        quote=quote,
+                        expected_hash=quote_hash,
+                        anchor_terms=anchor_terms,
                     )
+                    if not recovered and anchor_terms:
+                        # 模型摘录/哈希常不可信：仅凭锚点重切，避免线索中心整片失效
+                        recovered = reanchor_citation(
+                            text,
+                            quote=None,
+                            expected_hash=None,
+                            anchor_terms=anchor_terms,
+                        )
+                    if recovered:
+                        quote, quote_hash = recovered
+                        reanchored = True
+                    else:
+                        raise deny(
+                            "quote_hash_mismatch",
+                            "引用失效：原文片段与哈希不匹配",
+                            ERROR_CODES["CITATION_STALE"],
+                            {
+                                "chunk_id": chunk["id"],
+                                "expected_hash": quote_hash,
+                                "actual_hash": compute_quote_hash(quote)
+                                if quote in text
+                                else None,
+                            },
+                        )
                 quote_ok = True
 
             add_audit(
@@ -2832,7 +2918,11 @@ class MaterialService:
                 decision="allow",
                 reason="ok",
                 detail_json=json.dumps(
-                    {"chunk_id": chunk["id"], "quote_verified": quote_ok},
+                    {
+                        "chunk_id": chunk["id"],
+                        "quote_verified": quote_ok,
+                        "quote_reanchored": reanchored,
+                    },
                     ensure_ascii=False,
                 ),
             )
@@ -2843,14 +2933,36 @@ class MaterialService:
             else:
                 aliases = get_global_mapper(self.db_path).alias_map()
                 display_text = render_display_aliases(chunk["text_redacted"], aliases)
-                display_quote = render_display_aliases(quote, aliases) if quote else None
+                # 展示态再走一遍，清掉残片 PERSON_xxx，避免前端落屏
+                display_quote = _review_display_value(quote, aliases=aliases) if quote else None
+                display_text = _review_display_value(display_text, aliases=aliases)
+            # 原文核验抽屉需要的卷宗抬头：案件、材料名、材料版本、识别质量
+            case_row = get_case(conn, case_id) if case_id else None
+            pages = [
+                page
+                for page in list_pages(conn, document_version_id)
+                if int(chunk["page_start"]) <= int(page["page_no"]) <= int(chunk["page_end"])
+            ]
+            confidences = [
+                float(page["avg_confidence"])
+                for page in pages
+                if page.get("avg_confidence") is not None
+            ]
             result = {
                 "chunk_id": chunk["id"],
+                "document_id": document_id,
                 "document_version_id": document_version_id,
+                "version_no": version.get("version_no"),
+                "filename": (document or {}).get("filename"),
+                "case_id": case_id,
+                "case_name": (case_row or {}).get("name") or case_id,
                 "ordinal": chunk["ordinal"],
                 "page_start": chunk["page_start"],
                 "page_end": chunk["page_end"],
                 "text": display_text,
+                "ocr_confidence": (
+                    round(sum(confidences) / len(confidences), 4) if confidences else None
+                ),
                 "quality_flags": json.loads(chunk.get("quality_flags_json") or "[]"),
                 "redacted": not restore_original,
             }
@@ -2858,6 +2970,9 @@ class MaterialService:
                 result["quote"] = display_quote
                 result["quote_hash"] = quote_hash
                 result["quote_verified"] = True
+                result["quote_reanchored"] = reanchored
+                # 存储态 quote 供前端后续回链；展示态在 result["quote"]
+                result["quote_storage"] = quote
             return result
 
     # ----- 人工修正 -----

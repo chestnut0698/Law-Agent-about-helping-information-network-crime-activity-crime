@@ -574,6 +574,8 @@
             this.tabs = [];
             this.activeTabId = null;
             this.artifactCache = {};
+            this._entityRefreshTried = false;
+            this._timelineRefreshTried = false;
             this.currentView = 'tasks';
 
             await this._bindConversation(task);
@@ -595,6 +597,19 @@
             if (artifactId) {
                 await this.openArtifact(artifactId);
             }
+        },
+
+        async refreshTask() {
+            if (!this.task || !this.task.id) return this.task;
+            const resp = await fetch(`/api/tasks/${this.task.id}`);
+            const task = await resp.json();
+            if (task.error_code) {
+                throw new Error(task.message || '刷新任务失败');
+            }
+            this.task = task;
+            this._renderNav();
+            this._renderContext();
+            return task;
         },
 
         _maybeOfferRerun() {
@@ -1144,7 +1159,17 @@
                 }
                 this.task = data.task;
                 await this.openArtifact(data.artifact.id);
-                Toast.success('判断已记录');
+                const followups = data.followup_actions || [];
+                if (followups.length) {
+                    Toast.success(followups.slice(0, 2).join('；'));
+                } else {
+                    Toast.success('判断已记录');
+                }
+                if (data.analysis_gate === 'ENTITY_REVIEW' && data.pending > 0) {
+                    Toast.info(`仍有 ${data.pending} 条待核，确认后方可继续后续分析`);
+                } else if (!data.analysis_gate && data.pending === 0) {
+                    Toast.info('实体复核已完成，可继续整理线索与报告');
+                }
             } catch (e) {
                 Toast.error('判断未能保存：' + e.message);
             } finally {
@@ -1162,6 +1187,8 @@
                     return;
                 }
                 this.task = data.task;
+                this.artifactCache = {};
+                this._entityRefreshTried = false;
                 await this.openArtifact(data.artifact.id);
                 Toast.success(`标识比对完成，待核对象 ${data.candidate_count || 0} 条`);
             } catch (e) {
@@ -1190,6 +1217,38 @@
             }
         },
 
+        _normalizeParties(parties) {
+            return (parties || []).map((p) => {
+                if (typeof p === 'string') {
+                    const surface = p.trim();
+                    if (!surface) return null;
+                    return {
+                        object_type: 'NAME',
+                        surface,
+                        display_name: surface,
+                        subject_id: `auto:NAME:${surface}`
+                    };
+                }
+                if (!p || typeof p !== 'object') return null;
+                const surface = (p.surface || p.display_name || '').trim();
+                if (!surface) return null;
+                return {
+                    object_type: p.object_type || 'NAME',
+                    surface,
+                    normalized_value: p.normalized_value || '',
+                    display_name: p.display_name || surface,
+                    subject_id: p.subject_id || `auto:${p.object_type || 'NAME'}:${p.normalized_value || surface}`
+                };
+            }).filter(Boolean);
+        },
+
+        _formatParties(parties) {
+            return this._normalizeParties(parties)
+                .map((p) => p.display_name || p.surface)
+                .filter(Boolean)
+                .join('；');
+        },
+
         async _runTimeline(button) {
             button.disabled = true;
             try {
@@ -1200,6 +1259,8 @@
                     return;
                 }
                 this.task = data.task;
+                this.artifactCache = {};
+                this._timelineRefreshTried = false;
                 await this.openArtifact(data.artifact.id);
                 Toast.success(`事件时间线已整理 ${data.event_count || 0} 条`);
             } catch (e) {
@@ -1209,57 +1270,288 @@
             }
         },
 
-        async _openCitation(source) {
+        async _openCitation(source, list, index) {
+            if (Array.isArray(list) && list.length) {
+                this.citeList = list;
+                this.citeIndex = Math.max(0, Math.min(index || 0, list.length - 1));
+            } else {
+                this.citeList = [source];
+                this.citeIndex = 0;
+            }
+            await this._loadCitation();
+        },
+
+        async _loadCitation() {
+            const source = (this.citeList || [])[this.citeIndex || 0];
+            if (!source) return;
             const versionId = source.document_version_id;
             const chunkId = source.chunk_id;
+            this._openCiteDrawerShell();
+            const body = Utils.$('#wb-cite-drawer-body');
+            if (body) {
+                body.innerHTML = '';
+                body.appendChild(Utils.create('div', { class: 'wb-cite-loading', text: '正在核对原文…' }));
+            }
             if (!versionId || !chunkId) {
-                Toast.warning('缺少原文定位');
+                this._renderCiteVerify({
+                    error: true,
+                    message: '该条依据尚未取得原文定位，不能用于确认或导出。'
+                }, source, {});
                 return;
             }
-            const params = new URLSearchParams();
-            if (source.quote_hash) params.set('quote_hash', source.quote_hash);
-            if (source.quote) params.set('quote', source.quote);
-            params.set('restore', '1');
-            const pane = Utils.$('#wb-cite-drawer');
-            if (pane) {
-                this._openCiteDrawerShell();
-                const body = Utils.$('#wb-cite-drawer-body');
-                if (body) {
-                    body.innerHTML = '';
-                    body.appendChild(Utils.create('div', { class: 'wb-cite-loading', text: '正在核对原文…' }));
-                }
-            }
-            try {
+            const anchors = [];
+            const pushAnchor = (v) => {
+                const s = String(v || '').trim();
+                if (!s || s.length < 2 || /^(PERSON|PHONE|ACCOUNT|ORG|DEVICE|ID)_/i.test(s)) return;
+                if (!anchors.includes(s)) anchors.push(s);
+            };
+            (source.highlight_terms || []).forEach(pushAnchor);
+            pushAnchor(source.value);
+            pushAnchor(source.extracted_value);
+            pushAnchor(source.quote_display);
+            // 从展示摘录里再抽可读词作锚点（禁止把存储态 PERSON_xxx 当锚点）
+            String(source.quote_display || '').split(/[\s，。；、,.；\n]+/).forEach(pushAnchor);
+
+            const storageQuote = source.quote_storage || source.quote || '';
+            const tryVerify = async (quote, quoteHash) => {
                 const resp = await fetch(
-                    `/api/materials/versions/${versionId}/chunks/${chunkId}?${params.toString()}`
+                    `/api/materials/versions/${versionId}/chunks/${chunkId}/verify`,
+                    {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            quote: quote || '',
+                            quote_hash: quoteHash || '',
+                            restore: 0,
+                            anchor_terms: anchors
+                        })
+                    }
                 );
-                const data = await resp.json();
+                return resp.json();
+            };
+
+            try {
+                let data = await tryVerify(storageQuote, source.quote_hash || '');
+                // 旧线索脏 hash：仅凭锚点再试一次
+                if (data.error_code && anchors.length) {
+                    data = await tryVerify('', '');
+                }
                 if (data.error_code) {
-                    Toast.error(data.message || '引用失效');
-                    this._renderCitePane({
+                    this._renderCiteVerify({
                         error: true,
-                        title: '引用失效',
-                        text: data.message || '原文已变更或哈希不匹配，禁止展示旧内容',
-                        meta: source.filename || source.document_name || ''
-                    }, source);
+                        message: data.message || '原文已变更或哈希不匹配，禁止展示旧内容'
+                    }, source, data);
                     return;
                 }
-                this._renderCitePane({
-                    error: false,
-                    title: '原文回链',
-                    text: data.text || source.quote || '无文本',
-                    meta: [source.filename || source.document_name, source.page_start || source.page_no ? `第 ${source.page_start || source.page_no} 页` : '']
-                        .filter(Boolean).join(' · ')
-                }, { ...source, quote: data.quote || source.quote });
+                // 存储态只留在内存供下次校验；界面只用展示态
+                if (data.quote_storage) source.quote_storage = data.quote_storage;
+                if (data.quote_hash) source.quote_hash = data.quote_hash;
+                if (data.quote) source.quote_display = data.quote;
+                this._renderCiteVerify(
+                    { error: false },
+                    { ...source, quote_display: data.quote || source.quote_display },
+                    data
+                );
             } catch (e) {
-                Toast.error('回链失败：' + e.message);
-                this._renderCitePane({
-                    error: true,
-                    title: '回链失败',
-                    text: e.message,
-                    meta: ''
-                }, source);
+                this._renderCiteVerify({ error: true, message: '回链失败：' + e.message }, source, {});
             }
+        },
+
+        _displayQuote(source) {
+            // 界面一律展示态；禁止落存储态 PERSON_xxx
+            const raw = String(
+                (source && (source.quote_display || source.display_quote)) || ''
+            ).trim();
+            if (raw && !/PERSON_|PHONE_|ACCOUNT_|ORG_|DEVICE_/i.test(raw)) return raw;
+            const fallback = String((source && source.quote) || '').trim();
+            if (!fallback) return '脱敏片段';
+            // 最后兜底：前端也遮罩占位符，绝不把存储态原文亮给用户
+            return fallback.replace(
+                /(?:PERSON|NAME|PHONE|ACCOUNT|ID|ORG|ORGANIZATION|DEVICE|BANK_CARD|CREDIT_CARD)_[a-f0-9]{1,16}/gi,
+                (tok) => {
+                    const u = tok.toUpperCase();
+                    if (u.startsWith('PERSON') || u.startsWith('NAME')) return '脱敏人员';
+                    if (u.startsWith('PHONE')) return '脱敏手机号';
+                    if (u.startsWith('ACCOUNT') || u.startsWith('BANK') || u.startsWith('CREDIT')) return '脱敏账户';
+                    if (u.startsWith('ORG')) return '脱敏组织';
+                    return '脱敏标识';
+                }
+            );
+        },
+
+        _collectHighlightTerms(source) {
+            const terms = [];
+            const push = (v) => {
+                const s = String(v || '').trim();
+                if (!s || s.length < 2) return;
+                if (/^(PERSON|PHONE|ACCOUNT|ORG|DEVICE|ID)_/i.test(s)) return;
+                if (!terms.includes(s)) terms.push(s);
+            };
+            (source && source.highlight_terms || []).forEach(push);
+            push(source && source.value);
+            push(source && source.extracted_value);
+            push(source && source.quote_display);
+            const display = this._displayQuote(source || {});
+            if (display && display.length <= 80) push(display);
+            return terms.sort((a, b) => b.length - a.length).slice(0, 8);
+        },
+
+        _escapeHtml(text) {
+            return String(text || '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;');
+        },
+
+        _renderHighlightedText(container, text, source) {
+            const raw = String(text || '');
+            const terms = this._collectHighlightTerms(source || {});
+            if (!raw || !terms.length) {
+                container.textContent = raw;
+                return;
+            }
+            // 在原文中定位：优先完整 quote，再定位被提取字段值
+            let html = this._escapeHtml(raw);
+            terms.forEach((term) => {
+                const esc = this._escapeHtml(term);
+                if (!esc || html.indexOf(esc) < 0) return;
+                // 只替换首次出现，避免整篇刷黄
+                html = html.replace(
+                    esc,
+                    `<mark class="wb-cite-mark"><strong>${esc}</strong></mark>`
+                );
+            });
+            container.innerHTML = html;
+        },
+
+        _renderVerifyText(container, fullText, source) {
+            const raw = String(fullText || '');
+            const terms = this._collectHighlightTerms(source || {});
+            const anchor = terms.map((t) => raw.indexOf(t)).filter((i) => i >= 0).sort((a, b) => a - b)[0];
+            if (!raw) {
+                container.textContent = '原文为空';
+                return;
+            }
+            let start = 0;
+            let end = raw.length;
+            if (anchor != null && raw.length > 460) {
+                start = Math.max(0, anchor - 180);
+                end = Math.min(raw.length, anchor + 280);
+            } else if (raw.length > 900) {
+                end = 900;
+            }
+            const window_ = raw.slice(start, end);
+            let html = this._escapeHtml(window_);
+            terms.forEach((term) => {
+                const esc = this._escapeHtml(term);
+                if (!esc || html.indexOf(esc) < 0) return;
+                html = html.replace(esc, `<mark class="wb-cite-mark"><strong>${esc}</strong></mark>`);
+            });
+            const prefix = start > 0 ? '<span class="wb-cite-omit">……（上文省略）……</span>' : '';
+            const suffix = end < raw.length ? '<span class="wb-cite-omit">……（下文省略）……</span>' : '';
+            container.innerHTML = prefix + html + suffix;
+        },
+
+        _renderCiteVerify(view, source, data) {
+            const bodyEl = Utils.$('#wb-cite-drawer-body');
+            const title = Utils.$('#wb-cite-title');
+            const kicker = Utils.$('#wb-cite-kicker');
+            if (!bodyEl) return;
+            this._openCiteDrawerShell();
+            const list = this.citeList || [source];
+            const index = this.citeIndex || 0;
+            if (kicker) kicker.textContent = view.error ? '引用失效' : '原文核验';
+            if (title) title.textContent = source.case_name || data.case_name || '原文核验';
+            bodyEl.innerHTML = '';
+
+            bodyEl.appendChild(Utils.create('div', {
+                class: 'wb-cite-desc',
+                text: `第 ${index + 1} / ${list.length} 条依据 · 逐字核验原文材料后再作处置判断`
+            }));
+
+            const conf = data.ocr_confidence != null ? data.ocr_confidence : source.ocr_confidence;
+            const pageNo = data.page_start || source.page_start || source.page_no;
+            const meta = Utils.create('div', { class: 'wb-cite-meta' });
+            [
+                ['所属案件', data.case_name || source.case_name || '—'],
+                ['材料名称', data.filename || source.filename || source.document_name || '—'],
+                ['材料版本', data.version_no != null ? `v${data.version_no}` : '—'],
+                ['页码', pageNo ? `第 ${pageNo} 页` : '—'],
+                ['识别质量', conf != null ? `${Math.round(conf * 100)}%` : '—']
+            ].forEach(([label, value]) => {
+                meta.appendChild(Utils.create('span', { class: 'wb-cite-meta-item' }, [
+                    Utils.create('span', { class: 'wb-cite-meta-label', text: `${label}：` }),
+                    Utils.create('b', { text: String(value) })
+                ]));
+            });
+            bodyEl.appendChild(meta);
+
+            if (view.error) {
+                bodyEl.appendChild(Utils.create('div', { class: 'wb-cite-invalid' }, [
+                    Utils.create('div', { class: 'wb-cite-invalid-title', text: '该引用当前已失效，不得用于确认或导出报告' }),
+                    Utils.create('div', { text: view.message || '材料版本已变更，请重新核验' })
+                ]));
+            }
+
+            const panel = Utils.create('section', { class: 'wb-cite-panel' });
+            panel.appendChild(Utils.create('div', { class: 'wb-cite-panel-head', text: '识别文本 · 高亮原句' }));
+            const textBox = Utils.create('div', { class: `wb-cite-body${view.error ? ' is-error' : ''}` });
+            if (view.error) {
+                // 失效时也只展示展示态摘要，禁止落存储态 quote
+                textBox.textContent = this._displayQuote(source) || view.message || '原文不可展示';
+            } else {
+                // data.text 已是展示态；高亮词也只用展示态
+                this._renderVerifyText(
+                    textBox,
+                    data.text || this._displayQuote(source) || '',
+                    { ...source, quote_display: data.quote || source.quote_display }
+                );
+            }
+            panel.appendChild(textBox);
+            if (conf != null && conf < 0.85) {
+                panel.appendChild(Utils.create('div', {
+                    class: 'wb-cite-lowconf',
+                    text: '识别置信度较低，建议人工复核'
+                }));
+            }
+            bodyEl.appendChild(panel);
+
+            const nav = Utils.create('div', { class: 'wb-cite-nav' });
+            const prev = Utils.create('button', { type: 'button', class: 'wb-btn wb-btn-outline', text: '‹ 上一条' });
+            const next = Utils.create('button', { type: 'button', class: 'wb-btn wb-btn-outline', text: '下一条 ›' });
+            prev.disabled = list.length <= 1;
+            next.disabled = list.length <= 1;
+            prev.addEventListener('click', () => {
+                this.citeIndex = (index - 1 + list.length) % list.length;
+                this._loadCitation();
+            });
+            next.addEventListener('click', () => {
+                this.citeIndex = (index + 1) % list.length;
+                this._loadCitation();
+            });
+            const drawer = Utils.$('#wb-cite-drawer');
+            const isFull = drawer && drawer.classList.contains('is-fullscreen');
+            const full = Utils.create('button', {
+                type: 'button',
+                class: 'wb-btn wb-btn-ghost',
+                text: isFull ? '退出全屏核验' : '进入全屏核验模式'
+            });
+            full.addEventListener('click', () => {
+                if (drawer) drawer.classList.toggle('is-fullscreen');
+                this._loadCitation();
+            });
+            nav.appendChild(prev);
+            nav.appendChild(full);
+            nav.appendChild(next);
+            bodyEl.appendChild(nav);
+
+            requestAnimationFrame(() => {
+                const mark = textBox.querySelector('.wb-cite-mark');
+                if (mark && typeof mark.scrollIntoView === 'function') {
+                    mark.scrollIntoView({ block: 'center', behavior: 'smooth' });
+                }
+            });
         },
 
         _renderCitePane(view, source) {
@@ -1281,27 +1573,215 @@
                 ]));
             }
             const body = Utils.create('div', { class: `wb-cite-body${view.error ? ' is-error' : ''}` });
-            const quote = (source && source.quote) || '';
+            const displayQuote = this._displayQuote(source || {});
             const text = view.text || '';
-            // 材料预览走 Markdown 结构渲染；带精确 quote 高亮时仍用纯文本，避免 HTML 偏移
-            if (!view.error && !quote && window.Markdown) {
+            if (!view.error && !displayQuote && !(source && (source.value || (source.highlight_terms || []).length)) && window.Markdown) {
                 body.classList.add('md-content');
                 body.innerHTML = Markdown.parse(text);
-            } else if (quote && text.includes(quote) && !view.error) {
-                const idx = text.indexOf(quote);
-                body.appendChild(document.createTextNode(text.slice(0, idx)));
-                body.appendChild(Utils.create('mark', { class: 'wb-cite-mark', text: quote }));
-                body.appendChild(document.createTextNode(text.slice(idx + quote.length)));
+            } else if (!view.error) {
+                this._renderHighlightedText(body, text, {
+                    ...source,
+                    quote_display: displayQuote,
+                    quote: displayQuote
+                });
             } else {
-                body.textContent = text;
+                body.textContent = text || displayQuote || '原文不可展示';
             }
             bodyEl.appendChild(body);
+            // 滚到首个高亮
+            requestAnimationFrame(() => {
+                const mark = body.querySelector('.wb-cite-mark');
+                if (mark && typeof mark.scrollIntoView === 'function') {
+                    mark.scrollIntoView({ block: 'center', behavior: 'smooth' });
+                }
+            });
+        },
+
+        _orgStyleEvidenceQuote(ev) {
+            // 与组织实体字段表短 q 同款：卡片只展示展示态短摘录
+            const raw = String(this._displayQuote(ev) || '').replace(/\s+/g, ' ').trim();
+            const value = String(ev.value || ev.extracted_value || '').trim();
+            const maxLen = 40;
+            if (!raw) return (value || '脱敏片段').slice(0, maxLen);
+            if (raw.length <= maxLen) return raw;
+            let needle = value;
+            if (!needle || needle.length > 40 || !raw.includes(needle)) {
+                const parts = value.split(/[、,，;/]/).map((p) => p.trim()).filter((p) => p.length >= 2);
+                needle = parts.find((p) => raw.includes(p)) || '';
+            }
+            if (needle && !/PERSON_|PHONE_|ACCOUNT_/i.test(needle)) {
+                const at = raw.indexOf(needle);
+                if (at >= 0) {
+                    const left = Math.max(0, at - Math.max(0, Math.floor((maxLen - needle.length) / 4)));
+                    const right = Math.min(raw.length, left + maxLen);
+                    const start = Math.max(0, right - maxLen);
+                    return raw.slice(start, right);
+                }
+            }
+            return raw.slice(0, maxLen);
+        },
+
+        _collectEntityEvidence(selected) {
+            // 原文回溯只保留：字段对照表「有值格子」出处 + 主标识每案最多 1 条兜底。
+            // 不再倾倒全部 records（旧逻辑会把「问：取过什么」这类切坏窗口塞进来）。
+            const list = [];
+            const seen = new Set();
+            const caseCovered = new Set();
+            const push = (ev, { primary = false } = {}) => {
+                if (!ev) return;
+                const quote = String(ev.quote || '').trim();
+                const value = String(ev.value || ev.extracted_value || '').trim();
+                // 有值时要求片段里能看见该值（或足够长的可核验 quote）
+                if (value && quote) {
+                    const compactQuote = quote.replace(/\s+/g, '');
+                    const compactDisplay = String(ev.quote_display || '').replace(/\s+/g, '');
+                    const compactValue = value.replace(/\s+/g, '');
+                    // 多值单元格（顿号拼接）任一子值出现即可
+                    const parts = compactValue.split(/[、,，;/]/).filter((p) => p.length >= 2);
+                    const hay = compactQuote + compactDisplay;
+                    const valueVisible = parts.length
+                        ? parts.some((p) => hay.includes(p))
+                        : (compactValue.length >= 2 && (
+                            hay.includes(compactValue)
+                            || compactValue.includes(compactQuote)
+                        ));
+                    // 短摘录（组织风格）里称谓常被脱敏成占位符，不能因字面看不到值就丢掉
+                    if (!valueVisible && quote.replace(/\s+/g, '').length > 40) return;
+                }
+                if (!ev.chunk_id || !ev.quote_hash || !quote) {
+                    // 失效条仍可展示，但排到后面
+                    ev = { ...ev, _invalid: true };
+                }
+                const key = `${ev.chunk_id || ''}|${ev.quote_hash || ''}|${quote}|${value}|${ev.field_label || ''}`;
+                if (seen.has(key)) return;
+                seen.add(key);
+                list.push(ev);
+                if (primary && ev.case_id && !ev._invalid) caseCovered.add(ev.case_id);
+            };
+
+            (selected.field_compare || []).forEach((field) => {
+                // 别名底表的「材料出处」只是路径文案，不进证据卡（避免长窗口破坏组织风格）
+                if (field.field_key === 'alias_material') return;
+                (field.per_case || []).forEach((cell) => {
+                    if (!cell.value && !(cell.sources || []).length) return;
+                    (cell.sources || []).forEach((src) => {
+                        const value = src.extracted_value || (
+                            String(cell.value || '').length <= 40 ? cell.value : ''
+                        ) || cell.value;
+                        push({
+                            case_name: src.case_name || cell.case_name,
+                            case_id: src.case_id || cell.case_id,
+                            filename: src.filename,
+                            page_start: src.page_start,
+                            page_end: src.page_end,
+                            quote: src.quote,
+                            quote_display: src.quote_display,
+                            quote_hash: src.quote_hash,
+                            chunk_id: src.chunk_id,
+                            document_version_id: src.document_version_id,
+                            document_id: src.document_id,
+                            ocr_confidence: src.ocr_confidence,
+                            value,
+                            field_label: field.label || src.field_label || field.field_key,
+                            highlight_terms: [src.extracted_value, cell.value].filter(Boolean)
+                        }, { primary: true });
+                    });
+                });
+            });
+
+            // 主标识兜底：每案 1 条，优先 evidence，其次 records 中 quote 含 value 的
+            const fallbacks = [];
+            (selected.evidence || []).forEach((ev) => {
+                fallbacks.push({
+                    case_name: ev.case_name,
+                    case_id: ev.case_id,
+                    filename: ev.filename,
+                    page_start: ev.page_start,
+                    page_end: ev.page_end,
+                    quote: ev.quote,
+                    quote_display: ev.quote_display,
+                    quote_hash: ev.quote_hash,
+                    chunk_id: ev.chunk_id,
+                    document_version_id: ev.document_version_id,
+                    document_id: ev.document_id,
+                    ocr_confidence: ev.ocr_confidence,
+                    value: ev.value,
+                    field_label: ev.field_label || '主标识',
+                    highlight_terms: [ev.value].filter(Boolean),
+                    _rank: 0
+                });
+            });
+            (selected.records || []).forEach((rec) => {
+                const src = rec.source || {};
+                fallbacks.push({
+                    case_name: rec.case_name,
+                    case_id: rec.case_id,
+                    filename: src.document_name,
+                    page_start: src.page_no,
+                    quote: src.quote,
+                    quote_display: src.quote_display,
+                    quote_hash: src.quote_hash,
+                    chunk_id: src.chunk_id,
+                    document_version_id: src.document_version_id,
+                    ocr_confidence: src.ocr_confidence,
+                    value: rec.value,
+                    field_label: '主标识',
+                    highlight_terms: [rec.value].filter(Boolean),
+                    _rank: 1
+                });
+            });
+            fallbacks
+                .sort((a, b) => (a._rank - b._rank) || String(b.quote || '').length - String(a.quote || '').length)
+                .forEach((ev) => {
+                    if (!ev.case_id || caseCovered.has(ev.case_id)) return;
+                    push(ev, { primary: true });
+                });
+
+            list.sort((a, b) => Number(!!a._invalid) - Number(!!b._invalid));
+            return list;
+        },
+
+        async _buildFieldTable(candidateId, force) {
+            if (!candidateId || !this.task || !this.task.id) return;
+            if (this._fieldTableBusy) return;
+            this._fieldTableTried = this._fieldTableTried || {};
+            if (!force && this._fieldTableTried[candidateId]) return;
+            this._fieldTableTried[candidateId] = true;
+            this._fieldTableBusy = candidateId;
+            if (force) Toast.info('正在按材料重建字段对照表…');
+            try {
+                const resp = await fetch(
+                    `/api/tasks/${this.task.id}/entity-candidates/${candidateId}/field-table`,
+                    {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ force: !!force })
+                    }
+                );
+                const result = await resp.json();
+                if (!result.ok) {
+                    // 模型不可用或身份锚定失败时保留规则字段表，不清空页面
+                    if (force) Toast.warning(result.message || result.error || '字段表生成未完成，仍保留原表');
+                    return;
+                }
+                this.artifactCache = {};
+                await this.refreshTask();
+                this._renderCurrentView();
+                if (force) Toast.success('字段对照表已按材料重建');
+            } catch (e) {
+                if (force) Toast.error('字段表生成失败：' + e.message);
+            } finally {
+                this._fieldTableBusy = null;
+            }
         },
 
         _closeCiteDrawer() {
             const drawer = Utils.$('#wb-cite-drawer');
             const center = Utils.$('#wb-center');
-            if (drawer) drawer.hidden = true;
+            if (drawer) {
+                drawer.hidden = true;
+                drawer.classList.remove('is-fullscreen');
+            }
             if (center) center.classList.remove('cite-open');
         },
 
@@ -1369,16 +1849,22 @@
             });
             panel.appendChild(Utils.create('div', { class: 'wb-group-label', text: '证据摘录（点击回原文）' }));
             (payload.evidence || []).forEach(ev => {
+                const displayQuote = this._displayQuote(ev);
                 const row = Utils.create('div', { class: 'wb-entity-record' }, [
                     Utils.create('div', { class: 'case', text: ev.case_name || ev.case_id || '' }),
-                    Utils.create('div', { class: 'value', text: ev.quote || '脱敏片段' }),
+                    Utils.create('div', { class: 'value', text: displayQuote }),
                     Utils.create('div', {
                         class: 'source',
                         text: [ev.filename, ev.page_start ? `第 ${ev.page_start} 页` : ''].filter(Boolean).join(' · ')
                     })
                 ]);
                 row.style.cursor = 'pointer';
-                row.addEventListener('click', () => this._openCitation(ev));
+                row.addEventListener('click', () => this._openCitation({
+                    ...ev,
+                    quote_storage: ev.quote_storage || ev.quote,
+                    quote_display: ev.quote_display || displayQuote,
+                    highlight_terms: [ev.value, ev.extracted_value].filter(Boolean)
+                }));
                 panel.appendChild(row);
             });
             if (payload.uncertainty) {
@@ -1532,7 +2018,7 @@
                             class: 'wb-timeline-meta',
                             text: [
                                 item.amount_text || '',
-                                (item.parties || []).join('；'),
+                                this._formatParties(item.parties || []),
                                 source.filename || '',
                                 source.page_start ? `第 ${source.page_start} 页` : ''
                             ].filter(Boolean).join(' · ') || '点击回链原文'
@@ -2711,29 +3197,70 @@
         async _ensureEntitySet() {
             const art = (this.task.artifacts || []).find((a) => a.type === 'ENTITY_CANDIDATE_SET');
             if (!art) return null;
-            let data = this.artifactCache[art.id] || await this._fetchArtifact(art.id);
+            delete this.artifactCache[art.id];
+            let data = await this._fetchArtifact(art.id);
             const ver = (((data || {}).payload || {}).summary || {}).extractor_version || '';
             // 旧产物用过时抽取器时自动重跑，否则页面会一直显示噪声人名
-            if (!this._entityRefreshTried && this.task && this.task.id && ver !== 'stage7-fuzzy-v2') {
-                this._entityRefreshTried = true;
+            if (!this._entityRefreshTried && this.task && this.task.id && ver !== 'stage9-quote-v1') {
                 try {
                     Toast.info('实体识别规则已升级，正在重新抽取比对…');
                     const resp = await fetch(`/api/tasks/${this.task.id}/collision/run`, { method: 'POST' });
                     const result = await resp.json();
-                    if (!result.error_code && result.ok !== false) {
-                        await this.refreshTask();
-                        const next = (this.task.artifacts || []).find((a) => a.type === 'ENTITY_CANDIDATE_SET');
-                        if (next) {
-                            delete this.artifactCache[next.id];
-                            data = await this._fetchArtifact(next.id);
-                        }
-                        Toast.success(`已按新规则更新，待核 ${result.candidate_count || 0} 条`);
+                    if (result.error_code) {
+                        Toast.warning('自动重抽未完成，仍显示旧结果：' + (result.message || ''));
+                        return data;
                     }
+                    this._entityRefreshTried = true;
+                    this.artifactCache = {};
+                    await this.refreshTask();
+                    const next = (this.task.artifacts || []).find((a) => a.type === 'ENTITY_CANDIDATE_SET');
+                    if (next) {
+                        data = await this._fetchArtifact(next.id);
+                    }
+                    Toast.success(`已按新规则更新，待核 ${result.candidate_count || 0} 条`);
                 } catch (e) {
                     Toast.warning('自动重抽未完成，仍显示旧结果：' + (e.message || ''));
                 }
+            } else if (ver === 'stage9-quote-v1') {
+                this._entityRefreshTried = true;
             }
             return data;
+        },
+
+        async _ensureTimelineSet() {
+            const art = (this.task.artifacts || []).find((a) => a.type === 'ROLE_TIMELINE');
+            if (!art) return { art: null, data: null };
+            delete this.artifactCache[art.id];
+            let data = await this._fetchArtifact(art.id);
+            const ver = (((data || {}).payload || {}).summary || {}).extractor_version || '';
+            if (!this._timelineRefreshTried && this.task && this.task.id && ver !== 'stage6-party-v2') {
+                try {
+                    Toast.info('时间线规则已升级，正在重新整理事件…');
+                    const resp = await fetch(`/api/tasks/${this.task.id}/timeline/run`, { method: 'POST' });
+                    const result = await resp.json();
+                    if (result.error_code) {
+                        Toast.warning('时间线重跑未完成，仍显示旧结果：' + (result.message || ''));
+                        return { art, data };
+                    }
+                    this._timelineRefreshTried = true;
+                    this.artifactCache = {};
+                    this.task = result.task || this.task;
+                    if (typeof this.refreshTask === 'function') {
+                        await this.refreshTask();
+                    }
+                    const next = (this.task.artifacts || []).find((a) => a.type === 'ROLE_TIMELINE');
+                    Toast.success(`时间线已更新 ${result.event_count || 0} 条`);
+                    if (next) {
+                        data = await this._fetchArtifact(next.id);
+                        return { art: next, data };
+                    }
+                } catch (e) {
+                    Toast.warning('时间线重跑未完成，仍显示旧结果：' + (e.message || ''));
+                }
+            } else if (ver === 'stage6-party-v2') {
+                this._timelineRefreshTried = true;
+            }
+            return { art, data };
         },
 
         async _viewEntities(root) {
@@ -2898,6 +3425,22 @@
                     text: payload.boundary || '复核提示：系统仅提供可解释的关联候选。请结合原文与字段差异作出判断，不要将候选直接作为事实结论。'
                 })
             ]));
+            const gate = payload.analysis_gate || (payload.summary || {}).analysis_gate || '';
+            if (pendingCount > 0 || gate === 'ENTITY_REVIEW') {
+                root.appendChild(Utils.create('div', { class: 'wb-alert info' }, [
+                    window.Icons ? Icons.el('sparkles') : Utils.create('span', { text: '→' }),
+                    Utils.create('span', {
+                        text: `分析确认门闩：仍有 ${pendingCount} 条待核。请逐条作出「视为同一」或「保留独立」；全部确认后，右侧助手才会继续整理线索与报告。`
+                    })
+                ]));
+            } else if (candidates.length) {
+                root.appendChild(Utils.create('div', { class: 'wb-alert ok' }, [
+                    window.Icons ? Icons.el('check') : Utils.create('span', { text: '✓' }),
+                    Utils.create('span', {
+                        text: '实体复核已完成。可继续整理线索、刷新时间线主体，或生成报告。'
+                    })
+                ]));
+            }
 
             if (!candidates.length) {
                 root.appendChild(Utils.create('div', { class: 'wb-empty', text: '尚无跨案对象候选。请先在「分析任务」发起跨案分析或标识比对。' }));
@@ -3036,13 +3579,22 @@
             const detail = Utils.create('div', { class: 'wb-entity-detail-stack' });
             const overview = Utils.create('section', { class: 'wb-detail-card wb-entity-overview-card' });
             const overviewHead = Utils.create('div', { class: 'wb-detail-card-head wb-entity-overview-head' });
+            const titleLine = Utils.create('div', { class: 'wb-entity-title-line' }, [
+                Utils.create('div', { class: 'wb-entity-title wb-entity-main-title', text: selected.display_name }),
+                Utils.create('span', {
+                    class: 'wb-entity-type-badge',
+                    text: typeLabel[selected.entity_type] || selected.entity_type || '对象'
+                })
+            ]);
+            const recallMethod = selected.recall_method
+                || (selected.match_tier === 'SUSPECTED' ? '姓名相似 + 关联字段召回' : '跨案标识召回');
             const heading = Utils.create('div', { class: 'wb-entity-heading' }, [
                 window.Icons ? Icons.el(Icons.forEntityType(selected.entity_type), 'wb-entity-main-icon') : Utils.create('span'),
                 Utils.create('div', {}, [
-                    Utils.create('div', { class: 'wb-entity-title wb-entity-main-title', text: selected.display_name }),
+                    titleLine,
                     Utils.create('div', {
                         class: 'wb-file-meta',
-                        text: `${typeLabel[selected.entity_type] || selected.entity_type || '对象'} · ${selected.confidence_label || '待核验'}${selected.match_tier === 'SUSPECTED' ? ' · 疑似化名' : ''}`
+                        text: `${recallMethod}${selected.recalled_at ? ` · 召回于 ${selected.recalled_at}` : ''}`
                     })
                 ])
             ]);
@@ -3088,22 +3640,32 @@
             overview.appendChild(overviewBody);
             detail.appendChild(overview);
 
-            // 模块二：字段 × 案件矩阵。即使字段未记载也明确展示“未记载”。
+            // 模块二：字段表由 DeepSeek 依材料现场设计，不同实体表头不同
             const compareCard = Utils.create('section', { class: 'wb-detail-card wb-entity-section-card' });
-            compareCard.appendChild(Utils.create('div', { class: 'wb-detail-card-head' }, [
-                Utils.create('div', { class: 'wb-entity-title', text: '字段对照与差异说明' })
-            ]));
+            const compareHead = Utils.create('div', { class: 'wb-detail-card-head' }, [
+                Utils.create('div', {
+                    class: 'wb-entity-title',
+                    text: ((selected.field_table_meta || {}).table_title) || '字段对照与差异说明'
+                })
+            ]);
+            const rebuild = this._iconBtn('wb-btn wb-btn-ghost wb-btn-sm', 'refresh', '重建字段表');
+            rebuild.addEventListener('click', () => this._buildFieldTable(selected.candidate_id, true));
+            compareHead.appendChild(rebuild);
+            compareCard.appendChild(compareHead);
             const compareBody = Utils.create('div', { class: 'wb-detail-card-body wb-compare-body' });
-            const compareCases = selected.cases || [];
+            const compareCases = selected.field_compare_columns || selected.cases || [];
             const fields = selected.field_compare || [];
             const compareTable = Utils.create('div', { class: 'wb-compare-table' });
-            const columns = `150px repeat(${Math.max(compareCases.length, 1)}, minmax(150px, 1fr))`;
+            const columns = `140px repeat(${Math.max(compareCases.length, 1)}, minmax(140px, 1fr))`;
             const tableHead = Utils.create('div', { class: 'wb-compare-row wb-compare-head' });
             tableHead.style.gridTemplateColumns = columns;
             tableHead.appendChild(Utils.create('div', { text: '字段' }));
+            const aliasMode = !!(selected.field_compare_columns || []).length;
             compareCases.forEach((caseItem, index) => {
                 tableHead.appendChild(Utils.create('div', {
-                    text: `来源 ${String.fromCharCode(65 + index)}${caseItem.case_name ? ` · ${caseItem.case_name}` : ''}`
+                    text: aliasMode
+                        ? `称谓 · ${caseItem.case_name || caseItem.label || ''}`
+                        : `来源 ${String.fromCharCode(65 + index)}${caseItem.case_name ? ` · ${caseItem.case_name}` : ''}`
                 }));
             });
             compareTable.appendChild(tableHead);
@@ -3114,71 +3676,91 @@
                     class: 'wb-compare-field-name',
                     text: field.label || field.field_key || '字段'
                 }));
-                compareCases.forEach((caseItem) => {
-                    const value = (field.per_case || []).find((item) => item.case_id === caseItem.case_id) || {};
-                    const state = !value.value || value.status === 'missing'
+                const cells = compareCases.map((caseItem) =>
+                    (field.per_case || []).find((item) => item.case_id === caseItem.case_id) || {}
+                );
+                cells.forEach((value) => {
+                    const rawStatus = value.status || (!value.value ? 'missing' : 'same');
+                    const state = !value.value || rawStatus === 'missing'
                         ? 'missing'
-                        : (value.status === 'diff' ? 'diff' : 'same');
-                    const stateLabel = { same: '一致', diff: '不一致', missing: '未记载' }[state];
-                    row.appendChild(Utils.create('div', { class: 'wb-compare-cell' }, [
-                        Utils.create('span', { class: `wb-compare-status ${state}`, text: stateLabel }),
-                        Utils.create('span', { class: state === 'missing' ? 'wb-match-na' : '', text: value.value || '未记载' })
-                    ]));
+                        : (rawStatus === 'diff' ? 'diff' : (rawStatus === 'partial' ? 'partial' : 'same'));
+                    const stateLabel = {
+                        same: '一致',
+                        diff: '不一致',
+                        missing: '未记载',
+                        partial: '部分一致'
+                    }[state];
+                    const cell = Utils.create('div', { class: 'wb-compare-cell' });
+                    cell.appendChild(Utils.create('span', {
+                        class: `wb-compare-status ${state}`,
+                        text: stateLabel
+                    }));
+                    cell.appendChild(Utils.create('span', {
+                        class: `wb-compare-value${state === 'missing' ? ' wb-match-na' : ''}${state === 'diff' ? ' is-diff' : ''}`,
+                        text: value.value || '未记载'
+                    }));
+                    row.appendChild(cell);
                 });
                 compareTable.appendChild(row);
             });
             compareBody.appendChild(compareTable);
-            if ((selected.supporting_facts || []).length || (selected.conflicts || []).length) {
-                const explanation = Utils.create('div', { class: 'wb-compare-explanation' });
-                (selected.supporting_facts || []).forEach((fact) => {
-                    explanation.appendChild(Utils.create('span', { class: 'wb-match-ok', text: `一致：${fact}` }));
-                });
-                (selected.conflicts || []).forEach((fact) => {
-                    explanation.appendChild(Utils.create('span', { class: 'wb-match-bad', text: `差异：${fact}` }));
-                });
-                compareBody.appendChild(explanation);
+            if (!fields.length) {
+                compareBody.appendChild(Utils.create('div', {
+                    class: 'wb-empty',
+                    text: this._fieldTableBusy === selected.candidate_id ? '正在按材料生成字段对照表…' : '暂无字段对照，可点「重建字段表」。'
+                }));
             }
             compareCard.appendChild(compareBody);
             detail.appendChild(compareCard);
+            if (!(selected.field_table_meta || {}).producer) {
+                this._buildFieldTable(selected.candidate_id, false);
+            }
 
-            // 模块三：每案关键原文，可回链打开原材料。
+            // 模块三：依据材料与原文片段（各类实体同一卡片：案名+页码徽标 / 引用片段 / 材料·字段·打开原文）
             const evidenceCard = Utils.create('section', { class: 'wb-detail-card wb-entity-section-card' });
             evidenceCard.appendChild(Utils.create('div', { class: 'wb-detail-card-head' }, [
                 Utils.create('div', { class: 'wb-entity-title', text: '依据材料与原文片段' })
             ]));
             const evidenceBody = Utils.create('div', { class: 'wb-detail-card-body wb-evidence-list' });
-            const evidence = selected.evidence || [];
-            const records = selected.records || [];
-            const evidenceList = evidence.length ? evidence : records.map((rec) => ({
-                case_name: rec.case_name,
-                case_id: rec.case_id,
-                filename: (rec.source || {}).document_name,
-                page_start: (rec.source || {}).page_no,
-                quote: (rec.source || {}).quote,
-                quote_hash: (rec.source || {}).quote_hash,
-                chunk_id: (rec.source || {}).chunk_id,
-                document_version_id: (rec.source || {}).document_version_id,
-                value: rec.value
-            }));
+            const evidenceList = this._collectEntityEvidence(selected);
             const showAllEvidence = this.expandedEntityEvidenceId === selected.candidate_id;
-            evidenceList.slice(0, showAllEvidence ? 99 : 4).forEach((ev) => {
+            evidenceList.slice(0, showAllEvidence ? 99 : 4).forEach((ev, evIndex) => {
+                const linkable = !!(ev.chunk_id && ev.quote_hash);
+                const badgeText = linkable
+                    ? [
+                        ev.page_start ? `第 ${ev.page_start} 页` : '已定位',
+                        ev.ocr_confidence != null ? `OCR ${Math.round(ev.ocr_confidence * 100)}%` : ''
+                    ].filter(Boolean).join(' · ')
+                    : '引用失效';
+                const fieldPart = ev.field_label ? `字段·${ev.field_label}` : '';
                 const row = Utils.create('article', { class: 'wb-evidence-card' }, [
                     Utils.create('div', { class: 'wb-evidence-card-head' }, [
                         Utils.create('strong', { text: ev.case_name || ev.case_id || '案件材料' }),
                         Utils.create('span', {
-                            class: 'wb-evidence-page',
-                            text: ev.page_start ? `第 ${ev.page_start} 页` : '已定位'
+                            class: `wb-evidence-page${linkable ? '' : ' is-invalid'}`,
+                            text: badgeText
                         })
                     ]),
-                    Utils.create('blockquote', { text: `“${(ev.quote || ev.value || '脱敏片段').slice(0, 180)}”` }),
+                    Utils.create('blockquote', {
+                        text: `“${this._orgStyleEvidenceQuote(ev)}”`
+                    }),
                     Utils.create('div', { class: 'wb-evidence-card-foot' }, [
-                        Utils.create('span', { text: ev.filename || '材料原文' }),
-                        Utils.create('span', { class: 'wb-open-source', text: ev.chunk_id && ev.quote_hash ? '打开原文 ↗' : '待补定位' })
+                        Utils.create('span', {
+                            text: [
+                                ev.filename || '材料原文',
+                                ev.version_no != null ? `v${ev.version_no}` : '',
+                                fieldPart
+                            ].filter(Boolean).join(' · ')
+                        }),
+                        Utils.create('span', {
+                            class: 'wb-open-source',
+                            text: linkable ? '打开原文 ↗' : '待补定位'
+                        })
                     ])
                 ]);
-                if (ev.chunk_id && ev.quote_hash) {
+                if (linkable) {
                     row.classList.add('clickable');
-                    row.addEventListener('click', () => this._openCitation(ev));
+                    row.addEventListener('click', () => this._openCitation(ev, evidenceList, evIndex));
                 }
                 evidenceBody.appendChild(row);
             });
@@ -3311,8 +3893,7 @@
             const p = selected.payload || {};
             const detail = Utils.create('div', { class: 'wb-detail-card' });
             detail.appendChild(Utils.create('div', { class: 'wb-detail-card-head' }, [
-                Utils.create('div', { class: 'wb-entity-title', text: '线索处置' }),
-                Utils.create('div', { class: 'wb-file-meta', text: selected.artifact.id })
+                Utils.create('div', { class: 'wb-entity-title', text: '线索处置' })
             ]));
             const detailBody = Utils.create('div', { class: 'wb-detail-card-body' });
             detailBody.appendChild(Utils.create('div', {
@@ -3334,8 +3915,14 @@
             openEv.style.marginTop = '10px';
             openEv.addEventListener('click', () => {
                 const ev = (p.evidence || [])[0];
-                if (ev) this._openCitation(ev);
-                else Toast.info('暂无原文依据');
+                if (ev) {
+                    this._openCitation({
+                        ...ev,
+                        quote_storage: ev.quote_storage || ev.quote,
+                        quote_display: ev.quote_display || this._displayQuote(ev),
+                        highlight_terms: [ev.value, ev.extracted_value].filter(Boolean)
+                    });
+                } else Toast.info('暂无原文依据');
             });
             detailBody.appendChild(openEv);
 
@@ -3376,7 +3963,8 @@
             const page = Utils.create('div', { class: 'ref-tl-page' });
             root.appendChild(page);
 
-            const art = (this.task.artifacts || []).find((a) => a.type === 'ROLE_TIMELINE');
+            const ensured = await this._ensureTimelineSet();
+            const art = ensured.art || (this.task.artifacts || []).find((a) => a.type === 'ROLE_TIMELINE');
             if (!art) {
                 page.appendChild(Utils.create('div', { class: 'ref-tl-head' }, [
                     Utils.create('div', {}, [
@@ -3397,13 +3985,21 @@
                 return;
             }
 
-            const data = await this._fetchArtifact(art.id);
+            const data = ensured.data || await this._fetchArtifact(art.id);
             const payload = (data && data.payload) || {};
             const items = payload.items || [];
 
             const normalized = items.map((item, idx) => {
-                const parties = item.parties || [];
-                const subject = parties[0] || item.case_name || item.case_id || `事件 ${idx + 1}`;
+                const parties = this._normalizeParties(item.parties || []);
+                const primary = parties[0];
+                const subject = item.subject
+                    || (primary && (primary.display_name || primary.surface))
+                    || item.case_name
+                    || item.case_id
+                    || `事件 ${idx + 1}`;
+                const subjectId = item.subject_id
+                    || (primary && primary.subject_id)
+                    || subject;
                 const uncertain = !item.time_text || item.time_precision === 'UNKNOWN';
                 let sourceMode = item.source_mode || item.sourceMode;
                 if (!sourceMode) {
@@ -3424,7 +4020,9 @@
                     : (item.case_name ? [item.case_name] : (item.case_id ? [item.case_id] : []));
                 return {
                     ...item,
+                    parties,
                     subject,
+                    subjectId,
                     sourceMode,
                     timeCertain: !uncertain,
                     roleOrAction: item.role_or_action
@@ -3438,9 +4036,16 @@
             });
 
             if (this.timelineSubject == null) this.timelineSubject = 'all';
-            const subjects = Array.from(new Set(normalized.map((e) => e.subject)));
+            const subjectMap = new Map();
+            normalized.forEach((e) => {
+                const key = e.subjectId || e.subject;
+                if (!subjectMap.has(key)) subjectMap.set(key, e.subject);
+            });
+            const subjectEntries = Array.from(subjectMap.entries());
             const filtered = normalized.filter((e) =>
-                this.timelineSubject === 'all' || e.subject === this.timelineSubject
+                this.timelineSubject === 'all'
+                || e.subjectId === this.timelineSubject
+                || e.subject === this.timelineSubject
             );
 
             const head = Utils.create('div', { class: 'ref-tl-head' });
@@ -3496,8 +4101,8 @@
             ]));
             const select = Utils.create('select');
             select.appendChild(Utils.create('option', { value: 'all', text: '全部主体' }));
-            subjects.forEach((name) => {
-                select.appendChild(Utils.create('option', { value: name, text: name }));
+            subjectEntries.forEach(([id, name]) => {
+                select.appendChild(Utils.create('option', { value: id, text: name }));
             });
             select.value = this.timelineSubject;
             select.addEventListener('change', () => {
