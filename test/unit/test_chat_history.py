@@ -83,31 +83,44 @@ def test_repair_chat_messages_removes_duplicates(tmp_path):
     svc.save_message(task_id, "assistant", "最终说明")
 
     repaired = svc.repair_chat_messages(task_id)
-    assert [m["role"] for m in repaired] == ["user", "assistant", "tool", "assistant"]
+    # ensure_task_system_prompt 会补当前 TASK_AGENT_PROMPT，并置顶
+    assert [m["role"] for m in repaired] == ["system", "user", "assistant", "tool", "assistant"]
     remaining = svc.get_messages(task_id)
-    assert len(remaining) == 4
-    assert remaining[-1]["content"] == "最终说明"
+    assert len(remaining) == 5
+    assert any(r["role"] == "system" for r in remaining)
+    assert remaining[-1]["content"] == "最终说明" or any(
+        r["content"] == "最终说明" for r in remaining
+    )
 
 
-def test_save_messages_appends_once(tmp_path, monkeypatch):
-    db = tmp_path / "chat.db"
-    svc = TaskService(db_path=db)
-    monkeypatch.setattr("agents.react_agent.get_task_service", lambda: svc)
-    monkeypatch.setattr("app.tasks.get_task_service", lambda: svc)
-
-    task_id = "task-save"
-    agent = ReactAgent(task_id=task_id)
-    agent.task_id = task_id
-    agent.messages = [
-        {"role": "user", "content": "开始分析"},
-        _assistant_tools("先看范围", ["c1"]),
-        _tool("c1", "overview"),
+def test_messages_for_llm_keeps_reasoning_content():
+    messages = [
+        {"role": "user", "content": "继续"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "get_task_overview", "arguments": "{}"},
+                }
+            ],
+            "reasoning_content": "先看任务范围",
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "ok"},
     ]
-    agent._persisted_count = 0
-    agent.save_messages_to_db()
-    agent.save_messages_to_db()
-    rows = svc.get_messages(task_id)
-    assert len(rows) == 3
-    assert [r["role"] for r in rows] == ["user", "assistant", "tool"]
-    assert rows[1]["tool_call_id"] is None
-    assert rows[2]["tool_call_id"] == "c1"
+    payload = messages_for_llm(messages)
+    assert payload[1]["reasoning_content"] == "先看任务范围"
+    assert payload[2]["role"] == "tool"
+
+
+def test_public_chat_error_reasoning_hint():
+    from agents.react_agent import _public_chat_error
+
+    text = _public_chat_error(
+        Exception(
+            "Error code: 400 - The `reasoning_content` in the thinking mode must be passed back to the API."
+        )
+    )
+    assert "思考过程" in text

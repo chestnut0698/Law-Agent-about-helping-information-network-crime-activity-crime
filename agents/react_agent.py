@@ -3,9 +3,13 @@ from app.chat_history import messages_for_llm
 from app.config import *
 import inspect
 import json
+import logging
+import traceback
 from tools.tools import *
 from pathlib import Path
 from app.tasks import get_task_service
+
+logger = logging.getLogger(__name__)
 
 # ReAct（Reason + Act）模式的核心思想——让 AI 交替进行"推理（Reason）"和"行动（Act）"，并通过观察（Observation）来驱动下一步。
 class ReactAgent(BaseAgent):
@@ -82,6 +86,9 @@ class ReactAgent(BaseAgent):
         )
         try:
             max_rounds = 16
+            # 纯思考轮不要落成空 assistant，否则下一轮 DeepSeek 会因消息序列/缺
+            # reasoning_content 回传而 400；先攒着，并入下一轮有正文或工具的消息。
+            pending_reasoning = ""
             for _round in range(max_rounds):
                 stream = self.llm_call()
 
@@ -90,7 +97,10 @@ class ReactAgent(BaseAgent):
                 tool_calls_buffer = {}
 
                 for chunk in stream:
-                    delta = chunk.choices[0].delta
+                    choices = getattr(chunk, "choices", None) or []
+                    if not choices:
+                        continue
+                    delta = choices[0].delta
                     if hasattr(delta, "reasoning_content") and delta.reasoning_content:
                         collected_reasoning += delta.reasoning_content
                         yield ("reasoning_content", delta.reasoning_content)
@@ -111,20 +121,24 @@ class ReactAgent(BaseAgent):
                             if tc.function.arguments:
                                 tool_calls_buffer[idx]["arguments"] += tc.function.arguments
 
+                merged_reasoning = f"{pending_reasoning}{collected_reasoning}"
+
                 if not tool_calls_buffer:
-                    msg = {"role": "assistant", "content": collected_content}
-                    if collected_reasoning:
-                        msg["reasoning_content"] = collected_reasoning
-                    self.messages.append(msg)
-                    # 本轮无工具 → 推送最终可见回复
+                    # 本轮无工具 → 有可见回复才落库并结束；纯思考不落空 assistant
                     if collected_content:
+                        msg = {"role": "assistant", "content": collected_content}
+                        if merged_reasoning:
+                            msg["reasoning_content"] = merged_reasoning
+                        self.messages.append(msg)
+                        pending_reasoning = ""
                         yield ("content", collected_content)
                         break
-                    # 只有可见回复才结束；纯思考空白轮继续，避免计划被空回复空推进
+                    if collected_reasoning:
+                        pending_reasoning = merged_reasoning
                     continue
 
                 # 工具轮：把模型夹带的 content 当作本步思路（无 reasoning 通道时）
-                if collected_content and not collected_reasoning:
+                if collected_content and not collected_reasoning and not pending_reasoning:
                     yield ("reasoning_content", collected_content)
 
                 tool_calls_msg = []
@@ -157,14 +171,17 @@ class ReactAgent(BaseAgent):
                     "content": collected_content,
                     "tool_calls": tool_calls_msg,
                 }
-                if collected_reasoning:
-                    assistant_msg["reasoning_content"] = collected_reasoning
+                if merged_reasoning:
+                    assistant_msg["reasoning_content"] = merged_reasoning
+                pending_reasoning = ""
                 self.messages.append(assistant_msg)
                 self.messages += messages_tool_return
 
             self.save_messages_to_db()
             yield ("done", {})
         except Exception as exc:
+            logger.exception("chat interrupted: %s", exc)
+            traceback.print_exc()
             yield ("error", _public_chat_error(exc))
 
     @staticmethod
@@ -203,4 +220,10 @@ def _public_chat_error(exc: Exception) -> str:
     text = str(exc)
     if "tool_calls" in text or "tool_call_id" in text:
         return "对话记录已自动修复，请再发送一次即可继续。"
+    if "reasoning_content" in text and "thinking" in text.lower():
+        return "思考过程未正确回传，请再发送一次即可继续。"
+    if "context length" in text.lower() or "maximum context" in text.lower():
+        return "对话上下文过长，请新开一轮对话或精简后再试。"
+    if "timeout" in text.lower() or "timed out" in text.lower():
+        return "模型响应超时，请稍后重试。"
     return "分析过程中断，请稍后重试。"

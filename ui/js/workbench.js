@@ -27,11 +27,13 @@
         currentView: 'tasks',
         selectedEntityId: null,
         selectedLeadId: null,
+        selectedLeadEvidenceIndex: 0,
         selectedGraphNodeId: null,
         materialsQuery: '',
         materialsCaseFilter: 'all',
         leadsQuery: '',
         leadsStatusFilter: 'all',
+        leadsEntityFilter: null,
         artifactCache: {},
 
         async init() {
@@ -935,11 +937,8 @@
             runBtn.addEventListener('click', () => this._executeAnalysis(runBtn));
             const collideBtn = this._iconBtn('wb-btn wb-btn-ghost', 'users', '只做标识比对');
             collideBtn.addEventListener('click', () => this._runCollision(collideBtn));
-            const clueBtn = this._iconBtn('wb-btn wb-btn-ghost', 'link2', '只生成疑似关联线索');
-            clueBtn.addEventListener('click', () => this._generateClues(clueBtn));
             actions.appendChild(runBtn);
             actions.appendChild(collideBtn);
-            actions.appendChild(clueBtn);
             panel.appendChild(actions);
 
             const metrics = Utils.create('div', { class: 'wb-entity-metrics' }, [
@@ -999,11 +998,66 @@
             });
         },
 
-        _metric(label, value) {
-            return Utils.create('div', { class: 'wb-entity-metric' }, [
+        _metric(label, value, onClick) {
+            const el = Utils.create('div', {
+                class: onClick ? 'wb-entity-metric is-clickable' : 'wb-entity-metric'
+            }, [
                 Utils.create('div', { class: 'v', text: String(value) }),
                 Utils.create('div', { class: 'k', text: label })
             ]);
+            if (onClick) {
+                el.title = '点击查看';
+                el.addEventListener('click', onClick);
+            }
+            return el;
+        },
+
+        _recommendationLabel(code) {
+            return {
+                MERGE: '建议视为同一对象',
+                KEEP_SEPARATE: '建议保留为独立主体',
+                CORRECT: '建议更正后重核',
+                DEFER: '建议暂缓，待人工核验',
+                NEED_MORE_EVIDENCE: '建议补充材料后再核'
+            }[String(code || '').toUpperCase()] || '待人工核验';
+        },
+
+        _openLeadsForEntity(candidate, { draftOnly = false } = {}) {
+            const refs = candidate.generated_clues || [];
+            const preferred = draftOnly
+                ? refs.find((item) => item.status === 'DRAFT') || refs[0]
+                : refs[0];
+            this.leadsEntityFilter = {
+                candidateId: candidate.candidate_id || '',
+                fingerprint: candidate.fingerprint || '',
+                artifactIds: refs.map((item) => item.artifact_id).filter(Boolean),
+                draftOnly: !!draftOnly
+            };
+            this.selectedLeadId = preferred ? preferred.artifact_id : null;
+            this.setView('leads');
+        },
+
+        _clueMatchesEntityFilter(payload, artifactId) {
+            const filter = this.leadsEntityFilter;
+            if (!filter) return true;
+            const ids = filter.artifactIds || [];
+            if (ids.length) {
+                if (!ids.includes(artifactId)) return false;
+            } else {
+                const linked = (payload.linked_candidate_ids || []).map(String);
+                const fps = [
+                    ...(payload.fingerprints || []),
+                    payload.fingerprint || ''
+                ].map(String).filter(Boolean);
+                const byCandidate = filter.candidateId && linked.includes(String(filter.candidateId));
+                const byFp = filter.fingerprint && fps.includes(String(filter.fingerprint));
+                if (!byCandidate && !byFp) return false;
+            }
+            if (filter.draftOnly) {
+                const art = (this.task.artifacts || []).find((a) => a.id === artifactId);
+                return (art && art.status === 'DRAFT') || false;
+            }
+            return true;
         },
 
         _entityCandidateCard(candidate, index, artifactStatus, version) {
@@ -1193,25 +1247,6 @@
                 Toast.success(`标识比对完成，待核对象 ${data.candidate_count || 0} 条`);
             } catch (e) {
                 Toast.error('标识比对未能完成：' + e.message);
-            } finally {
-                button.disabled = false;
-            }
-        },
-
-        async _generateClues(button) {
-            button.disabled = true;
-            try {
-                const resp = await fetch(`/api/tasks/${this.task.id}/clues/generate`, { method: 'POST' });
-                const data = await resp.json();
-                if (data.error_code) {
-                    Toast.error(data.message || '线索生成未能完成');
-                    return;
-                }
-                this.task = data.task;
-                await this.openArtifact(data.artifact.id);
-                Toast.success(`疑似关联线索已生成 ${ (data.created || []).length } 条`);
-            } catch (e) {
-                Toast.error('线索生成未能完成：' + e.message);
             } finally {
                 button.disabled = false;
             }
@@ -1520,14 +1555,22 @@
             const nav = Utils.create('div', { class: 'wb-cite-nav' });
             const prev = Utils.create('button', { type: 'button', class: 'wb-btn wb-btn-outline', text: '‹ 上一条' });
             const next = Utils.create('button', { type: 'button', class: 'wb-btn wb-btn-outline', text: '下一条 ›' });
+            const counter = Utils.create('span', {
+                class: 'wb-cite-nav-count',
+                text: list.length > 1
+                    ? `本线索依据 ${index + 1}/${list.length}`
+                    : (list.length === 1 ? '本线索依据 1/1' : '无依据')
+            });
             prev.disabled = list.length <= 1;
             next.disabled = list.length <= 1;
             prev.addEventListener('click', () => {
                 this.citeIndex = (index - 1 + list.length) % list.length;
+                this.selectedLeadEvidenceIndex = this.citeIndex;
                 this._loadCitation();
             });
             next.addEventListener('click', () => {
                 this.citeIndex = (index + 1) % list.length;
+                this.selectedLeadEvidenceIndex = this.citeIndex;
                 this._loadCitation();
             });
             const drawer = Utils.$('#wb-cite-drawer');
@@ -1542,6 +1585,7 @@
                 this._loadCitation();
             });
             nav.appendChild(prev);
+            nav.appendChild(counter);
             nav.appendChild(full);
             nav.appendChild(next);
             bodyEl.appendChild(nav);
@@ -1790,128 +1834,6 @@
             const center = Utils.$('#wb-center');
             if (drawer) drawer.hidden = false;
             if (center) center.classList.add('cite-open');
-        },
-
-        _renderClueSet(panel, payload) {
-            panel.appendChild(Utils.create('div', { class: 'wb-callout' }, [
-                Utils.create('span', { text: payload.boundary || '线索停留在待核验层级，请打开单条后在卡片内处置。' })
-            ]));
-            const summary = payload.summary || {};
-            panel.appendChild(Utils.create('div', { class: 'wb-entity-metrics' }, [
-                this._metric('线索', summary.total || 0),
-                this._metric('新生成', summary.created || 0),
-                this._metric('本轮跳过', summary.skipped || 0)
-            ]));
-            const items = payload.items || [];
-            if (!items.length) {
-                const skipped = payload.skipped || [];
-                const skipText = skipped.length
-                    ? `本轮跳过 ${skipped.length} 条（${skipped.slice(0, 3).map(s => s.reason).join('、')}）。`
-                    : '';
-                panel.appendChild(Utils.create('div', {
-                    class: 'wb-empty',
-                    text: `尚无跨案疑似关联线索。${skipText}通常需要：完整卡号/手机号/设备号同时出现在两起及以上案件，或同一账户出现在多案转账、同一手机号出现在多案联络。仅有尾号、掩码号或卡号校验未通过时，结果为 0 属正常。打开单条线索后，可在卡片底部继续核查、排除或暂缓。`
-                }));
-                return;
-            }
-            items.forEach(item => {
-                const open = this._iconBtn('wb-btn wb-btn-ghost', 'externalLink', '打开并处置');
-                if (item.artifact_id) {
-                    open.addEventListener('click', () => this.openArtifact(item.artifact_id));
-                }
-                panel.appendChild(Utils.create('section', { class: 'wb-entity-card' }, [
-                    Utils.create('div', { class: 'wb-entity-card-head' }, [
-                        Utils.create('div', { class: 'wb-entity-title', text: item.title || '疑似关联线索' }),
-                        Utils.create('span', { class: 'wb-pill ok', text: '待打开' })
-                    ]),
-                    Utils.create('div', { class: 'wb-entity-card-body' }, [
-                        Utils.create('div', {
-                            class: 'wb-file-meta',
-                            text: `涉及 ${item.case_count || '—'} 起案件 · 可回原文定位 ${item.chunk_count || 0} 处`
-                        }),
-                        open
-                    ])
-                ]));
-            });
-        },
-
-        _renderClueItem(panel, payload, status, artifact, version) {
-            panel.appendChild(Utils.create('div', { class: 'wb-callout' }, [
-                Utils.create('span', {
-                    text: payload.boundary || '本条仅为疑似关联线索，请在核对原文后作出处置；不构成法律结论。'
-                })
-            ]));
-            panel.appendChild(Utils.create('div', { class: 'wb-summary-v', text: payload.title || '' }));
-            panel.appendChild(Utils.create('div', { class: 'wb-file-meta', text: payload.summary || '' }));
-            panel.appendChild(Utils.create('div', { class: 'wb-group-label', text: '涉及案件' }));
-            (payload.cases || []).forEach(c => {
-                panel.appendChild(Utils.create('div', { class: 'wb-file-meta', text: c.case_name || c.case_id }));
-            });
-            panel.appendChild(Utils.create('div', { class: 'wb-group-label', text: '证据摘录（点击回原文）' }));
-            (payload.evidence || []).forEach(ev => {
-                const displayQuote = this._displayQuote(ev);
-                const row = Utils.create('div', { class: 'wb-entity-record' }, [
-                    Utils.create('div', { class: 'case', text: ev.case_name || ev.case_id || '' }),
-                    Utils.create('div', { class: 'value', text: displayQuote }),
-                    Utils.create('div', {
-                        class: 'source',
-                        text: [ev.filename, ev.page_start ? `第 ${ev.page_start} 页` : ''].filter(Boolean).join(' · ')
-                    })
-                ]);
-                row.style.cursor = 'pointer';
-                row.addEventListener('click', () => this._openCitation({
-                    ...ev,
-                    quote_storage: ev.quote_storage || ev.quote,
-                    quote_display: ev.quote_display || displayQuote,
-                    highlight_terms: [ev.value, ev.extracted_value].filter(Boolean)
-                }));
-                panel.appendChild(row);
-            });
-            if (payload.uncertainty) {
-                panel.appendChild(Utils.create('div', { class: 'wb-callout warn', text: payload.uncertainty }));
-            }
-
-            const dispositionLabel = {
-                CONTINUE: '继续核查',
-                NEED_MATERIAL: '需补材料',
-                EXCLUDE: '排除',
-                DEFER: '暂缓'
-            };
-            const review = Utils.create('div', { class: 'wb-entity-review' });
-            panel.appendChild(Utils.create('div', { class: 'wb-group-label', text: '内联处置' }));
-            if (payload.disposition && dispositionLabel[payload.disposition]) {
-                review.appendChild(Utils.create('div', {
-                    class: 'wb-callout',
-                    text: `${dispositionLabel[payload.disposition]}：${payload.disposition_reason || '已记录'}`
-                }));
-            } else if (!['STALE', 'INVALID'].includes(status)) {
-                const actions = [
-                    ['CONTINUE', '继续核查', 'check'],
-                    ['NEED_MATERIAL', '需补材料', 'fileStack'],
-                    ['EXCLUDE', '排除', 'x'],
-                    ['DEFER', '暂缓', 'info']
-                ];
-                const buttons = Utils.create('div', { class: 'wb-entity-actions' });
-                actions.forEach(([code, label, icon]) => {
-                    const button = this._iconBtn(
-                        `wb-btn${code === 'CONTINUE' ? ' wb-btn-primary' : ' wb-btn-ghost'}`,
-                        icon,
-                        label
-                    );
-                    button.addEventListener('click', () => {
-                        this._showClueDispositionForm(
-                            review,
-                            artifact.id,
-                            code,
-                            label,
-                            version
-                        );
-                    });
-                    buttons.appendChild(button);
-                });
-                review.appendChild(buttons);
-            }
-            panel.appendChild(review);
         },
 
         _showClueDispositionForm(container, artifactId, disposition, label, version) {
@@ -3233,7 +3155,7 @@
             delete this.artifactCache[art.id];
             let data = await this._fetchArtifact(art.id);
             const ver = (((data || {}).payload || {}).summary || {}).extractor_version || '';
-            if (!this._timelineRefreshTried && this.task && this.task.id && ver !== 'stage6-party-v2') {
+            if (!this._timelineRefreshTried && this.task && this.task.id && ver !== 'stage7-role-subject-v1') {
                 try {
                     Toast.info('时间线规则已升级，正在重新整理事件…');
                     const resp = await fetch(`/api/tasks/${this.task.id}/timeline/run`, { method: 'POST' });
@@ -3257,7 +3179,7 @@
                 } catch (e) {
                     Toast.warning('时间线重跑未完成，仍显示旧结果：' + (e.message || ''));
                 }
-            } else if (ver === 'stage6-party-v2') {
+            } else if (ver === 'stage7-role-subject-v1') {
                 this._timelineRefreshTried = true;
             }
             return { art, data };
@@ -3387,7 +3309,7 @@
                 });
             }
 
-            const reviewBtn = this._iconBtn('wb-btn wb-btn-outline', 'sparkles', 'Agent 复核建议');
+            const reviewBtn = this._iconBtn('wb-btn wb-btn-outline', 'sparkles', '模型复核建议');
             reviewBtn.addEventListener('click', async () => {
                 reviewBtn.disabled = true;
                 try {
@@ -3399,15 +3321,26 @@
                         })
                     });
                     const result = await resp.json();
-                    if (result.error_code || result.ok === false) {
-                        Toast.error(result.message || result.error || '复核未能完成');
+                    if (result.error_code || result.ok === false || result.fallback) {
+                        Toast.warning(
+                            result.message
+                            || result.error
+                            || '模型未返回有效分析，请直接查看字段对照与原文。'
+                        );
                         return;
                     }
-                    Toast.success('复核建议已更新');
+                    const suggestion = result.suggestion || {};
+                    const rec = result.recommendation || suggestion.recommendation || '';
+                    const summary = result.agent_summary || suggestion.agent_summary || '';
+                    Toast.success(
+                        summary
+                            ? `${this._recommendationLabel(rec)}：${summary}`
+                            : this._recommendationLabel(rec)
+                    );
                     await this.refreshTask();
                     this._renderCurrentView();
                 } catch (e) {
-                    Toast.error(e.message || '复核未能完成');
+                    Toast.error(e.message || '复核建议未能完成');
                 } finally {
                     reviewBtn.disabled = false;
                 }
@@ -3620,22 +3553,33 @@
             const caseCount = impact.case_count || (selected.cases || []).length || 0;
             const relationCount = impact.relation_count || 0;
             const clueCount = impact.clue_count || (selected.generated_clues || []).length || 0;
+            const openAllClues = clueCount
+                ? () => this._openLeadsForEntity(selected, { draftOnly: false })
+                : null;
+            const openDraftClues = relationCount
+                ? () => this._openLeadsForEntity(selected, { draftOnly: true })
+                : null;
             overviewBody.appendChild(Utils.create('div', { class: 'wb-entity-metrics' }, [
                 this._metric('涉及案件', caseCount),
-                this._metric('受影响关联', relationCount),
-                this._metric('生成线索', clueCount)
+                this._metric('待升格线索', relationCount, openDraftClues),
+                this._metric('关联线索', clueCount, openAllClues)
             ]));
-            if (selected.agent_summary) {
+            const advice = selected.ai_suggestion || {};
+            const isModelAdvice = advice.source === 'model' && advice.fallback !== true
+                && advice.producer === 'DEEPSEEK_ENTITY_REVIEW'
+                && String(advice.agent_summary || selected.agent_summary || '').trim();
+            if (isModelAdvice) {
+                const summaryText = String(advice.agent_summary || selected.agent_summary || '').trim();
+                const recCode = advice.recommendation || selected.recommendation || '';
                 overviewBody.appendChild(Utils.create('div', { class: 'wb-agent-summary' }, [
-                    Utils.create('span', { class: 'wb-agent-summary-label', text: 'Agent 复核：' }),
-                    Utils.create('span', { text: selected.agent_summary })
+                    Utils.create('span', {
+                        class: 'wb-agent-summary-label',
+                        text: '模型建议：'
+                    }),
+                    Utils.create('span', {
+                        text: `${this._recommendationLabel(recCode)}。${summaryText}`
+                    })
                 ]));
-            }
-            if ((selected.decision || 'PENDING') !== 'PENDING') {
-                overviewBody.appendChild(Utils.create('div', {
-                    class: 'wb-file-meta',
-                    text: `已记录：${selected.decision} · ${selected.reason || ''}`
-                }));
             }
             overview.appendChild(overviewBody);
             detail.appendChild(overview);
@@ -3782,29 +3726,54 @@
         },
 
         async _collectClueItems() {
-            const arts = (this.task.artifacts || []).filter((a) => a.type === 'CLUE_ITEM');
+            const arts = (this.task.artifacts || []).filter(
+                (a) => a.type === 'CLUE_ITEM' && !['STALE', 'INVALID'].includes(a.status)
+            );
             const items = [];
             for (const a of arts) {
                 const data = this.artifactCache[a.id] || await this._fetchArtifact(a.id);
-                if (data) items.push(data);
+                if (!data) continue;
+                const st = (data.artifact && data.artifact.status) || a.status;
+                if (['STALE', 'INVALID'].includes(st)) continue;
+                const p = data.payload || {};
+                // 只展示统一办案风卡片；旧规则长文案在再生前不混入列表
+                if (!p.analysis || !Array.isArray(p.counter_evidence) || !p.aspect) continue;
+                items.push(data);
             }
             return items;
         },
 
         async _viewLeads(root) {
             const items = await this._collectClueItems();
-            const exportBtn = this._iconBtn('wb-btn wb-btn-outline', 'filter', '导出筛选结果');
-            exportBtn.addEventListener('click', () => Toast.info('线索导出即将接入'));
             root.appendChild(this._pageHead(
                 '关联线索中心',
-                '按证据与核验状态管理疑似关联线索；处置结果写入核验留痕。',
-                exportBtn,
+                '按核验方面管理疑似关联线索；重新整理后会替换旧条。处置结果写入核验留痕。',
+                null,
                 `${items.length} 条线索`
             ));
 
             if (!items.length) {
-                root.appendChild(Utils.create('div', { class: 'wb-empty', text: '尚无线索。请先发起跨案分析或生成疑似关联线索。' }));
+                root.appendChild(Utils.create('div', {
+                    class: 'wb-empty',
+                    text: '尚无线索。可在右侧对话说明：请按标识、资金、时空等不同方面重新整理疑似关联线索；完成后到本页核验原文。'
+                }));
                 return;
+            }
+
+            if (this.leadsEntityFilter) {
+                const clear = this._iconBtn('wb-btn wb-btn-ghost wb-btn-sm', 'x', '清除实体过滤');
+                clear.addEventListener('click', () => {
+                    this.leadsEntityFilter = null;
+                    this._renderCurrentView();
+                });
+                root.appendChild(Utils.create('div', { class: 'wb-alert info' }, [
+                    Utils.create('span', {
+                        text: this.leadsEntityFilter.draftOnly
+                            ? '当前仅显示与所选实体关联的待升格线索。'
+                            : '当前仅显示与所选实体关联的线索。'
+                    }),
+                    clear
+                ]));
             }
 
             const toolbar = Utils.create('div', { class: 'wb-toolbar' });
@@ -3841,6 +3810,8 @@
             const q = (this.leadsQuery || '').toLowerCase();
             const filtered = items.filter((d) => {
                 const p = d.payload || {};
+                const artId = d.artifact && d.artifact.id;
+                if (!this._clueMatchesEntityFilter(p, artId)) return false;
                 const disp = p.disposition || 'PENDING';
                 if (this.leadsStatusFilter !== 'all' && disp !== this.leadsStatusFilter) return false;
                 const hay = `${p.title || ''} ${(p.objects || []).join(' ')} ${(p.cases || []).join(' ')}`.toLowerCase();
@@ -3866,23 +3837,43 @@
                     EXCLUDE: '已排除', DEFER: '暂缓'
                 }[disp] || disp;
                 const tone = disp === 'EXCLUDE' ? 'danger' : (disp === 'PENDING' || disp === 'NEED_MATERIAL' || disp === 'DEFER' ? 'warn' : 'ok');
-                const item = Utils.create('button', {
-                    type: 'button',
-                    class: `wb-list-item${d.artifact.id === selected.artifact.id ? ' active' : ''}`
-                }, [
+                const basis = p.match_basis || p.rule_id || '';
+                const aspectLabel = {
+                    ID: '标识同一性',
+                    FUND: '资金路径',
+                    TIME: '时空连续',
+                    ROLE: '角色冲突',
+                    QUAL: '材料质量',
+                    PLAT: '平台共现'
+                }[String(p.aspect || '').toUpperCase()] || '';
+                const chips = (p.objects || []).slice(0, 4);
+                const metaChildren = [
+                    this._statusTag(label, tone)
+                ];
+                if (aspectLabel) {
+                    metaChildren.push(Utils.create('span', { class: 'wb-clue-basis', text: aspectLabel }));
+                }
+                if (basis && basis !== 'AI_CLUE') {
+                    metaChildren.push(Utils.create('span', { class: 'wb-clue-basis', text: basis }));
+                }
+                const itemChildren = [
                     Utils.create('div', { class: 'wb-list-item-title', text: p.title || d.artifact.title }),
                     Utils.create('div', {
                         style: 'display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;align-items:center'
-                    }, [
-                        this._statusTag(label, tone),
-                        Utils.create('span', {
-                            class: 'wb-file-meta',
-                            text: (p.objects || []).slice(0, 3).join(' · ')
-                        })
-                    ])
-                ]);
+                    }, metaChildren)
+                ];
+                if (chips.length) {
+                    itemChildren.push(Utils.create('div', { class: 'wb-clue-chips' },
+                        chips.map((c) => Utils.create('span', { class: 'wb-clue-chip', text: c }))
+                    ));
+                }
+                const item = Utils.create('button', {
+                    type: 'button',
+                    class: `wb-list-item${d.artifact.id === selected.artifact.id ? ' active' : ''}`
+                }, itemChildren);
                 item.addEventListener('click', () => {
                     this.selectedLeadId = d.artifact.id;
+                    this.selectedLeadEvidenceIndex = 0;
                     this._renderCurrentView();
                 });
                 listBody.appendChild(item);
@@ -3896,12 +3887,36 @@
                 Utils.create('div', { class: 'wb-entity-title', text: '线索处置' })
             ]));
             const detailBody = Utils.create('div', { class: 'wb-detail-card-body' });
-            detailBody.appendChild(Utils.create('div', {
-                class: 'wb-callout',
-                text: p.uncertainty || p.boundary || '标识重合仅为待核验线索，不代表同一人或共同犯罪。'
+            const analysisText = String(p.analysis || p.summary || '').trim();
+            if (analysisText) {
+                detailBody.appendChild(Utils.create('div', {
+                    class: 'wb-clue-analysis',
+                    text: analysisText
+                }));
+            } else {
+                detailBody.appendChild(Utils.create('div', {
+                    class: 'wb-callout',
+                    text: p.uncertainty || p.boundary || '标识重合仅为待核验线索，不代表同一人或共同犯罪。'
+                }));
+            }
+            const supportList = (p.evidence || []).map((ev) => ({
+                ...ev,
+                stance: ev.stance || 'support',
+                quote_storage: ev.quote_storage || ev.quote,
+                quote_display: ev.quote_display || this._displayQuote(ev),
+                highlight_terms: [ev.value, ev.extracted_value].filter(Boolean)
             }));
-            const support = (p.evidence || []).length;
-            const counter = (p.counter_evidence || []).length;
+            const counterList = (p.counter_evidence || []).map((ev) => ({
+                ...ev,
+                stance: ev.stance || 'counter',
+                quote_storage: ev.quote_storage || ev.quote,
+                quote_display: ev.quote_display || this._displayQuote(ev),
+                highlight_terms: [ev.value, ev.extracted_value].filter(Boolean)
+            }));
+            // 同线索内翻阅：支持材料在前，反向材料在后；绝不混入其他线索
+            const clueEvidenceList = [...supportList, ...counterList];
+            const support = supportList.length;
+            const counter = counterList.length;
             detailBody.appendChild(Utils.create('div', {
                 class: 'wb-entity-title',
                 text: '证据概览',
@@ -3910,19 +3925,23 @@
             const evMeta = Utils.create('div', { class: 'wb-file-meta' });
             evMeta.innerHTML = `<span>${support} 条支持材料</span> · <span class="wb-match-bad">${counter} 条反向材料</span>`;
             detailBody.appendChild(evMeta);
+            if (p.uncertainty || p.boundary) {
+                detailBody.appendChild(Utils.create('div', {
+                    class: 'wb-file-meta',
+                    style: 'margin-top:6px',
+                    text: p.uncertainty || p.boundary
+                }));
+            }
             const openEv = this._iconBtn('wb-btn wb-btn-outline', 'externalLink', '打开原文依据');
             openEv.style.width = '100%';
             openEv.style.marginTop = '10px';
             openEv.addEventListener('click', () => {
-                const ev = (p.evidence || [])[0];
-                if (ev) {
-                    this._openCitation({
-                        ...ev,
-                        quote_storage: ev.quote_storage || ev.quote,
-                        quote_display: ev.quote_display || this._displayQuote(ev),
-                        highlight_terms: [ev.value, ev.extracted_value].filter(Boolean)
-                    });
-                } else Toast.info('暂无原文依据');
+                if (!clueEvidenceList.length) {
+                    Toast.info('暂无原文依据');
+                    return;
+                }
+                const start = Math.max(0, Math.min(this.selectedLeadEvidenceIndex || 0, clueEvidenceList.length - 1));
+                this._openCitation(clueEvidenceList[start], clueEvidenceList, start);
             });
             detailBody.appendChild(openEv);
 
@@ -3965,6 +3984,7 @@
 
             const ensured = await this._ensureTimelineSet();
             const art = ensured.art || (this.task.artifacts || []).find((a) => a.type === 'ROLE_TIMELINE');
+            const subCopy = '按时间查看同一人物（或账户）在各案中的角色与行为记载及原文依据。';
             if (!art) {
                 page.appendChild(Utils.create('div', { class: 'ref-tl-head' }, [
                     Utils.create('div', {}, [
@@ -3972,10 +3992,7 @@
                             Utils.create('h1', { text: '角色时间线' }),
                             Utils.create('span', { class: 'ref-tl-node-badge', text: '0 个节点' })
                         ]),
-                        Utils.create('div', {
-                            class: 'sub',
-                            text: '围绕人员、账户与行为记载，按时间重建跨案角色变化与证据来源。'
-                        })
+                        Utils.create('div', { class: 'sub', text: subCopy })
                     ])
                 ]));
                 page.appendChild(Utils.create('div', { class: 'wb-empty', text: '尚未生成事件时间线。' }));
@@ -3989,21 +4006,52 @@
             const payload = (data && data.payload) || {};
             const items = payload.items || [];
 
+            const caseNameSet = new Set(
+                (this.task.cases || []).map((c) => c.display_name || c.name || c.case_id).filter(Boolean)
+            );
+
             const normalized = items.map((item, idx) => {
                 const parties = this._normalizeParties(item.parties || []);
-                const primary = parties[0];
-                const subject = item.subject
-                    || (primary && (primary.display_name || primary.surface))
-                    || item.case_name
-                    || item.case_id
-                    || `事件 ${idx + 1}`;
+                const personParty = parties.find((p) => {
+                    const t = (p.object_type || '').toUpperCase();
+                    return t === 'NAME' || t === 'PERSON';
+                });
+                const accountParty = parties.find((p) => (p.object_type || '').toUpperCase() === 'ACCOUNT');
+                let subjectKind = (item.subject_kind || '').toUpperCase();
+                if (subjectKind !== 'PERSON' && subjectKind !== 'ACCOUNT') {
+                    if (item.person_subject_id || personParty) subjectKind = 'PERSON';
+                    else if (item.account_subject_id || accountParty) subjectKind = 'ACCOUNT';
+                    else subjectKind = '';
+                }
+                let subject = item.subject
+                    || (subjectKind === 'ACCOUNT'
+                        ? (item.account_subject || (accountParty && (accountParty.display_name || accountParty.surface)))
+                        : (item.person_subject || (personParty && (personParty.display_name || personParty.surface))))
+                    || '';
+                // 禁止把案件名当作主体
+                if (!subject || caseNameSet.has(subject) || subject === item.case_name || subject === item.case_id) {
+                    subject = item.person_subject
+                        || item.account_subject
+                        || (personParty && (personParty.display_name || personParty.surface))
+                        || (accountParty && (accountParty.display_name || accountParty.surface))
+                        || '';
+                }
                 const subjectId = item.subject_id
-                    || (primary && primary.subject_id)
-                    || subject;
-                const uncertain = !item.time_text || item.time_precision === 'UNKNOWN';
-                let sourceMode = item.source_mode || item.sourceMode;
-                if (!sourceMode) {
-                    sourceMode = uncertain ? 'inferred' : 'recorded';
+                    || (subjectKind === 'ACCOUNT'
+                        ? (item.account_subject_id || (accountParty && accountParty.subject_id))
+                        : (item.person_subject_id || (personParty && personParty.subject_id)))
+                    || '';
+                const uncertain = Boolean(item.time_uncertain)
+                    || !item.time_text
+                    || item.time_precision === 'UNKNOWN';
+                // 缺时间 ≠ 系统推测
+                let sourceMode = item.source_mode || item.sourceMode || 'recorded';
+                if (sourceMode === 'inferred' && uncertain && item.event_type !== 'INFERRED'
+                    && !(item.role_or_action || '').startsWith('系统推测')) {
+                    sourceMode = 'recorded';
+                }
+                if (!['recorded', 'inferred', 'confirmed'].includes(sourceMode)) {
+                    sourceMode = 'recorded';
                 }
                 const source = item.source || {};
                 const evidences = Array.isArray(item.evidences) && item.evidences.length
@@ -4023,6 +4071,15 @@
                     parties,
                     subject,
                     subjectId,
+                    subjectKind,
+                    personSubjectId: item.person_subject_id || (personParty && personParty.subject_id) || '',
+                    personSubject: item.person_subject
+                        || (personParty && (personParty.display_name || personParty.surface))
+                        || '',
+                    accountSubjectId: item.account_subject_id || (accountParty && accountParty.subject_id) || '',
+                    accountSubject: item.account_subject
+                        || (accountParty && (accountParty.display_name || accountParty.surface))
+                        || '',
                     sourceMode,
                     timeCertain: !uncertain,
                     roleOrAction: item.role_or_action
@@ -4031,22 +4088,61 @@
                         || (item.event_type === 'TRANSFER' ? '转账记载' : '联络记载'),
                     cases: caseList,
                     evidences,
+                    objects: item.objects || [],
+                    conflictWith: item.conflict_with || item.conflictWith || [],
                     source
                 };
+            }).filter((e) => e.subjectId || e.subject);
+
+            const sortKey = (e) => {
+                const ts = (e.time_text || e.event_time || e.time || '').trim();
+                const uncertain = !e.timeCertain || !ts || ts === '时间不明' || ts === '未知';
+                return [uncertain ? 1 : 0, ts || '\uffff', String(e.event_id || '')];
+            };
+            normalized.sort((a, b) => {
+                const ka = sortKey(a);
+                const kb = sortKey(b);
+                for (let i = 0; i < ka.length; i += 1) {
+                    if (ka[i] < kb[i]) return -1;
+                    if (ka[i] > kb[i]) return 1;
+                }
+                return 0;
             });
 
             if (this.timelineSubject == null) this.timelineSubject = 'all';
+            if (this.timelineSubjectKind == null) this.timelineSubjectKind = 'all';
+
             const subjectMap = new Map();
             normalized.forEach((e) => {
-                const key = e.subjectId || e.subject;
-                if (!subjectMap.has(key)) subjectMap.set(key, e.subject);
+                if (e.personSubjectId || (e.subjectKind === 'PERSON' && e.subjectId)) {
+                    const id = e.personSubjectId || e.subjectId;
+                    const name = e.personSubject || (e.subjectKind === 'PERSON' ? e.subject : '') || id;
+                    if (id && !caseNameSet.has(name)) {
+                        subjectMap.set(`PERSON::${id}`, { id, name, kind: 'PERSON' });
+                    }
+                }
+                if (e.accountSubjectId || (e.subjectKind === 'ACCOUNT' && e.subjectId)) {
+                    const id = e.accountSubjectId || e.subjectId;
+                    const name = e.accountSubject || (e.subjectKind === 'ACCOUNT' ? e.subject : '') || id;
+                    if (id && !caseNameSet.has(name)) {
+                        subjectMap.set(`ACCOUNT::${id}`, { id, name, kind: 'ACCOUNT' });
+                    }
+                }
             });
-            const subjectEntries = Array.from(subjectMap.entries());
-            const filtered = normalized.filter((e) =>
-                this.timelineSubject === 'all'
-                || e.subjectId === this.timelineSubject
-                || e.subject === this.timelineSubject
-            );
+            const subjectEntries = Array.from(subjectMap.values());
+            const filtered = normalized.filter((e) => {
+                if (this.timelineSubject === 'all') return true;
+                const kind = this.timelineSubjectKind || 'all';
+                if (kind === 'PERSON') {
+                    return e.personSubjectId === this.timelineSubject
+                        || (e.subjectKind === 'PERSON' && e.subjectId === this.timelineSubject);
+                }
+                if (kind === 'ACCOUNT') {
+                    return e.accountSubjectId === this.timelineSubject
+                        || (e.subjectKind === 'ACCOUNT' && e.subjectId === this.timelineSubject);
+                }
+                return e.subjectId === this.timelineSubject || e.subject === this.timelineSubject;
+            });
 
             const head = Utils.create('div', { class: 'ref-tl-head' });
             const titleH1 = Utils.create('h1', { class: 'ref-tl-title' });
@@ -4063,10 +4159,7 @@
                         text: `${normalized.length} 个节点`
                     })
                 ]),
-                Utils.create('div', {
-                    class: 'sub',
-                    text: '围绕人员、账户与行为记载，按时间重建跨案角色变化与证据来源。'
-                })
+                Utils.create('div', { class: 'sub', text: subCopy })
             ]));
             const headActions = Utils.create('div', { class: 'ref-tl-head-actions' });
             const rangeBtn = this._iconBtn('wb-btn wb-btn-outline', 'calendar', '时间范围');
@@ -4089,7 +4182,7 @@
                         html: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>'
                     }),
                 Utils.create('span', {
-                    text: '时间线同时展示材料明确记载与系统推测节点。虚线连接不代表事实上的连续行为。'
+                    text: '材料明确记载与标注的系统推测分开展示；时间不明仅标「时间不确定」。虚线连接不代表事实上的连续行为。'
                 })
             ]));
 
@@ -4097,16 +4190,30 @@
             const cardHead = Utils.create('div', { class: 'ref-tl-card-head' });
             cardHead.appendChild(Utils.create('div', {}, [
                 Utils.create('h2', { text: '主体视角' }),
-                Utils.create('p', { text: '选择主体以聚焦相关时间节点' })
+                Utils.create('p', { text: '默认人物；可切换账户查看收付与相关记载' })
             ]));
             const select = Utils.create('select');
-            select.appendChild(Utils.create('option', { value: 'all', text: '全部主体' }));
-            subjectEntries.forEach(([id, name]) => {
-                select.appendChild(Utils.create('option', { value: id, text: name }));
+            select.appendChild(Utils.create('option', { value: 'all|all', text: '全部主体' }));
+            const persons = subjectEntries.filter((s) => s.kind === 'PERSON');
+            const accounts = subjectEntries.filter((s) => s.kind === 'ACCOUNT');
+            persons.forEach((s) => {
+                select.appendChild(Utils.create('option', {
+                    value: `PERSON|${s.id}`,
+                    text: `人物 · ${s.name}`
+                }));
             });
-            select.value = this.timelineSubject;
+            accounts.forEach((s) => {
+                select.appendChild(Utils.create('option', {
+                    value: `ACCOUNT|${s.id}`,
+                    text: `账户 · ${s.name}`
+                }));
+            });
+            const currentVal = `${this.timelineSubjectKind || 'all'}|${this.timelineSubject || 'all'}`;
+            select.value = [...select.options].some((o) => o.value === currentVal) ? currentVal : 'all|all';
             select.addEventListener('change', () => {
-                this.timelineSubject = select.value;
+                const [kind, id] = (select.value || 'all|all').split('|');
+                this.timelineSubjectKind = kind || 'all';
+                this.timelineSubject = id || 'all';
                 this._renderCurrentView();
             });
             cardHead.appendChild(select);
@@ -4135,7 +4242,9 @@
                         && (event.evidences[0].materialName || event.evidences[0].filename))
                         || '';
 
-                    const row = Utils.create('div', { class: 'ref-tl-row' });
+                    const row = Utils.create('div', {
+                        class: `ref-tl-row${event.sourceMode === 'inferred' ? ' is-inferred' : ''}`
+                    });
                     row.appendChild(Utils.create('div', {
                         class: 'ref-tl-time',
                         text: event.time_text || event.time || '时间不明'
@@ -4144,10 +4253,12 @@
                         Utils.create('span', { class: `ref-tl-dot ${modeClass}` })
                     ]));
 
-                    const cardEl = Utils.create('div', { class: 'ref-tl-event' });
+                    const cardEl = Utils.create('div', {
+                        class: `ref-tl-event${event.sourceMode === 'inferred' ? ' is-inferred' : ''}`
+                    });
                     const top = Utils.create('div', { class: 'ref-tl-event-top' });
                     const leftBits = [
-                        Utils.create('span', { class: 'subj', text: event.subject }),
+                        Utils.create('span', { class: 'subj', text: event.subject || '—' }),
                         !event.timeCertain
                             ? Utils.create('span', { class: 'ref-tl-outline-pill', text: '时间不确定' })
                             : null,
@@ -4166,6 +4277,22 @@
                         class: 'ref-tl-event-action',
                         text: event.roleOrAction || '—'
                     }));
+                    if ((event.objects || []).length) {
+                        const chips = Utils.create('div', { class: 'ref-tl-object-chips' });
+                        (event.objects || []).slice(0, 4).forEach((obj) => {
+                            chips.appendChild(Utils.create('span', {
+                                class: 'ref-tl-object-chip',
+                                text: obj.display_name || obj.surface || ''
+                            }));
+                        });
+                        cardEl.appendChild(chips);
+                    }
+                    if ((event.conflictWith || []).length) {
+                        cardEl.appendChild(Utils.create('div', {
+                            class: 'ref-tl-conflict',
+                            text: `记载冲突：${(event.conflictWith || []).join('；')}`
+                        }));
+                    }
                     cardEl.appendChild(Utils.create('hr', { class: 'ref-tl-event-sep' }));
 
                     const foot = Utils.create('div', { class: 'ref-tl-event-foot' });
@@ -4205,8 +4332,11 @@
             (this.task.cases || []).forEach((c, i) => {
                 addNode(`case:${c.case_id}`, c.display_name || c.name || `案件${i + 1}`, '案件');
             });
+            const clueNodes = [];
             Object.values(this.artifactCache).forEach((data) => {
                 if (!data || !data.artifact) return;
+                const st = data.artifact.status;
+                if (['STALE', 'INVALID'].includes(st)) return;
                 if (data.artifact.type === 'ENTITY_CANDIDATE_SET') {
                     (data.payload.candidates || []).forEach((c) => {
                         const nid = `ent:${c.candidate_id}`;
@@ -4216,22 +4346,61 @@
                                 from: nid,
                                 to: `case:${cs.case_id}`,
                                 label: '出现于',
-                                source: '实体候选'
+                                source: '实体候选',
+                                strength: 'solid'
                             });
                         });
                     });
                 }
                 if (data.artifact.type === 'CLUE_ITEM') {
                     const p = data.payload || {};
+                    if (!p.analysis || !Array.isArray(p.counter_evidence) || !p.aspect) return;
                     const lid = `clue:${data.artifact.id}`;
                     addNode(lid, p.title || data.artifact.title, '线索');
-                    (p.objects || []).forEach((obj, idx) => {
+                    clueNodes.push({ id: lid, payload: p });
+                    (p.objects || []).forEach((obj) => {
                         const oid = `obj:${obj}`;
                         addNode(oid, obj, '对象');
-                        edges.push({ from: lid, to: oid, label: '涉及', source: '线索' });
+                        edges.push({
+                            from: lid,
+                            to: oid,
+                            label: '涉及',
+                            source: '线索',
+                            strength: 'solid'
+                        });
+                    });
+                    (p.linked_candidate_ids || []).forEach((cid) => {
+                        const eid = `ent:${cid}`;
+                        if (seen.has(eid)) {
+                            edges.push({
+                                from: lid,
+                                to: eid,
+                                label: '挂接实体',
+                                source: '线索',
+                                strength: 'solid'
+                            });
+                        }
                     });
                 }
             });
+            // 共享对象的多线索 → 路径相关（合成边，非定罪）
+            for (let i = 0; i < clueNodes.length; i += 1) {
+                for (let j = i + 1; j < clueNodes.length; j += 1) {
+                    const a = clueNodes[i];
+                    const b = clueNodes[j];
+                    const oa = new Set((a.payload.objects || []).map(String));
+                    const ob = (b.payload.objects || []).map(String);
+                    const share = ob.some((x) => oa.has(x));
+                    if (!share) continue;
+                    edges.push({
+                        from: a.id,
+                        to: b.id,
+                        label: '路径相关（待核合成）',
+                        source: '多线索合成',
+                        strength: 'weak'
+                    });
+                }
+            }
             return { nodes, edges };
         },
 
@@ -4239,22 +4408,29 @@
             // preload entity/clue caches for graph edges
             await this._ensureEntitySet();
             await this._collectClueItems();
-            const { nodes, edges } = this._buildGraphModel();
+            let { nodes, edges } = this._buildGraphModel();
+            if (this.graphHideWeak) {
+                edges = edges.filter((e) => e.strength !== 'weak');
+            }
             const graphActions = Utils.create('div', { class: 'wb-page-head-actions', style: 'display:flex;gap:8px;flex-wrap:wrap' });
-            const weakBtn = this._iconBtn('wb-btn wb-btn-outline', 'filter', '收起弱关系');
-            weakBtn.addEventListener('click', () => Toast.info('弱关系筛选即将接入'));
-            const exportGraph = this._iconBtn('wb-btn wb-btn-primary', 'download', '导出图谱');
-            exportGraph.addEventListener('click', () => Toast.info('图谱导出即将接入'));
+            const weakBtn = this._iconBtn(
+                'wb-btn wb-btn-outline',
+                'filter',
+                this.graphHideWeak ? '显示路径合成边' : '收起路径合成边'
+            );
+            weakBtn.addEventListener('click', () => {
+                this.graphHideWeak = !this.graphHideWeak;
+                this._renderCurrentView();
+            });
             graphActions.appendChild(weakBtn);
-            graphActions.appendChild(exportGraph);
             root.appendChild(this._pageHead(
                 '链条图谱',
-                '将实体、案件与行为关系合并，用于发现资金、联络与人员路径。',
+                '实体、案件与已挂接线索的关系视图；共享对象的线索以「路径相关」弱边合成，不表示已认定同一犯罪链条。',
                 graphActions,
-                '简化关系视图'
+                '关系视图'
             ));
             if (!nodes.length) {
-                root.appendChild(Utils.create('div', { class: 'wb-empty', text: '暂无关系可展示。请先完成标识比对或生成线索。' }));
+                root.appendChild(Utils.create('div', { class: 'wb-empty', text: '暂无关系可展示。请先完成标识比对或形成关联线索。' }));
                 return;
             }
             if (!this.selectedGraphNodeId || !nodes.some((n) => n.id === this.selectedGraphNodeId)) {
@@ -4304,8 +4480,11 @@
                 line.setAttribute('x2', `${b.x}%`);
                 line.setAttribute('y2', `${b.y}%`);
                 line.setAttribute('stroke', 'currentColor');
-                line.setAttribute('stroke-opacity', '0.25');
-                line.setAttribute('stroke-width', '2');
+                line.setAttribute('stroke-opacity', e.strength === 'weak' ? '0.35' : '0.25');
+                line.setAttribute('stroke-width', e.strength === 'weak' ? '1.5' : '2');
+                if (e.strength === 'weak') {
+                    line.setAttribute('stroke-dasharray', '4 4');
+                }
                 svg.appendChild(line);
             });
 

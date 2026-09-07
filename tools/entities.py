@@ -29,7 +29,7 @@ from app.files import (
 )
 
 EXTRACTOR_VERSION = "stage9-quote-v1"
-EVENT_EXTRACTOR_VERSION = "stage6-party-v2"
+EVENT_EXTRACTOR_VERSION = "stage7-role-subject-v1"
 STRONG_TYPES = ("PHONE", "ACCOUNT", "DEVICE", "ID_CARD", "NAME", "ORGANIZATION", "MERCHANT", "IP")
 RULE_TYPE_MAP = {
     "ACCOUNT": "R001",
@@ -528,13 +528,13 @@ def redacted_quote(
             extra_anchors=extra,
         )
         if snippet:
-                return snippet, quote_hash(snippet)
+            return snippet, quote_hash(snippet)
         return "", ""
     # 无脱敏正文时退回 raw（仍按实体定位，不用裸切片）
     if raw and surface:
         snippet = locate_quote_in_text(raw, surface=surface, preferred_start=start)
         if snippet:
-    return snippet, quote_hash(snippet)
+            return snippet, quote_hash(snippet)
     return "", ""
 
 
@@ -856,7 +856,7 @@ def extract_rule_mentions(text: str, mapper: GlobalEntityMapper | None = None) -
             for r in person_only:
                 s, e = _extend_person_span(source, r.start, r.end)
                 if e <= s:
-            continue
+                    continue
                 extended_persons.append(
                     RecognizerResult(
                         entity_type="PERSON",
@@ -873,7 +873,7 @@ def extract_rule_mentions(text: str, mapper: GlobalEntityMapper | None = None) -
                 for r in person_only:
                     s, e = _clamp_person_span(source, r.start, r.end)
                     if e - s < 2:
-            continue
+                        continue
                     clamped.append(
                         RecognizerResult(
                             entity_type="PERSON",
@@ -891,7 +891,7 @@ def extract_rule_mentions(text: str, mapper: GlobalEntityMapper | None = None) -
         for result in sorted(results, key=lambda r: (-float(r.score), r.start, -(r.end - r.start))):
             object_type = _ANALYZER_TYPE_MAP.get(result.entity_type)
             if not object_type:
-            continue
+                continue
             start, end = result.start, result.end
             raw = source[start:end].strip()
             if not raw or not take(start, end):
@@ -922,7 +922,7 @@ def extract_rule_mentions(text: str, mapper: GlobalEntityMapper | None = None) -
                         raw = trimmed
                         if not take(start, end):
                             continue
-        else:
+                    else:
                         raw = trimmed
                 if not _org_surface_ok(raw, exclusions):
                     occupied.pop()
@@ -976,14 +976,14 @@ def extract_rule_mentions(text: str, mapper: GlobalEntityMapper | None = None) -
                     continue
                 if not luhn_ok(digits):
                     hit = _mention_hit("ACCOUNT", raw, start, end, producer="PRESIDIO")
-            hit["normalized_value"] = ""
-            hit["mask_info"] = {
-                "masked": True,
-                "positions": list(range(len(raw))),
-                "kind": "luhn_failed",
-            }
-            hit["possible_forms"] = []
-            found.append(hit)
+                    hit["normalized_value"] = ""
+                    hit["mask_info"] = {
+                        "masked": True,
+                        "positions": list(range(len(raw))),
+                        "kind": "luhn_failed",
+                    }
+                    hit["possible_forms"] = []
+                    found.append(hit)
                     continue
             elif object_type == "ID_CARD":
                 if not id_card_ok(raw):
@@ -1014,8 +1014,8 @@ def extract_rule_mentions(text: str, mapper: GlobalEntityMapper | None = None) -
                         "positions": [i for i, ch in enumerate(raw) if ch in "*＊xX×ｘ"],
                         "kind": "phone_mask",
                     }
-            hit["possible_forms"] = []
-            found.append(hit)
+                    hit["possible_forms"] = []
+                    found.append(hit)
                     continue
             elif object_type == "MERCHANT":
                 m = re.search(r"([A-Za-z0-9_-]{6,32})\s*$", raw)
@@ -1043,14 +1043,14 @@ def extract_rule_mentions(text: str, mapper: GlobalEntityMapper | None = None) -
         if not take(match.start(0), match.end(0)):
             continue
         hit = _mention_hit("NAME", raw, match.start(0), match.end(0), producer="PLACEHOLDER")
-            hit["mask_info"] = {"masked": True, "positions": list(range(len(raw))), "kind": "placeholder"}
-            hit["possible_forms"] = []
-            if mapper:
-                fp = mapper.get_fingerprint_by_anonymous_id(raw)
+        hit["mask_info"] = {"masked": True, "positions": list(range(len(raw))), "kind": "placeholder"}
+        hit["possible_forms"] = []
+        if mapper:
+            fp = mapper.get_fingerprint_by_anonymous_id(raw)
             hit["normalized_value"] = fp or ""
-            else:
-                hit["normalized_value"] = ""
-            found.append(hit)
+        else:
+            hit["normalized_value"] = ""
+        found.append(hit)
 
     return _drop_nested_person_mentions(found)
 
@@ -1145,7 +1145,7 @@ def _event_parties(sentence: str) -> list[dict[str, Any]]:
         if key in seen:
             continue
         seen.add(key)
-            deduped.append(item)
+        deduped.append(item)
     return deduped[:6]
 
 
@@ -1202,6 +1202,59 @@ def apply_subject_resolve(
             obj["subject_id"] = obj.get("subject_id") or f"auto:{obj['object_type']}:{key_val}"
         out.append(obj)
     return out
+
+
+_PERSON_SUBJECT_TYPES = frozenset({"NAME", "PERSON"})
+_ACCOUNT_SUBJECT_TYPES = frozenset({"ACCOUNT"})
+# 角色时间线默认主体：人物；辅视角：账户。案件/商户不当主体。
+_TIMELINE_SUBJECT_KINDS = frozenset({"PERSON", "ACCOUNT"})
+
+
+def classify_timeline_subject_kind(object_type: str | None) -> str | None:
+    """将 object_type 映射为时间线主体种类；案件等返回 None。"""
+    ot = (object_type or "").strip().upper()
+    if ot in _PERSON_SUBJECT_TYPES:
+        return "PERSON"
+    if ot in _ACCOUNT_SUBJECT_TYPES:
+        return "ACCOUNT"
+    return None
+
+
+def pick_timeline_subject_refs(parties: list[Any]) -> dict[str, Any]:
+    """从 parties 选出人物主主体与账户辅主体；绝不回退到案件名。"""
+    resolved = [p for p in (parties or []) if isinstance(p, dict)]
+    person = next(
+        (p for p in resolved if classify_timeline_subject_kind(p.get("object_type")) == "PERSON"),
+        None,
+    )
+    account = next(
+        (p for p in resolved if classify_timeline_subject_kind(p.get("object_type")) == "ACCOUNT"),
+        None,
+    )
+    objects = []
+    for p in resolved:
+        kind = classify_timeline_subject_kind(p.get("object_type"))
+        if kind in _TIMELINE_SUBJECT_KINDS:
+            continue
+        objects.append(
+            {
+                "object_type": p.get("object_type"),
+                "display_name": p.get("display_name") or p.get("surface") or "",
+                "subject_id": p.get("subject_id") or "",
+            }
+        )
+    return {
+        "person": person,
+        "account": account,
+        "objects": objects[:6],
+    }
+
+
+def timeline_event_sort_key(item: dict[str, Any]) -> tuple:
+    """真实时间优先；时间不明置底，不因推测插队。"""
+    ts = (item.get("event_time") or item.get("time") or "").strip()
+    uncertain = bool(item.get("time_uncertain")) or not ts or ts in {"时间不明", "未知"}
+    return (1 if uncertain else 0, ts or "\uffff", str(item.get("event_id") or ""))
 
 
 def extract_event_mentions(text: str) -> list[dict[str, Any]]:
@@ -1297,17 +1350,17 @@ def persist_mentions(
 ) -> int:
     inserted = 0
     now = utc_now()
-        for hit in hits:
-            if hit.get("quote_redacted") and hit.get("quote_hash"):
-                quote = hit["quote_redacted"]
-                qhash = hit["quote_hash"]
-            else:
-                quote, qhash = redacted_quote(
-                    chunk,
-                    int(hit["char_start"]),
-                    int(hit["char_end"]),
+    for hit in hits:
+        if hit.get("quote_redacted") and hit.get("quote_hash"):
+            quote = hit["quote_redacted"]
+            qhash = hit["quote_hash"]
+        else:
+            quote, qhash = redacted_quote(
+                chunk,
+                int(hit["char_start"]),
+                int(hit["char_end"]),
                 surface=str(hit.get("surface_raw") or ""),
-                )
+            )
         # 无法在脱敏正文定位到实体的命中：仍入库供碰撞计数，但不挂可回链 quote
         if not quote or not qhash:
             quote, qhash = "", ""
@@ -2206,7 +2259,7 @@ def _build_review_field_compare(
                     [item["source"]] if item.get("source") else []
                 ):
                     if not src or not src.get("chunk_id") or src in srcs:
-            continue
+                        continue
                     # 出处窗口必须覆盖该单元格值（展示态或存储态）
                     q = src.get("quote") or ""
                     qd = src.get("quote_display") or ""
@@ -2219,7 +2272,7 @@ def _build_review_field_compare(
                             if len(part.strip()) >= 2
                         )
                     ):
-            continue
+                        continue
                     srcs.append(src)
             sources_by_case[case_id] = srcs[:3]
         status_map = _field_cell_status(case_ids, rendered)
@@ -2348,28 +2401,28 @@ def _enrich_candidate_for_review(
     )
     field_label = (primary_row or {}).get("label") or _primary_field_key(object_type)[1]
 
-        records = []
-        for item in items:
-            records.append(
-                {
-                    "case_id": item["case_id"],
-                    "case_name": case_names.get(item["case_id"]) or item["case_id"],
+    records = []
+    for item in items:
+        records.append(
+            {
+                "case_id": item["case_id"],
+                "case_name": case_names.get(item["case_id"]) or item["case_id"],
                 "value": _review_display_value(
                     item.get("surface_raw") or "", object_type
                 ),
-                    "source": {
-                        "document_name": item.get("filename") or item.get("document_id"),
-                        "page_no": item.get("page_start"),
-                        "chunk_id": item["chunk_id"],
-                        "document_version_id": item.get("document_version_id"),
-                        "document_id": item.get("document_id"),
+                "source": {
+                    "document_name": item.get("filename") or item.get("document_id"),
+                    "page_no": item.get("page_start"),
+                    "chunk_id": item["chunk_id"],
+                    "document_version_id": item.get("document_version_id"),
+                    "document_id": item.get("document_id"),
                     "ocr_confidence": item.get("ocr_confidence"),
-                        "quote": item.get("quote_redacted") or "",
+                    "quote": item.get("quote_redacted") or "",
                     "quote_display": _review_display_value(item.get("quote_redacted") or ""),
-                        "quote_hash": item.get("quote_hash") or "",
-                    },
-                }
-            )
+                    "quote_hash": item.get("quote_hash") or "",
+                },
+            }
+        )
 
     supporting = []
     conflicts = []
@@ -3280,6 +3333,142 @@ def collect_rule_hits(
             hits.append(payload)
     hits.extend(collect_event_rule_hits(task_id, cases, db_path=db_path))
     return hits
+
+
+# 支付平台类弱共现：类别词，不点名具体公司
+_PLATFORM_SURFACE_RE = re.compile(
+    r"(第三方)?支付(股份有限公司|有限公司|公司)?|支付平台|支付接口|清算(机构|平台)?"
+)
+
+
+def collect_within_case_consistency(
+    task_id: str,
+    db_path=None,
+) -> list[dict[str, Any]]:
+    """案內材料一致性提示（非跨案线索）。
+
+    典型：同一手机号在同一案件内出现于多处材料，且同案另有多个账户记载 →
+    提示核验「是否多卡绑定同一号码」。不写入 CLUE_ITEM，不构成跨案关联认定。
+    """
+    init_entity_db(db_path)
+    notes: list[dict[str, Any]] = []
+    with db_session(db_path) as conn:
+        phone_rows = _rows(
+            conn,
+            """
+            SELECT case_id, normalized_value, surface_raw, chunk_id, quote_redacted
+            FROM entity_mentions
+            WHERE task_id = ? AND object_type = 'PHONE'
+              AND normalized_value IS NOT NULL AND TRIM(normalized_value) != ''
+            """,
+            (task_id,),
+        )
+        account_rows = _rows(
+            conn,
+            """
+            SELECT case_id, normalized_value, surface_raw, chunk_id
+            FROM entity_mentions
+            WHERE task_id = ? AND object_type = 'ACCOUNT'
+              AND normalized_value IS NOT NULL AND TRIM(normalized_value) != ''
+            """,
+            (task_id,),
+        )
+
+    accounts_by_case: dict[str, set[str]] = {}
+    for row in account_rows:
+        cid = row.get("case_id") or ""
+        accounts_by_case.setdefault(cid, set()).add(row.get("normalized_value") or "")
+
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in phone_rows:
+        key = (row.get("case_id") or "", row.get("normalized_value") or "")
+        if not key[0] or not key[1]:
+            continue
+        grouped.setdefault(key, []).append(row)
+
+    for (case_id, phone_norm), rows in grouped.items():
+        chunk_ids = {r.get("chunk_id") for r in rows if r.get("chunk_id")}
+        if len(chunk_ids) < 2 and len(rows) < 2:
+            continue
+        account_norms = {a for a in accounts_by_case.get(case_id, set()) if a}
+        if len(account_norms) < 2:
+            continue
+        display = public_surface(rows[0].get("surface_raw") or phone_norm, "PHONE")
+        notes.append(
+            {
+                "kind": "within_case_consistency",
+                "scope": "case_internal",
+                "label": "案內同一手机号多处出现，且同案有多张账户记载",
+                "case_id": case_id,
+                "phone_display": display,
+                "account_count": len(account_norms),
+                "material_spots": len(chunk_ids) or len(rows),
+                "suggested_action": "请在实体复核/材料核对中核验是否为同一人多卡绑定，勿直接写成跨案关联线索",
+                "note": "一致性提示，不是跨案关联结论",
+            }
+        )
+    return notes[:30]
+
+
+def collect_weak_platform_hints(
+    task_id: str,
+    cases: list[dict[str, Any]],
+    db_path=None,
+) -> list[dict[str, Any]]:
+    """弱平台共现：组织/商户表面含支付平台类表述且跨 ≥2 案 → 可选待核方面 PLAT。"""
+    init_entity_db(db_path)
+    case_ids = {c.get("case_id") for c in cases if c.get("case_id")}
+    if len(case_ids) < 2:
+        return []
+    with db_session(db_path) as conn:
+        rows = _rows(
+            conn,
+            """
+            SELECT case_id, object_type, surface_raw, normalized_value, chunk_id, quote_redacted
+            FROM entity_mentions
+            WHERE task_id = ? AND object_type IN ('ORGANIZATION', 'MERCHANT', 'NAME')
+            """,
+            (task_id,),
+        )
+    buckets: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        surface = str(row.get("surface_raw") or "").strip()
+        if not surface or not _PLATFORM_SURFACE_RE.search(surface):
+            continue
+        # 归一键：去掉空白后的表面前缀，避免点名具体字号特化
+        key = re.sub(r"\s+", "", surface)[:24] or (row.get("normalized_value") or "")[:24]
+        if not key:
+            continue
+        bucket = buckets.setdefault(
+            key,
+            {"surface": surface, "cases": set(), "chunks": set(), "rows": []},
+        )
+        if row.get("case_id"):
+            bucket["cases"].add(row["case_id"])
+        if row.get("chunk_id"):
+            bucket["chunks"].add(row["chunk_id"])
+        bucket["rows"].append(row)
+
+    hints: list[dict[str, Any]] = []
+    case_name = {
+        c.get("case_id"): (c.get("display_name") or c.get("name") or c.get("case_id"))
+        for c in cases
+    }
+    for key, bucket in buckets.items():
+        if len(bucket["cases"]) < 2 or len(bucket["chunks"]) < 2:
+            continue
+        hints.append(
+            {
+                "kind": "weak_platform",
+                "label": "支付平台类名称跨案共现（弱关联）",
+                "surface": bucket["surface"],
+                "cases": [case_name.get(cid, cid) for cid in sorted(bucket["cases"])],
+                "evidence_count": len(bucket["chunks"]),
+                "suggested_aspect": "PLAT",
+                "note": "证据可能偏弱，宜单独作为「平台共现」待核，勿直接写成犯罪链条",
+            }
+        )
+    return hints[:20]
 
 
 def verify_quote_hash(chunk_text: str, quote: str, expected_hash: str) -> bool:

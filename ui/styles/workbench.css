@@ -1191,6 +1191,55 @@ body,
     padding-top: 12px;
     border-top: 1px solid var(--border-color);
 }
+.wb-cite-nav-count {
+    flex: 1;
+    text-align: center;
+    font-size: 12px;
+    color: var(--text-muted);
+    min-width: 96px;
+}
+
+/* 线索中心：办案风列表与分析 */
+.wb-clue-basis {
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--border-color);
+    background: var(--bg-tertiary);
+    color: var(--text-muted);
+    font-size: 11px;
+    line-height: 1.5;
+}
+.wb-clue-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+}
+.wb-clue-chip {
+    display: inline-flex;
+    align-items: center;
+    max-width: 100%;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    color: var(--text-secondary, var(--text-muted));
+    font-size: 11px;
+    line-height: 1.45;
+}
+.wb-clue-analysis {
+    margin: 0;
+    padding: 12px 14px;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    font-size: 13px;
+    line-height: 1.65;
+    font-weight: 500;
+}
 .wb-cite-drawer.is-fullscreen {
     position: fixed;
     inset: 0;
@@ -1500,6 +1549,14 @@ body,
 
 .wb-entity-metric .v { font-size: 19px; font-weight: 650; line-height: 1.2; }
 .wb-entity-metric .k { color: var(--text-muted); font-size: 11px; margin-top: 3px; }
+.wb-entity-metric.is-clickable {
+  cursor: pointer;
+  transition: border-color .15s ease, background .15s ease;
+}
+.wb-entity-metric.is-clickable:hover {
+  border-color: var(--border-strong, #c5cdd8);
+  background: var(--surface-2, #f5f7fa);
+}
 
 .wb-entity-card {
     border: 1px solid var(--border-color);
@@ -2906,6 +2963,35 @@ body,
     font-size: 14px;
     line-height: 1.6;
     color: var(--foreground);
+}
+.ref-tl-object-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+}
+.ref-tl-object-chip {
+    display: inline-flex;
+    align-items: center;
+    height: 22px;
+    padding: 0 8px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--muted-foreground);
+    font-size: 12px;
+}
+.ref-tl-conflict {
+    margin-top: 8px;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--warning, #b45309);
+}
+.ref-tl-event.is-inferred {
+    border-style: dashed;
+}
+.ref-tl-row.is-inferred .ref-tl-time {
+    color: var(--warning, #b45309);
 }
 .ref-tl-event-sep {
     margin: 12px 0;

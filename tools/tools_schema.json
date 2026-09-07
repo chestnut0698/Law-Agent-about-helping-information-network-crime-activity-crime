@@ -326,37 +326,69 @@
     "type": "function",
     "function": {
       "name": "write_ai_clues",
-      "description": "将跨案关联线索写入工作台。调用前须已阅读实体候选与时间线。evidence 的 quote 必须是材料工具返回的连续原文（可含 PERSON_xxx）；quote_hash 可省略，由服务端按原文重算。禁止改写、拼接或凭记忆编造摘录。",
+      "description": "将疑似关联线索写入线索中心（整体替换本任务旧线索）。调用前须已阅读实体候选与材料；可先查看关联提示。对用户只用办案用语说明结果在「线索中心」。每条须：请核验开头的标题；核验维度 aspect（ID/FUND/TIME/ROLE/QUAL/PLAT，一批内按维度拆开）；短办案观察；发现路径；对象芯片；至少2条支持摘录；反向材料数组（确无则[]并写明未见反向）。案內多卡同号勿写成跨案线索；上下游路径勿单条定性。禁止定罪并案；禁止对用户说工具名或英文字段。",
       "parameters": {
         "type": "object",
         "properties": {
           "clues": {
             "type": "array",
-            "description": "线索列表",
+            "description": "线索列表；每条只围绕一个核验问题与一个 aspect；写入成功后旧线索全部作废",
             "items": {
               "type": "object",
               "properties": {
                 "title": {
                   "type": "string",
-                  "description": "线索标题：只写待核验关联现象，不写同一人/共同犯罪结论"
+                  "description": "≤60字，必须以「请核验」开头，写清案件与待核问题。例：请核验案件《甲案》与《乙案》中尾号 6231 的银行账户是否为同一账户"
                 },
-                "summary": {
+                "aspect": {
                   "type": "string",
-                  "description": "线索摘要（≤600字）：写清跨案重合点、不确定性与待核材料；禁止定罪并案表述"
+                  "description": "核验维度，仅限 ID/FUND/TIME/ROLE/QUAL/PLAT。ID=标识同一性；FUND=资金路径；TIME=时空连续；ROLE=角色冲突；QUAL=材料质量；PLAT=支付平台弱共现"
+                },
+                "analysis": {
+                  "type": "string",
+                  "description": "≤80字办案观察，须对准 aspect。例：开户姓名存在差异（王某某 / 王某伟），可能为同音姓名登记差异或不同主体"
+                },
+                "match_basis": {
+                  "type": "string",
+                  "description": "发现路径短标签，如：强标识账户碰撞 / 弱线索姓名+联系方式关联 / 资金流水汇聚模式"
+                },
+                "objects": {
+                  "type": "array",
+                  "items": {"type": "string"},
+                  "description": "1～5 个对象芯片，如：尾号 6231 银行账户、王某伟"
                 },
                 "evidence": {
                   "type": "array",
-                  "description": "支撑证据；每条须可回链到材料原文",
+                  "description": "支持材料；至少 2 条，尽量覆盖≥2 案，每条可回链",
                   "items": {
                     "type": "object",
                     "properties": {
-                      "chunk_id": {"type": "string", "description": "材料片段 ID（来自工具返回）"},
-                      "quote": {"type": "string", "description": "从材料正文逐字摘录的连续原文，建议≤80字"},
-                      "quote_hash": {"type": "string", "description": "可选；服务端会忽略并重算"},
-                      "page_start": {"type": "integer", "description": "起始页码"},
-                      "page_end": {"type": "integer", "description": "结束页码"},
-                      "document_version_id": {"type": "string", "description": "材料版本 ID"},
-                      "case_name": {"type": "string", "description": "来源案件名称"}
+                      "chunk_id": {"type": "string"},
+                      "quote": {"type": "string", "description": "连续原文摘录，建议≤40字"},
+                      "quote_hash": {"type": "string", "description": "可选；服务端忽略并重算"},
+                      "page_start": {"type": "integer"},
+                      "page_end": {"type": "integer"},
+                      "document_version_id": {"type": "string"},
+                      "case_name": {"type": "string"},
+                      "stance": {"type": "string", "description": "support（默认）"}
+                    },
+                    "required": ["chunk_id", "quote", "document_version_id"]
+                  }
+                },
+                "counter_evidence": {
+                  "type": "array",
+                  "description": "反向/冲突材料（必填数组）。须主动检索；找到则写入，确无则传 []，并在 analysis 写明未见反向材料。",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "chunk_id": {"type": "string"},
+                      "quote": {"type": "string"},
+                      "quote_hash": {"type": "string"},
+                      "page_start": {"type": "integer"},
+                      "page_end": {"type": "integer"},
+                      "document_version_id": {"type": "string"},
+                      "case_name": {"type": "string"},
+                      "stance": {"type": "string", "description": "counter"}
                     },
                     "required": ["chunk_id", "quote", "document_version_id"]
                   }
@@ -364,14 +396,35 @@
                 "linked_candidate_ids": {
                   "type": "array",
                   "items": {"type": "string"},
-                  "description": "关联的实体候选 ID（可选）"
+                  "description": "关联实体候选 ID"
+                },
+                "fingerprints": {
+                  "type": "array",
+                  "items": {"type": "string"},
+                  "description": "关联实体指纹（可选）"
+                },
+                "uncertainty": {
+                  "type": "string",
+                  "description": "≤40字不确定性提示"
                 }
               },
-              "required": ["title", "summary", "evidence"]
+              "required": ["title", "aspect", "analysis", "match_basis", "objects", "evidence", "counter_evidence"]
             }
           }
         },
         "required": ["clues"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_association_hints",
+      "description": "列出系统规则给出的跨案关联提示（账户/电话/设备/资金路径等），仅供整理线索参考，不会写入线索中心。对用户说明时称「关联提示」，不要念本工具英文名。正式线索请写入线索中心。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
       }
     }
   },

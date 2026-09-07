@@ -254,24 +254,16 @@ def run_task_timeline(task_id: str, user_id: str | None = None) -> str:
     except TaskError as exc:
         return _tool_json(exc.to_dict())
 
-# 废弃
-"""
-def generate_task_clues(task_id: str, user_id: str | None = None) -> str:
-    # 根据 R001–R006 规则命中生成跨案线索产物（含表述与校核）。
+# 废弃：规则不再直接落 CLUE_ITEM。请用 list_association_hints + write_ai_clues。
+
+def list_association_hints(task_id: str, user_id: str | None = None) -> str:
     try:
-        result = get_task_service().generate_clues(task_id, user_id=user_id or "system")
-        return _tool_json(
-            _artifact_brief(
-                result.get("artifact"),
-                message="线索生成完成",
-                created_count=len(result.get("created") or []),
-                skipped_count=len(result.get("skipped") or []),
-                hit_count=result.get("hit_count"),
-            )
+        result = get_task_service().list_association_hints(
+            task_id, user_id=user_id or "system"
         )
+        return _tool_json(result)
     except TaskError as exc:
         return _tool_json(exc.to_dict())
-"""
 
 def write_ai_clues(task_id: str, clues: list[dict[str, Any]], user_id: str | None = None) -> str:
     blocked = _entity_review_gate(task_id)
@@ -283,7 +275,11 @@ def write_ai_clues(task_id: str, clues: list[dict[str, Any]], user_id: str | Non
             "ok": True,
             "artifact_id": result["artifact"]["id"] if result.get("artifact") else None,
             "clue_count": result["clue_count"],
-            "message": f"已写入 {result['clue_count']} 条疑似关联线索，请到中间工作区核验",
+            "retired_count": result.get("retired_count") or 0,
+            "message": (
+                f"已更新疑似关联线索 {result['clue_count']} 条"
+                f"（此前 {result.get('retired_count') or 0} 条已作废），请到中间工作区「线索中心」核验"
+            ),
         })
     except TaskError as exc:
         return _tool_json(exc.to_dict())

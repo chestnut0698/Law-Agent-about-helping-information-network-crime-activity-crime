@@ -35,6 +35,7 @@ tool_functions = {
     "delete_task_material": delete_task_material,
     "run_task_collision": run_task_collision,
     "run_task_timeline": run_task_timeline,
+    "list_association_hints": list_association_hints,
     "write_ai_clues": write_ai_clues,
     "read_artifact": read_artifact,
     "list_entity_candidates": list_entity_candidates,

@@ -13,6 +13,7 @@
         confirm_task_plan: 1,
         run_task_collision: 2,
         run_task_timeline: 3,
+        list_association_hints: 4,
         write_ai_clues: 4,
         read_artifact: 4,
         read_material_chunk: 4

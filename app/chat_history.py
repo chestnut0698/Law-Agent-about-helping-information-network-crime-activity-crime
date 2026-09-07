@@ -113,7 +113,11 @@ def _clip_tool_content(text: str, limit: int = TOOL_CONTENT_LIMIT) -> str:
 
 
 def messages_for_llm(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """只保留模型接口允许的字段，并确保 tool 序列合法。"""
+    """只保留模型接口允许的字段，并确保 tool 序列合法。
+
+    DeepSeek thinking 模式要求：带过 reasoning 的 assistant 必须把
+    reasoning_content 原样回传，否则会 400。
+    """
     payload: list[dict[str, Any]] = []
     for msg in sanitize_tool_history(messages):
         item: dict[str, Any] = {
@@ -126,6 +130,9 @@ def messages_for_llm(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             item["tool_calls"] = msg["tool_calls"]
         if msg.get("tool_call_id"):
             item["tool_call_id"] = msg["tool_call_id"]
+        reasoning = msg.get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning.strip():
+            item["reasoning_content"] = reasoning
         payload.append(item)
     return payload
 

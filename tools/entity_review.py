@@ -313,23 +313,10 @@ def list_candidate_relations(task_id: str, candidate_id: str) -> str:
         cand = _find_candidate(detail.get("payload") or {}, candidate_id)
         if not cand:
             return _tool_json({"ok": False, "error": "候选不存在"})
-        fingerprint = cand.get("fingerprint")
-        clues = []
-        for art in service.get_task(task_id).get("artifacts") or []:
-            if art.get("type") != "CLUE_ITEM" or art.get("status") in {"INVALID"}:
-                continue
-            payload = (service.get_artifact(task_id, art["id"]).get("payload") or {})
-            linked = payload.get("linked_candidate_ids") or []
-            if candidate_id in linked or fingerprint and fingerprint in (payload.get("fingerprints") or []):
-                clues.append(
-                    {
-                        "artifact_id": art["id"],
-                        "title": art.get("title") or payload.get("title"),
-                        "status": art.get("status"),
-                    }
-                )
+        clues = service.list_clues_for_candidate(task_id, cand)
         impact = dict(cand.get("impact") or {})
         impact["clue_count"] = len(clues)
+        impact["relation_count"] = sum(1 for item in clues if item.get("status") == "DRAFT")
         return _tool_json(
             {
                 "ok": True,
@@ -1091,43 +1078,25 @@ def build_candidate_field_table(
         if alias_mode:
             columns, seeded = _seed_alias_person_table(cand, identity_aliases)
             try:
-                get_task_service().propose_entity_review(
+                get_task_service().persist_candidate_field_table(
                     task_id,
                     candidate_id,
-                    suggestion={
-                        "recommendation": cand.get("recommendation") or "DEFER",
-                        "agent_summary": "模型未完成补全，已按各称谓材料出处预填对照表",
-                        "supporting_facts": [],
-                        "conflicts": [],
-                        "missing_fields": [],
-                        "field_compare": seeded,
-                        "evidence": cand.get("evidence") or [],
-                        "confidence": "LOW",
-                    },
-                    user_id=user_id or "system",
-                )
-                art, detail = _load_candidate_set(task_id)
-                payload = detail.get("payload") or {}
-                target = _find_candidate(payload, candidate_id)
-                if target is not None:
-                    target["field_compare_columns"] = columns
-                    target["field_table_meta"] = {
+                    field_compare=seeded,
+                    evidence=cand.get("evidence") or [],
+                    supporting_facts=[],
+                    conflicts=[],
+                    missing_fields=[],
+                    field_table_meta={
                         "producer": "RULE_ALIAS_SEED",
                         "table_title": "不同称谓对照（供同一性判断）",
                         "row_count": len(seeded),
                         "compare_mode": "alias",
                         "partial": True,
                         "error": str(exc)[:120],
-                    }
-                    get_task_service().write_artifact(
-                        task_id=task_id,
-                        type="ENTITY_CANDIDATE_SET",
-                        title=art.get("title") or "跨案对象待核·待判断",
-                        ref_key="entity-candidates",
-                        status=art.get("status") or "PENDING_REVIEW",
-                        parent_ids=json.loads(art.get("parent_ids_json") or "[]"),
-                        payload=payload,
-                    )
+                    },
+                    field_compare_columns=columns,
+                    user_id=user_id or "system",
+                )
                 return _tool_json(
                     {
                         "ok": True,
@@ -1418,67 +1387,37 @@ def build_candidate_field_table(
         else:
             missing_fields.append(f"各案均未记载{label}")
 
-    summary = str(parsed.get("summary") or "").strip()
-    if not summary:
-        summary = (
-            f"已按材料重建{len(field_compare)}项字段对照："
-            + ("；".join((supporting + conflicts)[:3]) or "多数字段材料未记载")
-        )
-    suggestion = {
-        "recommendation": cand.get("recommendation") or "DEFER",
-        "agent_summary": summary[:150],
-        "supporting_facts": supporting,
-        "conflicts": conflicts,
-        "missing_fields": missing_fields,
-        "field_compare": field_compare,
-        "evidence": list(evidence_map.values()),
-        "confidence": "MEDIUM",
+    field_table_meta = {
+        "producer": FIELD_TABLE_PRODUCER,
+        "model": MODEL_NAME,
+        "table_title": str(
+            parsed.get("table_title")
+            or (
+                "不同称谓对照（供同一性判断）"
+                if alias_mode
+                else "字段对照与差异说明"
+            )
+        ),
+        "row_count": len(field_compare),
+        "compare_mode": "alias" if alias_mode else "case",
     }
     try:
-        get_task_service().propose_entity_review(
+        # 字段表重建只改对照/证据，不覆盖模型复核建议文案
+        get_task_service().persist_candidate_field_table(
             task_id,
             candidate_id,
-            suggestion=suggestion,
+            field_compare=field_compare,
+            evidence=list(evidence_map.values()),
+            supporting_facts=supporting,
+            conflicts=conflicts,
+            missing_fields=missing_fields,
+            field_table_meta=field_table_meta,
+            field_compare_columns=field_compare_columns or None,
+            clear_field_compare_columns=not bool(field_compare_columns),
             user_id=user_id or "system",
         )
     except TaskError as exc:
         return _tool_json(exc.to_dict())
-
-    # 记录产出来源，避免每次打开都重跑模型
-    try:
-        art, detail = _load_candidate_set(task_id)
-        payload = detail.get("payload") or {}
-        target = _find_candidate(payload, candidate_id)
-        if target is not None:
-            target["field_table_meta"] = {
-                "producer": FIELD_TABLE_PRODUCER,
-                "model": MODEL_NAME,
-                "table_title": str(
-                    parsed.get("table_title")
-                    or (
-                        "不同称谓对照（供同一性判断）"
-                        if alias_mode
-                        else "字段对照与差异说明"
-                    )
-                ),
-                "row_count": len(field_compare),
-                "compare_mode": "alias" if alias_mode else "case",
-            }
-            if field_compare_columns:
-                target["field_compare_columns"] = field_compare_columns
-            else:
-                target.pop("field_compare_columns", None)
-            get_task_service().write_artifact(
-                task_id=task_id,
-                type="ENTITY_CANDIDATE_SET",
-                title=art.get("title") or "跨案对象待核·待判断",
-                ref_key="entity-candidates",
-                status=art.get("status") or "PENDING_REVIEW",
-                parent_ids=json.loads(art.get("parent_ids_json") or "[]"),
-                payload=payload,
-            )
-    except Exception:
-        pass
 
     # 表已落盘到候选，这里只回摘要；整表带上 sources 会撑爆工具返回长度
     return _tool_json(
@@ -1486,7 +1425,7 @@ def build_candidate_field_table(
             "ok": True,
             "cached": False,
             "candidate_id": candidate_id,
-            "table_title": str(parsed.get("table_title") or "字段对照与差异说明"),
+            "table_title": field_table_meta["table_title"],
             "fields": [
                 {
                     "label": row["label"],
@@ -1509,14 +1448,16 @@ def propose_entity_review(
     candidate_id: str,
     suggestion: dict[str, Any],
     user_id: str | None = None,
+    advise_only: bool = False,
 ) -> str:
-    """写入 AI 复核建议（不改变人工 decision）。"""
+    """写入 AI 复核建议（不改变人工 decision）。advise_only 时不改字段表。"""
     try:
         result = get_task_service().propose_entity_review(
             task_id,
             candidate_id,
             suggestion=suggestion,
             user_id=user_id or "system",
+            advise_only=advise_only,
         )
         return _tool_json({"ok": True, **result})
     except TaskError as exc:

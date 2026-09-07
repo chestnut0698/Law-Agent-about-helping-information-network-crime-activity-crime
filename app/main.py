@@ -451,7 +451,7 @@ async def run_entity_review_agent_api(
     task_id: str,
     payload: dict | None = None,
 ):
-    """触发 DeepSeek 实体复核 Agent（单候选或批量待核）。"""
+    """触发模型分析建议（只写 recommendation/摘要，不改人工 decision / 字段表）。"""
     try:
         from agents.entity_review_agent import run_entity_review_for_task
 
@@ -502,10 +502,14 @@ async def task_generate_clues(
     task_id: str,
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
-    try:
-        return get_task_service().generate_clues(task_id, user_id=x_user_id)
-    except TaskError as exc:
-        return task_error_response(exc)
+    """已下线：规则不再直接落库。保留路由以免旧前端 404，统一返回说明。"""
+    return JSONResponse(
+        status_code=410,
+        content={
+            "error_code": "CLUE_RULE_GENERATE_GONE",
+            "message": "请在对话中说明需要重新形成疑似关联线索，由助手写入线索中心核验。",
+        },
+    )
 
 
 @app.post("/api/tasks/{task_id}/timeline/run")
