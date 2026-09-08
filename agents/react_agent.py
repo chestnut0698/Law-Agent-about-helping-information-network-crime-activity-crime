@@ -17,6 +17,7 @@ class ReactAgent(BaseAgent):
         super().__init__()
         self.task_id = task_id
         self._persisted_count = 0
+        self._no_think = False
         schema_path = Path(__file__).resolve().parent.parent / "tools" / "tools_schema.json"
         with open(schema_path, "r", encoding="utf-8") as f:
             self.tools = json.load(f)
@@ -49,7 +50,7 @@ class ReactAgent(BaseAgent):
     def llm_call(self, tool_choice="auto", temperature=0.1, max_tokens=4096):
         payload = messages_for_llm(self.messages)
         print(f"[llm_call] messages={len(payload)} last_role={(payload[-1]['role'] if payload else None)}")
-        return self.client.chat.completions.create(
+        kwargs = dict(
             model=self.model,
             messages=payload,
             tools=self.tools,
@@ -58,6 +59,10 @@ class ReactAgent(BaseAgent):
             max_tokens=max_tokens,
             stream=True,
         )
+        # 思维链超长被截断后，后续轮次转无思考模式直接作答，避免长时间空想
+        if self._no_think:
+            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+        return self.client.chat.completions.create(**kwargs)
 
     def chat(self, user_input):
         """
@@ -66,6 +71,8 @@ class ReactAgent(BaseAgent):
         """
         self.messages.append({"role": "user", "content": user_input})
 
+        # 每条新消息回到可思考状态；本消息内一旦思维链超长会切到无思考
+        self._no_think = False
 
         plan_steps = []
         if PLANS:
@@ -95,6 +102,7 @@ class ReactAgent(BaseAgent):
                 collected_content = ""
                 collected_reasoning = ""
                 tool_calls_buffer = {}
+                overflow = False
 
                 for chunk in stream:
                     choices = getattr(chunk, "choices", None) or []
@@ -104,6 +112,10 @@ class ReactAgent(BaseAgent):
                     if hasattr(delta, "reasoning_content") and delta.reasoning_content:
                         collected_reasoning += delta.reasoning_content
                         yield ("reasoning_content", delta.reasoning_content)
+                        # 思维链过长：截断本轮，下一轮转无思考模式直接作答
+                        if CHAT_MAX_REASONING_CHARS and len(collected_reasoning) > CHAT_MAX_REASONING_CHARS:
+                            overflow = True
+                            break
 
                     # 内容先缓冲：有工具调用时不当成最终回答提前推给前端
                     if delta.content:
@@ -120,6 +132,12 @@ class ReactAgent(BaseAgent):
                                 }
                             if tc.function.arguments:
                                 tool_calls_buffer[idx]["arguments"] += tc.function.arguments
+
+                if overflow:
+                    # 丢弃本轮未成型的正文/工具调用（思考片段已流给前端），转无思考重发
+                    self._no_think = True
+                    pending_reasoning = ""
+                    continue
 
                 merged_reasoning = f"{pending_reasoning}{collected_reasoning}"
 

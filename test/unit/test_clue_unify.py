@@ -120,3 +120,115 @@ def test_list_association_hints_ok(svc):
     result = service.list_association_hints(task_id)
     assert result["ok"] is True
     assert "hints" in result
+
+
+def _evidence():
+    return [
+        {"chunk_id": "c1", "document_version_id": "v1", "quote": "甲案账户记载", "case_name": "甲案"},
+        {"chunk_id": "c2", "document_version_id": "v2", "quote": "乙案账户记载", "case_name": "乙案"},
+    ]
+
+
+def _clue(aspect, title, analysis, obj="尾号6231"):
+    return {
+        "title": title,
+        "aspect": aspect,
+        "analysis": analysis,
+        "match_basis": "强标识账户碰撞",
+        "objects": [obj],
+        "evidence": _evidence(),
+        "counter_evidence": [],
+        "linked_candidate_ids": ["cand-1"],
+    }
+
+
+def test_put_clue_item_incremental_keeps_set(svc):
+    task_id, service = svc
+    r1 = service.put_clue_item(
+        task_id, _clue("ID", "请核验两案账户是否同一", "尾号一致；未见反向材料。")
+    )
+    assert r1["clue_count"] == 1 and r1["retired_count"] == 0
+    r2 = service.put_clue_item(
+        task_id,
+        _clue("FUND", "请核验两案资金是否汇聚", "同收款侧汇聚；未见反向材料。"),
+    )
+    assert r2["clue_count"] == 1 and r2["retired_count"] == 0
+
+    snap = service.list_clue_items_for_model(task_id)
+    assert snap["clue_count"] == 2
+    assert {c["aspect"] for c in snap["clues"]} == {"ID", "FUND"}
+
+    # 同对象同维度重写 → 顶替旧条，不新增
+    r3 = service.put_clue_item(
+        task_id, _clue("ID", "请核验账户控制人是否同一", "开户名差异较大；未见反向材料。")
+    )
+    assert r3["clue_count"] == 1 and r3["retired_count"] == 1
+    snap = service.list_clue_items_for_model(task_id)
+    assert snap["clue_count"] == 2
+    assert {c["aspect"] for c in snap["clues"]} == {"ID", "FUND"}
+
+
+def test_put_replace_all_and_delete(svc):
+    task_id, service = svc
+    service.put_clue_item(task_id, _clue("ID", "请核验两案账户是否同一", "尾号一致；未见反向材料。"))
+    service.put_clue_item(task_id, _clue("FUND", "请核验两案资金是否汇聚", "同收款侧汇聚；未见反向材料。"))
+
+    rr = service.put_clue_item(
+        task_id, _clue("ROLE", "请核验开户姓名冲突", "开户名王某某与王某伟；未见反向材料。"), replace_all=True
+    )
+    assert rr["retired_count"] >= 2
+    snap = service.list_clue_items_for_model(task_id)
+    assert snap["clue_count"] == 1 and snap["clues"][0]["aspect"] == "ROLE"
+
+    deleted = service.delete_clue_item(task_id, 0)
+    assert deleted["ok"] is True and deleted["remaining"] == 0
+    assert service.list_clue_items_for_model(task_id)["clue_count"] == 0
+    with pytest.raises(TaskError):
+        service.delete_clue_item(task_id, 5)
+
+
+def test_delete_and_overwrite_disposed_refused(svc):
+    task_id, service = svc
+    service.put_clue_item(task_id, _clue("ID", "请核验两案账户是否同一", "尾号一致；未见反向材料。"))
+    art_id = service.list_clue_items_for_model(task_id)["clues"][0]["artifact_id"]
+    service.dispose_clue_item(task_id, art_id, "EXCLUDE", "测试排除")
+
+    with pytest.raises(TaskError) as ei:
+        service.delete_clue_item(task_id, 0)
+    assert "人工处置" in str(ei.value)
+    with pytest.raises(TaskError) as ei:
+        service.put_clue_item(task_id, _clue("ID", "请核验两案账户是否同一", "尾号一致；未见反向材料。"))
+    assert "人工处置" in str(ei.value)
+
+    # 换一个核验维度仍可追加
+    ok = service.put_clue_item(
+        task_id, _clue("FUND", "请核验两案资金是否汇聚", "同收款侧汇聚；未见反向材料。")
+    )
+    assert ok["clue_count"] == 1
+    assert service.list_clue_items_for_model(task_id)["clue_count"] == 2
+
+
+def test_minimal_clue_auto_fills_optional(svc):
+    """只给必填四项（title/aspect/analysis/evidence）时，系统自动兜底其余字段。"""
+    task_id, service = svc
+    result = service.put_clue_item(
+        task_id,
+        {
+            "title": "两案账户资金是否衔接",
+            "aspect": "FUND",
+            "analysis": "两案流水在同一侧汇聚；未见反向材料。",
+            "evidence": [
+                {"chunk_id": "c1", "document_version_id": "v1", "quote": "甲案账户记载", "case_name": "甲案"},
+                {"chunk_id": "c2", "document_version_id": "v2", "quote": "乙案账户记载", "case_name": "乙案"},
+            ],
+        },
+    )
+    assert result["clue_count"] == 1 and result["retired_count"] == 0
+    snap = service.list_clue_items_for_model(task_id)
+    assert snap["clue_count"] == 1
+    # 服务端自动规范化：标题补「请核验」前缀、对象由支持材料回填
+    payload = service.get_artifact(task_id, snap["clues"][0]["artifact_id"])["payload"]
+    assert payload["title"].startswith("请核验")
+    assert payload["match_basis"]
+    assert payload["objects"]
+    assert payload["counter_evidence"] == []

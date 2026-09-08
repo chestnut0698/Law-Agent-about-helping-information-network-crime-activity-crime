@@ -131,6 +131,7 @@
                                 break;
                             }
                             case 'thinking': {
+                                // console.log('[THINK]', event.content || '');
                                 ensureStep();
                                 Thinking.appendStepThinking(currentStep, event.content || '');
                                 this._showStatus('梳理分析思路…', 25);
@@ -138,6 +139,7 @@
                                 break;
                             }
                             case 'tool_call': {
+                                // console.log('[TOOL_CALL]', event.tool);
                                 ensureStep();
                                 const tool = event.tool || {};
                                 const planIndex = PLAN_BY_TOOL[tool.name];
@@ -163,6 +165,7 @@
                                 break;
                             }
                             case 'tool_result': {
+                                // console.log('[TOOL_RESULT]', event.tool);
                                 const tool = event.tool || {};
                                 if (currentToolCard) {
                                     const ok = tool.status !== 'error';
@@ -179,6 +182,7 @@
                                 break;
                             }
                             case 'text_delta': {
+                                // console.log('[TEXT]', event.text || '');
                                 if (currentStep) {
                                     Thinking.finishStep(currentStep, `第 ${stepIndex} 步 · 已完成`);
                                     currentStep = null;

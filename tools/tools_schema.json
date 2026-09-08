@@ -325,94 +325,124 @@
   {
     "type": "function",
     "function": {
-      "name": "write_ai_clues",
-      "description": "将疑似关联线索写入线索中心（整体替换本任务旧线索）。调用前须已阅读实体候选与材料；可先查看关联提示。对用户只用办案用语说明结果在「线索中心」。每条须：请核验开头的标题；核验维度 aspect（ID/FUND/TIME/ROLE/QUAL/PLAT，一批内按维度拆开）；短办案观察；发现路径；对象芯片；至少2条支持摘录；反向材料数组（确无则[]并写明未见反向）。案內多卡同号勿写成跨案线索；上下游路径勿单条定性。禁止定罪并案；禁止对用户说工具名或英文字段。",
+      "name": "list_task_clues",
+      "description": "查看当前存活待核线索清单（含序号与核验维度）。整理或调整线索前先调用以了解现状；本工具不修改任何数据。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "put_task_clue",
+      "description": "写入或更新一条待核线索（逐条维护，不再整批替换）。replace_all=true 仅当用户要求重新形成/覆盖全部线索时用（作废旧条）；默认逐条追加/更新，同对象同核验维度的旧条自动顶替，已被人工处置的线索拒绝覆盖。必填：title（自然标题即可，不必以固定词开头）、aspect（ID/FUND/TIME/ROLE/QUAL/PLAT 之一）、analysis（一句办案观察）、evidence（至少 2 条支持摘录，引文从查阅材料返回的正文逐字抄，chunk_id/document_version_id 也照抄）。match_basis / objects / counter_evidence 均可省略。",
       "parameters": {
         "type": "object",
         "properties": {
-          "clues": {
-            "type": "array",
-            "description": "线索列表；每条只围绕一个核验问题与一个 aspect；写入成功后旧线索全部作废",
-            "items": {
-              "type": "object",
-              "properties": {
-                "title": {
-                  "type": "string",
-                  "description": "≤60字，必须以「请核验」开头，写清案件与待核问题。例：请核验案件《甲案》与《乙案》中尾号 6231 的银行账户是否为同一账户"
-                },
-                "aspect": {
-                  "type": "string",
-                  "description": "核验维度，仅限 ID/FUND/TIME/ROLE/QUAL/PLAT。ID=标识同一性；FUND=资金路径；TIME=时空连续；ROLE=角色冲突；QUAL=材料质量；PLAT=支付平台弱共现"
-                },
-                "analysis": {
-                  "type": "string",
-                  "description": "≤80字办案观察，须对准 aspect。例：开户姓名存在差异（王某某 / 王某伟），可能为同音姓名登记差异或不同主体"
-                },
-                "match_basis": {
-                  "type": "string",
-                  "description": "发现路径短标签，如：强标识账户碰撞 / 弱线索姓名+联系方式关联 / 资金流水汇聚模式"
-                },
-                "objects": {
-                  "type": "array",
-                  "items": {"type": "string"},
-                  "description": "1～5 个对象芯片，如：尾号 6231 银行账户、王某伟"
-                },
-                "evidence": {
-                  "type": "array",
-                  "description": "支持材料；至少 2 条，尽量覆盖≥2 案，每条可回链",
-                  "items": {
-                    "type": "object",
-                    "properties": {
-                      "chunk_id": {"type": "string"},
-                      "quote": {"type": "string", "description": "连续原文摘录，建议≤40字"},
-                      "quote_hash": {"type": "string", "description": "可选；服务端忽略并重算"},
-                      "page_start": {"type": "integer"},
-                      "page_end": {"type": "integer"},
-                      "document_version_id": {"type": "string"},
-                      "case_name": {"type": "string"},
-                      "stance": {"type": "string", "description": "support（默认）"}
-                    },
-                    "required": ["chunk_id", "quote", "document_version_id"]
-                  }
-                },
-                "counter_evidence": {
-                  "type": "array",
-                  "description": "反向/冲突材料（必填数组）。须主动检索；找到则写入，确无则传 []，并在 analysis 写明未见反向材料。",
-                  "items": {
-                    "type": "object",
-                    "properties": {
-                      "chunk_id": {"type": "string"},
-                      "quote": {"type": "string"},
-                      "quote_hash": {"type": "string"},
-                      "page_start": {"type": "integer"},
-                      "page_end": {"type": "integer"},
-                      "document_version_id": {"type": "string"},
-                      "case_name": {"type": "string"},
-                      "stance": {"type": "string", "description": "counter"}
-                    },
-                    "required": ["chunk_id", "quote", "document_version_id"]
-                  }
-                },
-                "linked_candidate_ids": {
-                  "type": "array",
-                  "items": {"type": "string"},
-                  "description": "关联实体候选 ID"
-                },
-                "fingerprints": {
-                  "type": "array",
-                  "items": {"type": "string"},
-                  "description": "关联实体指纹（可选）"
-                },
-                "uncertainty": {
-                  "type": "string",
-                  "description": "≤40字不确定性提示"
+          "replace_all": {
+            "type": "boolean",
+            "description": "true=开始新一轮（先作废旧条再写本条）；false=逐条追加/更新当前工作集。默认 false。"
+          },
+          "clue": {
+            "type": "object",
+            "description": "单条待核线索内容",
+            "properties": {
+              "title": {
+                "type": "string",
+                "description": "≤60字，以「请核验」开头，写清案件与待核问题。例：请核验案件《甲案》与《乙案》中尾号 6231 的银行账户是否为同一账户"
+              },
+              "aspect": {
+                "type": "string",
+                "description": "核验维度，仅限 ID/FUND/TIME/ROLE/QUAL/PLAT。ID=标识同一性；FUND=资金路径；TIME=时空连续；ROLE=角色冲突；QUAL=材料质量；PLAT=支付平台弱共现"
+              },
+              "analysis": {
+                "type": "string",
+                "description": "≤80字办案观察，须对准 aspect。例：开户姓名存在差异（王某某 / 王某伟），可能为同音姓名登记差异或不同主体"
+              },
+              "match_basis": {
+                "type": "string",
+                "description": "可选：发现路径短标签（缺省系统按维度补），如：强标识账户碰撞 / 资金流水汇聚模式"
+              },
+              "objects": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "可选：1～5 个对象芯片（缺省由系统按支持材料补），如：尾号 6231 银行账户、王某伟"
+              },
+              "evidence": {
+                "type": "array",
+                "description": "支持材料；至少 2 条，尽量覆盖≥2 案，每条可回链",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "chunk_id": {"type": "string"},
+                    "quote": {"type": "string", "description": "连续原文摘录，建议≤40字"},
+                    "quote_hash": {"type": "string", "description": "可选；服务端忽略并重算"},
+                    "page_start": {"type": "integer"},
+                    "page_end": {"type": "integer"},
+                    "document_version_id": {"type": "string"},
+                    "case_name": {"type": "string"},
+                    "stance": {"type": "string", "description": "support（默认）"}
+                  },
+                  "required": ["chunk_id", "quote", "document_version_id"]
                 }
               },
-              "required": ["title", "aspect", "analysis", "match_basis", "objects", "evidence", "counter_evidence"]
-            }
+              "counter_evidence": {
+                "type": "array",
+                "description": "可选：反向/冲突材料数组；确无可省略，系统自动标注未见反向材料。",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "chunk_id": {"type": "string"},
+                    "quote": {"type": "string"},
+                    "quote_hash": {"type": "string"},
+                    "page_start": {"type": "integer"},
+                    "page_end": {"type": "integer"},
+                    "document_version_id": {"type": "string"},
+                    "case_name": {"type": "string"},
+                    "stance": {"type": "string", "description": "counter"}
+                  },
+                  "required": ["chunk_id", "quote", "document_version_id"]
+                }
+              },
+              "linked_candidate_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "关联实体候选 ID"
+              },
+              "fingerprints": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "关联实体指纹（可选）"
+              },
+              "uncertainty": {
+                "type": "string",
+                "description": "≤40字不确定性提示"
+              }
+            },
+            "required": ["title", "aspect", "analysis", "evidence"]
           }
         },
-        "required": ["clues"]
+        "required": ["clue"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "delete_task_clue",
+      "description": "删除第 index 条存活待核线索（index 取 list_task_clues 返回的序号）。仅能删除智能体自己写入且尚未被人工处置的线索；已处置的会返回拒绝并说明。删除后线索中心同步更新。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "integer",
+            "description": "list_task_clues 返回的线索序号"
+          }
+        },
+        "required": ["index"]
       }
     }
   },
@@ -432,7 +462,7 @@
     "type": "function",
     "function": {
       "name": "read_artifact",
-      "description": "读取指定产物的完整内容。先通过 get_task_overview 获得 artifact_id，再用此工具读取 ENTITY_CANDIDATE_SET 或 ROLE_TIMELINE 的详细数据。",
+      "description": "读取指定产物供分析。实体候选集返回精简摘要：每条含类型/案件/人工核验 decision（MERGE=视为同一、KEEP_SEPARATE=保留独立、CORRECT、DEFER、PENDING）+ 人工理由 + 若干可回链原文引文；角色时间线返回事件摘要。其它类型返回原 payload。先经 get_task_overview 拿 artifact_id。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -442,36 +472,6 @@
           }
         },
         "required": ["artifact_id"]
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
-      "name": "list_entity_candidates",
-      "description": "列出跨案实体候选摘要。默认仅返回待核（PENDING）对象，避免一次读入全部产物。",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "decision": {"type": "string", "description": "过滤决策状态，默认 PENDING"},
-          "entity_type": {"type": "string", "description": "可选实体类型过滤"},
-          "limit": {"type": "integer", "description": "最多返回条数，默认 30"}
-        },
-        "required": []
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
-      "name": "get_entity_candidate_context",
-      "description": "读取单个实体候选的复核上下文：类型、案件、字段对照、证据与影响统计。",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "candidate_id": {"type": "string", "description": "候选 ID"}
-        },
-        "required": ["candidate_id"]
       }
     }
   },

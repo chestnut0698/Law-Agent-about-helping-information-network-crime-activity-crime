@@ -180,6 +180,9 @@
 
 .analysis-step-think {
     padding: 4px 14px 8px 48px;
+    max-height: 300px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
 }
 
 .analysis-step-tools {

@@ -78,10 +78,18 @@
             if (expanded) {
                 stepEl.classList.add('expanded');
                 stepEl.classList.remove('compact');
+                this._scrollBottom(Utils.$('.analysis-step-think', stepEl));
             } else {
                 stepEl.classList.remove('expanded');
                 stepEl.classList.add('compact');
             }
+        },
+
+        _scrollBottom(el) {
+            // 仅在接近底部时保持跟随，避免打断用户上翻阅读
+            if (!el || el.scrollHeight <= el.clientHeight) return;
+            const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+            if (nearBottom) el.scrollTop = el.scrollHeight;
         },
 
         appendStepThinking(stepEl, text) {
@@ -95,6 +103,7 @@
             }
             last.textContent += text;
             this.setExpanded(stepEl, true);
+            this._scrollBottom(host);
         },
 
         addToolToStep(stepEl, toolCard) {

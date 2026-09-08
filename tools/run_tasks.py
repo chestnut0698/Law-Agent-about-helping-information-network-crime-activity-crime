@@ -254,7 +254,7 @@ def run_task_timeline(task_id: str, user_id: str | None = None) -> str:
     except TaskError as exc:
         return _tool_json(exc.to_dict())
 
-# 废弃：规则不再直接落 CLUE_ITEM。请用 list_association_hints + write_ai_clues。
+# 废弃：规则不再直接落 CLUE_ITEM。请用 list_task_clues / put_task_clue / delete_task_clue 维护线索工作集。
 
 def list_association_hints(task_id: str, user_id: str | None = None) -> str:
     try:
@@ -265,41 +265,85 @@ def list_association_hints(task_id: str, user_id: str | None = None) -> str:
     except TaskError as exc:
         return _tool_json(exc.to_dict())
 
-def write_ai_clues(task_id: str, clues: list[dict[str, Any]], user_id: str | None = None) -> str:
+def list_task_clues(task_id: str, user_id: str | None = None) -> str:
+    """列出当前存活待核线索的精简快照（含序号，供 delete/覆盖引用），不改任何数据。"""
+    try:
+        result = get_task_service().list_clue_items_for_model(task_id)
+        return _tool_json(result)
+    except TaskError as exc:
+        return _tool_json(exc.to_dict())
+
+
+def put_task_clue(
+    task_id: str,
+    clue: dict[str, Any],
+    replace_all: bool = False,
+    user_id: str | None = None,
+) -> str:
+    """写入或更新单条待核线索。
+
+    replace_all=True 表示开始新一轮线索：先作废旧条再写本条，只在用户明确要求
+    「重新形成/覆盖全部线索」时使用；默认 False 为逐条追加/更新当前工作集。
+    同对象同核验维度的旧模型线索会被本条顶替；已由人工处置的线索不允许覆盖。
+    """
     blocked = _entity_review_gate(task_id)
     if blocked:
         return _tool_json(blocked)
     try:
-        result = get_task_service().write_ai_clues(task_id, clues, user_id=user_id or "system")
-        return _tool_json({
-            "ok": True,
-            "artifact_id": result["artifact"]["id"] if result.get("artifact") else None,
-            "clue_count": result["clue_count"],
-            "retired_count": result.get("retired_count") or 0,
-            "message": (
-                f"已更新疑似关联线索 {result['clue_count']} 条"
-                f"（此前 {result.get('retired_count') or 0} 条已作废），请到中间工作区「线索中心」核验"
-            ),
-        })
+        result = get_task_service().put_clue_item(
+            task_id, clue, replace_all=bool(replace_all), user_id=user_id or "system"
+        )
+        replaced = result.get("retired_count") or 0
+        return _tool_json(
+            {
+                "ok": True,
+                "clue_count": result.get("clue_count"),
+                "replaced_count": replaced,
+                "message": (
+                    f"已写入待核线索 {result.get('clue_count')} 条"
+                    + (f"（顶替旧条 {replaced} 条）" if replaced else "")
+                    + "，请到中间工作区「线索中心」核验"
+                ),
+            }
+        )
+    except TaskError as exc:
+        return _tool_json(exc.to_dict())
+
+
+def delete_task_clue(task_id: str, index: int, user_id: str | None = None) -> str:
+    """删除第 index 条存活待核线索（序号来自 list_task_clues）。
+
+    仅能删除智能体自己写入、且尚未被人工处置的线索；已处置的会返回拒绝并说明。
+    """
+    blocked = _entity_review_gate(task_id)
+    if blocked:
+        return _tool_json(blocked)
+    try:
+        result = get_task_service().delete_clue_item(
+            task_id, int(index), user_id=user_id or "system"
+        )
+        return _tool_json(result)
     except TaskError as exc:
         return _tool_json(exc.to_dict())
 
 def read_artifact(task_id: str, artifact_id: str, user_id: str | None = None) -> str:
     """
-    读取指定产物的完整内容（含 payload）。
-    用于 AI 分析 ENTITY_CANDIDATE_SET 或 ROLE_TIMELINE 的详细数据。
+    读取指定产物的内容供 AI 分析。大产物（实体候选集 / 角色时间线）返回精简摘要：
+    实体候选含每条的人工核验 decision 与理由、可回链引文；时间线按事件关键字段裁剪。
+    其它类型返回原 payload。先经 get_task_overview 或左侧产物目录拿到 artifact_id。
     """
     try:
         service = get_task_service()
-        result = service.get_artifact(task_id, artifact_id)
+        result = service.artifact_digest_for_model(task_id, artifact_id)
+        meta = result["artifact"]
         return _tool_json({
             "ok": True,
             "artifact_id": artifact_id,
-            "type": result["artifact"]["type"],
-            "title": result["artifact"]["title"],
-            "status": result["artifact"]["status"],
-            "version": result["version"],
-            "payload": result["payload"],  # 核心数据
+            "type": meta["type"],
+            "title": meta["title"],
+            "status": meta["status"],
+            "version": meta["version"],
+            "payload": result["payload"],
         })
     except TaskError as exc:
         return _tool_json(exc.to_dict())

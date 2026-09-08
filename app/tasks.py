@@ -1527,6 +1527,131 @@ class TaskService:
 
     # ----- 产物 -----
 
+    def _read_artifact_payload_raw(
+        self, task_id: str, artifact_id: str
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """读产物当前版本 payload（不做 hydrate/回链修复），供模型摘要用。"""
+        with db_session(self.db_path) as conn:
+            art = _row(
+                conn,
+                "SELECT * FROM artifacts WHERE id = ? AND task_id = ?",
+                (artifact_id, task_id),
+            )
+            if not art:
+                raise TaskError(TASK_ERROR_CODES["ARTIFACT_NOT_FOUND"], "artifact not found")
+            ver = _row(
+                conn,
+                "SELECT payload_json FROM artifact_versions "
+                "WHERE artifact_id = ? AND version = ?",
+                (artifact_id, int(art["current_version"])),
+            )
+        payload = json.loads(ver["payload_json"]) if ver and ver.get("payload_json") else {}
+        return dict(art), payload
+
+    def _entity_digest_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """实体候选集摘要：给模型看已核验结论与可回链引文，而不是 1.6MB 全量。"""
+        candidates: list[dict[str, Any]] = []
+        for cand in payload.get("candidates") or []:
+            if not isinstance(cand, dict):
+                continue
+            evidence = []
+            for ev in (cand.get("evidence") or [])[:6]:
+                if not isinstance(ev, dict):
+                    continue
+                evidence.append(
+                    {
+                        "quote": str(ev.get("quote") or "")[:120],
+                        "chunk_id": ev.get("chunk_id"),
+                        "document_version_id": ev.get("document_version_id"),
+                        "page_start": ev.get("page_start"),
+                        "filename": ev.get("filename") or ev.get("document_name") or "",
+                        "case_name": ev.get("case_name") or "",
+                    }
+                )
+            records = [
+                {"value": str(r.get("value") or "")[:60], "case_name": r.get("case_name") or ""}
+                for r in (cand.get("records") or [])[:8]
+                if isinstance(r, dict)
+            ]
+            candidates.append(
+                {
+                    "candidate_id": cand.get("candidate_id"),
+                    "entity_type": cand.get("entity_type"),
+                    "display_name": cand.get("display_name") or cand.get("title"),
+                    "aliases": (cand.get("aliases") or [])[:6],
+                    "cases": cand.get("cases") or [],
+                    "match_tier": cand.get("match_tier"),
+                    "decision": cand.get("decision") or "PENDING",
+                    "reason": str(cand.get("reason") or "")[:60],
+                    "reviewed_at": cand.get("reviewed_at"),
+                    "records": records,
+                    "evidence": evidence,
+                }
+            )
+        summary = dict(payload.get("summary") or {})
+        return {
+            "summary": {
+                "total": summary.get("total") or len(candidates),
+                "reviewed": summary.get("reviewed") or 0,
+                "pending": summary.get("pending") or 0,
+                "analysis_gate": summary.get("analysis_gate")
+                or payload.get("analysis_gate")
+                or "",
+            },
+            "candidates": candidates,
+            "boundary": "人工核验 decision 已含在每条中：MERGE=视为同一、KEEP_SEPARATE=保留独立、CORRECT=已更正、DEFER=暂缓；PENDING=待核。",
+        }
+
+    def _timeline_digest_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """角色时间线摘要：事件按关键字段裁剪，避免整包灌给模型。"""
+        items = []
+        for item in (payload.get("items") or [])[:200]:
+            if not isinstance(item, dict):
+                continue
+            quote = ""
+            source = item.get("source") or {}
+            if isinstance(source, dict):
+                quote = str(source.get("quote") or "")[:60]
+            items.append(
+                {
+                    "event_id": item.get("event_id"),
+                    "event_type": item.get("event_type"),
+                    "time_text": item.get("time_text") or item.get("event_time") or "",
+                    "time_uncertain": bool(item.get("time_uncertain")),
+                    "case_name": item.get("case_name") or "",
+                    "subject": item.get("subject") or "",
+                    "subject_kind": item.get("subject_kind") or "",
+                    "role_or_action": str(item.get("role_or_action") or "")[:40],
+                    "summary_text": str(item.get("summary_text") or "")[:100],
+                    "source_mode": item.get("source_mode") or "recorded",
+                    "quote": quote,
+                }
+            )
+        return {
+            "summary": payload.get("summary") or {},
+            "items": items,
+            "truncated": len(payload.get("items") or []) > len(items),
+        }
+
+    def artifact_digest_for_model(self, task_id: str, artifact_id: str) -> dict[str, Any]:
+        """给模型读产物：大产物（实体候选集/时间线）返回摘要，其余保持原 payload。"""
+        art, payload = self._read_artifact_payload_raw(task_id, artifact_id)
+        atype = art["type"]
+        if atype == "ENTITY_CANDIDATE_SET":
+            payload = self._entity_digest_payload(payload)
+        elif atype == "ROLE_TIMELINE":
+            payload = self._timeline_digest_payload(payload)
+        return {
+            "artifact": {
+                "id": art["id"],
+                "type": atype,
+                "title": art.get("title") or "",
+                "status": art.get("status") or "",
+                "version": art.get("current_version"),
+            },
+            "payload": payload,
+        }
+
     def find_artifact(self, task_id: str, type: str, ref_key: str | None) -> Optional[dict[str, Any]]:
         with db_session(self.db_path) as conn:
             return _row(
@@ -2064,11 +2189,18 @@ class TaskService:
             task_id: str,
             clues: list[dict[str, Any]],  # 注意：clues 是列表，不是字典
             user_id: str | None = None,
+            replace_all: bool = True,
     ) -> dict[str, Any]:
         """
-        AI 通过工具调用写入线索。clues 格式见 tools_schema / agents.prompts.clue_writing。
-        办案风字段：title / aspect / analysis / match_basis / objects / evidence / counter_evidence。
-        每次成功写入前先作废本任务既有 CLUE_ITEM / CLUE_SET（再生替换，禁止新旧混展）。
+        AI 写入/更新线索（“整批替换”与“逐条维护”共用同一落库核心）。
+
+        replace_all=True：先作废本任务既有 CLUE_ITEM / CLUE_SET，再用本条/本批重建
+            （新一轮/整批替换语义，即旧 write_ai_clues 行为）。
+        replace_all=False：逐条追加，仅顶替“同核验维度 + 同核验问题”的旧模型线索
+            （避免重复）；已被人工处置的旧条拒绝覆盖。
+
+        无论哪种，写入后都由当前全部存活 CLUE_ITEM 重建 CLUE_SET 聚合产物，
+        保证线索中心列表与 CLUE_ITEM 一致。
         """
         from agents.prompts.clue_writing import CLUE_ASPECTS
 
@@ -2237,13 +2369,8 @@ class TaskService:
             title = _normalize_title(clue.get("title", ""))
             analysis = _normalize_analysis(clue)
             evidence_raw = clue.get("evidence") or []
-            if "counter_evidence" not in clue:
-                raise TaskError(
-                    TASK_ERROR_CODES["INVALID_SCOPE"],
-                    f"第 {idx + 1} 条线索缺少 counter_evidence（须主动反向检索；确无则传 []）",
-                )
             counter_raw = clue.get("counter_evidence") or []
-            if not isinstance(counter_raw, list):
+            if "counter_evidence" in clue and not isinstance(counter_raw, list):
                 raise TaskError(
                     TASK_ERROR_CODES["INVALID_SCOPE"],
                     f"第 {idx + 1} 条线索 counter_evidence 必须是数组",
@@ -2255,21 +2382,12 @@ class TaskService:
                     TASK_ERROR_CODES["INVALID_SCOPE"],
                     f"第 {idx + 1} 条线索缺少 analysis（办案观察）",
                 )
-            if not str(clue.get("match_basis") or "").strip():
-                raise TaskError(
-                    TASK_ERROR_CODES["INVALID_SCOPE"],
-                    f"第 {idx + 1} 条线索缺少 match_basis（发现路径标签）",
-                )
-            if not list(clue.get("objects") or []):
-                raise TaskError(
-                    TASK_ERROR_CODES["INVALID_SCOPE"],
-                    f"第 {idx + 1} 条线索缺少 objects（对象芯片）",
-                )
             if len(evidence_raw) < 2:
                 raise TaskError(
                     TASK_ERROR_CODES["INVALID_SCOPE"],
                     f"第 {idx + 1} 条线索 evidence 至少需要 2 条可回链摘录",
                 )
+            # match_basis / objects / counter_evidence 均可缺省，下面自动兜底
             if not counter_raw and "未见反向" not in analysis and "无反向" not in analysis:
                 analysis = (analysis.rstrip("。；; ") + "；未见反向材料。")[:80]
 
@@ -2335,10 +2453,13 @@ class TaskService:
                 "一次写入不少于 2 条时，须至少覆盖 2 种核验方面（标识同一性/资金路径/时空连续/角色冲突/材料质量/平台共现），避免同义重复",
             )
 
-        retired = self.retire_task_clues(task_id)
+        # 整轮替换才作废旧条；逐条追加只顶替“同对象同核验维度”的旧模型线索
+        retired = self.retire_task_clues(task_id) if replace_all else 0
+        if not replace_all:
+            for row in prepared:
+                retired += self._retire_active_duplicate(task_id, row)
 
         item_ids: list[str] = []
-        normalized_clues: list[dict[str, Any]] = []
         for row in prepared:
             clue_item = self.write_artifact(
                 task_id=task_id,
@@ -2351,9 +2472,8 @@ class TaskService:
                 input_snapshot=row["input_snapshot"],
             )
             item_ids.append(clue_item["id"])
-            normalized_clues.append(row["payload"])
 
-        # 回写相关实体候选的线索指标
+        # 回写相关实体候选的线索指标（读取时会重算，这里刷新已落盘快照）
         if entity_set and item_ids:
             try:
                 detail = self.get_artifact(task_id, entity_set["id"])
@@ -2378,45 +2498,7 @@ class TaskService:
             except Exception:
                 pass
 
-        batch = self.find_artifact(task_id, "MATERIAL_BATCH", "batch")
-
-        clue_set_payload = {
-            "summary": {
-                "total": len(item_ids),
-                "producer": "AI_AGENT",
-                "retired": retired,
-                "aspects": sorted(aspects_seen),
-            },
-            "items": [
-                {
-                    "artifact_id": aid,
-                    "title": clue.get("title") or "",
-                    "aspect": clue.get("aspect") or "",
-                    "rule_id": clue.get("match_basis") or "AI_CLUE",
-                    "case_count": len(
-                        {
-                            str(ev.get("case_name") or "").strip()
-                            for ev in (clue.get("evidence") or [])
-                            if str(ev.get("case_name") or "").strip()
-                        }
-                    ),
-                    "chunk_count": len(clue.get("evidence") or []),
-                }
-                for aid, clue in zip(item_ids, normalized_clues)
-            ],
-            "boundary": "AI 生成的待核验关联线索，不代表系统已认定为同一实体或共同犯罪。",
-        }
-
-        artifact = self.write_artifact(
-            task_id=task_id,
-            type="CLUE_SET",
-            title="跨案关联线索",
-            ref_key="ai-clues",
-            status="VALID" if clue_status == "VALID" else "DRAFT",
-            parent_ids=[batch["id"]] if batch else [],
-            payload=clue_set_payload,
-            input_snapshot={"clue_count": len(item_ids), "retired": retired},
-        )
+        artifact = self._rebuild_clue_set(task_id)
 
         return {
             "artifact": artifact,
@@ -2425,12 +2507,198 @@ class TaskService:
             "task": self.get_task(task_id),
         }
 
+    # ----- 线索：模型逐条维护（list_task_clues / put_task_clue / delete_task_clue）-----
+
+    def _active_clue_items(
+        self, task_id: str
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        """当前存活线索（CLUE_ITEM，非 STALE/INVALID），按创建先后返回 (artifact, payload)。"""
+        rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        with db_session(self.db_path) as conn:
+            arts = _rows(
+                conn,
+                "SELECT * FROM artifacts WHERE task_id = ? AND type = 'CLUE_ITEM' "
+                "AND status NOT IN ('STALE', 'INVALID') ORDER BY created_at ASC",
+                (task_id,),
+            )
+            for art in arts:
+                ver = _row(
+                    conn,
+                    "SELECT payload_json FROM artifact_versions "
+                    "WHERE artifact_id = ? AND version = ?",
+                    (art["id"], int(art["current_version"])),
+                )
+                payload = json.loads(ver["payload_json"]) if ver and ver.get("payload_json") else {}
+                rows.append((dict(art), payload))
+        return rows
+
+    @staticmethod
+    def _clue_dedup_key(payload: dict[str, Any]) -> str:
+        """同一条“核验问题”的稳定键：优先实体关联/指纹，其次对象，最后标题哈希。"""
+        linked = sorted(
+            str(x).strip()
+            for x in (payload.get("linked_candidate_ids") or [])
+            if str(x).strip()
+        )
+        fps = sorted(TaskService.clue_fingerprint_set(payload))
+        if linked:
+            return "cand:" + "|".join(linked)
+        if fps:
+            return "fp:" + "|".join(fps)
+        objects = sorted(str(x).strip() for x in (payload.get("objects") or []) if str(x).strip())
+        if objects:
+            return "obj:" + "|".join(objects)
+        title = str(payload.get("title") or "").strip()
+        return "title:" + hashlib.sha256(title.encode("utf-8")).hexdigest()[:12]
+
+    def _retire_active_duplicate(self, task_id: str, row: dict[str, Any]) -> int:
+        """追加写入时，把存活线索里同核验维度、同核验问题的旧模型线索作废为本次新条。
+
+        旧条若已被人工处置则拒绝覆盖，避免模型悄悄改掉人工判断。
+        """
+        payload = row.get("payload") or {}
+        aspect = str(payload.get("aspect") or "").upper()
+        key = self._clue_dedup_key(payload)
+        retired = 0
+        for art, existing in self._active_clue_items(task_id):
+            if str(existing.get("aspect") or "").upper() != aspect:
+                continue
+            if self._clue_dedup_key(existing) != key:
+                continue
+            if existing.get("disposition"):
+                raise TaskError(
+                    TASK_ERROR_CODES["STATE_CONFLICT"],
+                    "该对象该核验维度的线索已由人工处置，智能体不能覆盖；如需重新形成请向用户说明",
+                )
+            self._mark_artifact_stale(task_id, art["id"], reason="由智能体更新，旧条作废")
+            retired += 1
+        return retired
+
+    def _mark_artifact_stale(self, task_id: str, artifact_id: str, *, reason: str) -> None:
+        with db_session(self.db_path) as conn:
+            _update(
+                conn,
+                "artifacts",
+                artifact_id,
+                {"status": "STALE", "stale_reason": reason, "updated_at": utc_now()},
+            )
+            _update(conn, "supervision_tasks", task_id, {"updated_at": utc_now()})
+
+    def _rebuild_clue_set(self, task_id: str) -> dict[str, Any]:
+        """由当前全部存活 CLUE_ITEM 重建 CLUE_SET 聚合产物（线索中心读它）。"""
+        from agents.prompts.clue_writing import CLUE_ASPECTS
+
+        active = self._active_clue_items(task_id)
+        items: list[dict[str, Any]] = []
+        aspects: set[str] = set()
+        batch = self.find_artifact(task_id, "MATERIAL_BATCH", "batch")
+        entity_set = self.find_artifact(task_id, "ENTITY_CANDIDATE_SET", "entity-candidates")
+        status = "VALID" if entity_set and entity_set.get("status") == "VALID" else "DRAFT"
+        for art, payload in active:
+            aspect = str(payload.get("aspect") or "").upper()
+            aspects.add(aspect)
+            evidence = payload.get("evidence") or []
+            items.append(
+                {
+                    "artifact_id": art["id"],
+                    "title": payload.get("title") or art.get("title") or "",
+                    "aspect": aspect or "QUAL",
+                    "rule_id": payload.get("match_basis") or "AI_CLUE",
+                    "case_count": len(
+                        {
+                            str(ev.get("case_name") or "").strip()
+                            for ev in evidence
+                            if str(ev.get("case_name") or "").strip()
+                        }
+                    ),
+                    "chunk_count": len(evidence),
+                }
+            )
+        return self.write_artifact(
+            task_id=task_id,
+            type="CLUE_SET",
+            title="跨案关联线索",
+            ref_key="ai-clues",
+            status=status,
+            parent_ids=[batch["id"]] if batch else [],
+            payload={
+                "summary": {
+                    "total": len(items),
+                    "producer": "AI_AGENT",
+                    "aspects": sorted(a for a in aspects if a in CLUE_ASPECTS),
+                },
+                "items": items,
+                "boundary": "AI 生成的待核验关联线索，不代表系统已认定为同一实体或共同犯罪。",
+            },
+            input_snapshot={"clue_count": len(items), "action": "rebuild_set"},
+        )
+
+    def put_clue_item(
+        self,
+        task_id: str,
+        clue: dict[str, Any],
+        *,
+        replace_all: bool = False,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """模型逐条写入：单条追加，或作为“整轮重来”的首条（replace_all=True 作废旧条）。"""
+        return self.write_ai_clues(task_id, [clue], user_id=user_id, replace_all=replace_all)
+
+    def delete_clue_item(
+        self,
+        task_id: str,
+        index: int,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """模型删除第 index 条存活线索（序号来自 list_clue_items）。已人工处置的拒绝。"""
+        active = self._active_clue_items(task_id)
+        if not active:
+            raise TaskError(TASK_ERROR_CODES["NOT_FOUND"], "当前没有可删除的线索")
+        if index < 0 or index >= len(active):
+            raise TaskError(
+                TASK_ERROR_CODES["NOT_FOUND"],
+                f"序号 {index} 越界：当前存活线索 {len(active)} 条，请先重新 list_task_clues",
+            )
+        art, payload = active[index]
+        if payload.get("disposition"):
+            raise TaskError(
+                TASK_ERROR_CODES["STATE_CONFLICT"],
+                "该线索已由人工处置，智能体不能删除；请向用户说明",
+            )
+        self._mark_artifact_stale(task_id, art["id"], reason="由智能体删除")
+        self._rebuild_clue_set(task_id)
+        return {
+            "ok": True,
+            "removed_artifact_id": art["id"],
+            "removed_title": payload.get("title") or art.get("title") or "",
+            "remaining": len(active) - 1,
+            "message": f"已删除线索：{payload.get('title') or art.get('title') or ''}",
+        }
+
+    def list_clue_items_for_model(self, task_id: str) -> dict[str, Any]:
+        """给模型看的存活线索快照（精简，序号供 delete/覆盖引用）。"""
+        active = self._active_clue_items(task_id)
+        clues: list[dict[str, Any]] = []
+        for index, (art, payload) in enumerate(active):
+            clues.append(
+                {
+                    "index": index,
+                    "artifact_id": art["id"],
+                    "title": (payload.get("title") or art.get("title") or "")[:60],
+                    "aspect": str(payload.get("aspect") or "").upper() or "QUAL",
+                    "analysis": str(payload.get("analysis") or "")[:80],
+                    "objects": (payload.get("objects") or [])[:5],
+                    "disposition": payload.get("disposition") or "PENDING",
+                }
+            )
+        return {"ok": True, "clue_count": len(clues), "clues": clues}
+
     def generate_clues(
         self,
         task_id: str,
         user_id: str | None = None,
     ) -> dict[str, Any]:
-        """已下线：规则不再直接落 CLUE_ITEM。请改用 list_association_hints + write_ai_clues。"""
+        """已下线：规则不再直接落 CLUE_ITEM。请用 list_task_clues / put_task_clue / delete_task_clue 由助手逐条维护。"""
         raise TaskError(
             TASK_ERROR_CODES["STATE_CONFLICT"],
             "旧的规则自动落库方式已停用。请在对话中说明需要重新形成疑似关联线索，由助手按不同核验方面写入线索中心（会替换旧条）。",

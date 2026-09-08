@@ -5,8 +5,6 @@ from tools.policy_query import *
 from tools.materials import *
 from tools.run_tasks import *
 from tools.entity_review import (
-    list_entity_candidates,
-    get_entity_candidate_context,
     compare_candidate_fields,
     build_candidate_field_table,
     search_candidate_evidence,
@@ -36,10 +34,10 @@ tool_functions = {
     "run_task_collision": run_task_collision,
     "run_task_timeline": run_task_timeline,
     "list_association_hints": list_association_hints,
-    "write_ai_clues": write_ai_clues,
+    "list_task_clues": list_task_clues,
+    "put_task_clue": put_task_clue,
+    "delete_task_clue": delete_task_clue,
     "read_artifact": read_artifact,
-    "list_entity_candidates": list_entity_candidates,
-    "get_entity_candidate_context": get_entity_candidate_context,
     "compare_candidate_fields": compare_candidate_fields,
     "build_candidate_field_table": build_candidate_field_table,
     "search_candidate_evidence": search_candidate_evidence,
