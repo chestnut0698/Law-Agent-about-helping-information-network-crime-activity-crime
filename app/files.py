@@ -959,6 +959,182 @@ class GlobalEntityMapper:
             if not self._is_in_context(conn):
                 conn.close()
 
+    def repair_truncated_person_spans(self, *, task_id: str | None = None) -> dict[str, Any]:
+        """修复已落库的残缺人名脱敏跨度（姓+欠切），并重建受影响 chunk 的脱敏文。
+
+        只延长 PERSON/NAME 跨度；与其它脱敏项重叠则跳过。不特化具体人名。
+        """
+        from tools.entities import _extend_person_span
+
+        grown = 0
+        skipped_overlap = 0
+        chunks_rebuilt = 0
+        with db_session(self.db_path) as conn:
+            if task_id:
+                rows = conn.execute(
+                    """
+                    SELECT ri.id AS item_id, ri.chunk_id, ri.start_offset, ri.end_offset,
+                           ri.placeholder, ri.map_ref, ri.sens_type, ri.document_version_id,
+                           c.text_raw
+                    FROM redaction_items ri
+                    JOIN document_chunks c ON c.id = ri.chunk_id
+                    JOIN document_versions dv ON dv.id = c.document_version_id
+                    JOIN documents d ON d.id = dv.document_id
+                    JOIN task_cases tc ON tc.case_id = d.case_id
+                    WHERE tc.task_id = ? AND ri.sens_type IN ('PERSON', 'NAME')
+                    """,
+                    (task_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT ri.id AS item_id, ri.chunk_id, ri.start_offset, ri.end_offset,
+                           ri.placeholder, ri.map_ref, ri.sens_type, ri.document_version_id,
+                           c.text_raw
+                    FROM redaction_items ri
+                    JOIN document_chunks c ON c.id = ri.chunk_id
+                    WHERE ri.sens_type IN ('PERSON', 'NAME')
+                    """
+                ).fetchall()
+
+            # chunk_id -> list of planned updates {item_id, start, end, map_ref, placeholder, sens_type}
+            plans: dict[str, list[dict[str, Any]]] = {}
+            for row in rows:
+                text = row["text_raw"] or ""
+                s, e = int(row["start_offset"]), int(row["end_offset"])
+                if not text or not (0 <= s < e <= len(text)):
+                    continue
+                ns, ne = _extend_person_span(text, s, e)
+                if ns == s and ne == e:
+                    continue
+                # 仅接受真正变长
+                if (ne - ns) <= (e - s):
+                    continue
+                others = conn.execute(
+                    """
+                    SELECT id, start_offset, end_offset FROM redaction_items
+                    WHERE chunk_id = ? AND id != ?
+                    """,
+                    (row["chunk_id"], row["item_id"]),
+                ).fetchall()
+                overlap = False
+                for oth in others:
+                    os, oe = int(oth["start_offset"]), int(oth["end_offset"])
+                    if ns < oe and ne > os:
+                        overlap = True
+                        break
+                if overlap:
+                    skipped_overlap += 1
+                    continue
+                new_orig = text[ns:ne]
+                fp = self._fingerprint(new_orig)
+                existing = conn.execute(
+                    "SELECT anonymous_id, sens_type FROM entity_global_map WHERE fingerprint = ?",
+                    (fp,),
+                ).fetchone()
+                if existing:
+                    anon_id = existing["anonymous_id"]
+                    sens = existing["sens_type"] or row["sens_type"]
+                    conn.execute(
+                        "UPDATE entity_global_map SET last_seen_at = ? WHERE fingerprint = ?",
+                        (utc_now(), fp),
+                    )
+                else:
+                    sens = row["sens_type"] or "PERSON"
+                    anon_id = self._new_anonymous_id(sens)
+                    alias = self._allocate_alias(conn, new_orig, sens)
+                    now = utc_now()
+                    conn.execute(
+                        """
+                        INSERT INTO entity_global_map
+                        (fingerprint, anonymous_id, display_alias, sens_type, task_id, first_seen_at, last_seen_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (fp, anon_id, alias, sens, task_id or "", now, now),
+                    )
+                plans.setdefault(row["chunk_id"], []).append(
+                    {
+                        "item_id": row["item_id"],
+                        "start": ns,
+                        "end": ne,
+                        "map_ref": fp,
+                        "placeholder": anon_id,
+                        "sens_type": sens,
+                        "document_version_id": row["document_version_id"],
+                    }
+                )
+                grown += 1
+
+            for chunk_id, updates in plans.items():
+                chunk = conn.execute(
+                    "SELECT text_raw, document_version_id FROM document_chunks WHERE id = ?",
+                    (chunk_id,),
+                ).fetchone()
+                if not chunk:
+                    continue
+                text_raw = chunk["text_raw"] or ""
+                by_id = {u["item_id"]: u for u in updates}
+                items = conn.execute(
+                    """
+                    SELECT id, start_offset, end_offset, placeholder, map_ref, sens_type, document_version_id
+                    FROM redaction_items WHERE chunk_id = ?
+                    ORDER BY start_offset DESC
+                    """,
+                    (chunk_id,),
+                ).fetchall()
+                new_text = text_raw
+                new_rows = []
+                for item in items:
+                    iid = item["id"]
+                    if iid in by_id:
+                        u = by_id[iid]
+                        start, end = u["start"], u["end"]
+                        placeholder = u["placeholder"]
+                        map_ref = u["map_ref"]
+                        sens = u["sens_type"]
+                    else:
+                        start, end = int(item["start_offset"]), int(item["end_offset"])
+                        placeholder = item["placeholder"]
+                        map_ref = item["map_ref"]
+                        sens = item["sens_type"]
+                    if not (0 <= start < end <= len(text_raw)):
+                        continue
+                    new_text = new_text[:start] + placeholder + new_text[end:]
+                    new_rows.append(
+                        (
+                            new_id(),
+                            item["document_version_id"],
+                            chunk_id,
+                            sens,
+                            start,
+                            end,
+                            placeholder,
+                            map_ref,
+                            utc_now(),
+                        )
+                    )
+                conn.execute(
+                    "UPDATE document_chunks SET text_redacted = ? WHERE id = ?",
+                    (new_text, chunk_id),
+                )
+                conn.execute("DELETE FROM redaction_items WHERE chunk_id = ?", (chunk_id,))
+                for nr in new_rows:
+                    conn.execute(
+                        """
+                        INSERT INTO redaction_items
+                        (id, document_version_id, chunk_id, sens_type, start_offset, end_offset, placeholder, map_ref, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        nr,
+                    )
+                chunks_rebuilt += 1
+
+        return {
+            "grown": grown,
+            "skipped_overlap": skipped_overlap,
+            "chunks_rebuilt": chunks_rebuilt,
+        }
+
     # --------------------------------------------------------------
     # 核心重构方法：batch_apply_and_redact
     # --------------------------------------------------------------
@@ -1669,6 +1845,22 @@ def redact_text(
 
     person_results = [r for r in results if r.entity_type == "PERSON"]
     other_results = [r for r in results if r.entity_type != "PERSON"]
+
+    # 与抽取链路统一：先补残缺人名跨度，再邻接合并
+    from tools.entities import _extend_person_span
+
+    extended_persons = []
+    for r in person_results:
+        ns, ne = _extend_person_span(text, r.start, r.end)
+        if ne <= ns:
+            continue
+        if ns == r.start and ne == r.end:
+            extended_persons.append(r)
+        else:
+            extended_persons.append(
+                RecognizerResult(entity_type="PERSON", start=ns, end=ne, score=r.score)
+            )
+    person_results = extended_persons
 
     person_results.sort(key=lambda r: (r.start, r.end))
     person_results = merge_person_spans(text, person_results)

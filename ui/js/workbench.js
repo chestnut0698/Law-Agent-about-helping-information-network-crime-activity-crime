@@ -35,6 +35,10 @@
         leadsStatusFilter: 'all',
         leadsEntityFilter: null,
         artifactCache: {},
+        timelineFilters: null,
+        timelineSubject: 'all',
+        timelineSubjectKind: 'all',
+        timelineFacets: null,
 
         async init() {
             this._injectNavIcons();
@@ -1286,8 +1290,16 @@
 
         async _runTimeline(button) {
             button.disabled = true;
+            const prevText = button.textContent;
             try {
-                const resp = await fetch(`/api/tasks/${this.task.id}/timeline/run`, { method: 'POST' });
+                if (button.querySelector('span') || true) {
+                    button.setAttribute('data-loading', '1');
+                }
+                const resp = await fetch(`/api/tasks/${this.task.id}/timeline/run`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enrich: true })
+                });
                 const data = await resp.json();
                 if (data.error_code) {
                     Toast.error(data.message || '事件整理未能完成');
@@ -1296,13 +1308,193 @@
                 this.task = data.task;
                 this.artifactCache = {};
                 this._timelineRefreshTried = false;
+                this.timelineFilters = this._defaultTimelineFilters();
                 await this.openArtifact(data.artifact.id);
                 Toast.success(`事件时间线已整理 ${data.event_count || 0} 条`);
             } catch (e) {
                 Toast.error('事件整理未能完成：' + e.message);
             } finally {
                 button.disabled = false;
+                button.removeAttribute('data-loading');
+                if (prevText) button.title = button.title || '';
             }
+        },
+
+        _defaultTimelineFilters() {
+            return {
+                date_from: '',
+                date_to: '',
+                include_uncertain: true,
+                event_types: [],
+                source_modes: [],
+                case_id: ''
+            };
+        },
+
+        _timelineQueryParams(extra) {
+            const f = this.timelineFilters || this._defaultTimelineFilters();
+            const params = new URLSearchParams();
+            if (f.date_from) params.set('date_from', f.date_from);
+            if (f.date_to) params.set('date_to', f.date_to);
+            params.set('include_uncertain', f.include_uncertain ? '1' : '0');
+            if (f.event_types && f.event_types.length) params.set('event_type', f.event_types.join(','));
+            if (f.source_modes && f.source_modes.length) params.set('source_mode', f.source_modes.join(','));
+            if (f.case_id) params.set('case_id', f.case_id);
+            const kind = this.timelineSubjectKind;
+            const sid = this.timelineSubject;
+            if (kind && kind !== 'all') params.set('subject_kind', kind);
+            if (sid && sid !== 'all') params.set('subject_id', sid);
+            if (extra) {
+                Object.keys(extra).forEach((k) => {
+                    if (extra[k] != null && extra[k] !== '') params.set(k, extra[k]);
+                });
+            }
+            return params;
+        },
+
+        async _fetchTimelineQuery() {
+            const params = this._timelineQueryParams();
+            const resp = await fetch(`/api/tasks/${this.task.id}/timeline?${params.toString()}`);
+            const data = await resp.json();
+            if (data.error_code) {
+                throw new Error(data.message || '时间线查询失败');
+            }
+            this.timelineFacets = data.facets || null;
+            return data;
+        },
+
+        _closeTimelinePopovers() {
+            document.querySelectorAll('.ref-tl-popover').forEach((el) => el.remove());
+        },
+
+        _openTimelineRangePopover(anchor) {
+            this._closeTimelinePopovers();
+            if (!this.timelineFilters) this.timelineFilters = this._defaultTimelineFilters();
+            const f = this.timelineFilters;
+            const pop = Utils.create('div', { class: 'ref-tl-popover' });
+            pop.appendChild(Utils.create('div', { class: 'ref-tl-popover-title', text: '时间范围' }));
+            const row1 = Utils.create('div', { class: 'ref-tl-popover-row' });
+            const fromInput = Utils.create('input', { type: 'date', value: f.date_from || '' });
+            const toInput = Utils.create('input', { type: 'date', value: f.date_to || '' });
+            row1.appendChild(Utils.create('label', { text: '起' }));
+            row1.appendChild(fromInput);
+            row1.appendChild(Utils.create('label', { text: '止' }));
+            row1.appendChild(toInput);
+            pop.appendChild(row1);
+            const uncLabel = Utils.create('label', { class: 'ref-tl-popover-check' });
+            const unc = Utils.create('input', { type: 'checkbox' });
+            unc.checked = f.include_uncertain !== false;
+            uncLabel.appendChild(unc);
+            uncLabel.appendChild(document.createTextNode('含时间不明节点'));
+            pop.appendChild(uncLabel);
+            const actions = Utils.create('div', { class: 'ref-tl-popover-actions' });
+            const clearBtn = this._iconBtn('wb-btn wb-btn-ghost', 'x', '清除');
+            clearBtn.addEventListener('click', async () => {
+                this.timelineFilters.date_from = '';
+                this.timelineFilters.date_to = '';
+                this.timelineFilters.include_uncertain = true;
+                this._closeTimelinePopovers();
+                this._renderCurrentView();
+            });
+            const applyBtn = this._iconBtn('wb-btn wb-btn-primary', 'check', '应用');
+            applyBtn.addEventListener('click', async () => {
+                this.timelineFilters.date_from = fromInput.value || '';
+                this.timelineFilters.date_to = toInput.value || '';
+                this.timelineFilters.include_uncertain = unc.checked;
+                this._closeTimelinePopovers();
+                this._renderCurrentView();
+            });
+            actions.appendChild(clearBtn);
+            actions.appendChild(applyBtn);
+            pop.appendChild(actions);
+            anchor.parentElement.style.position = 'relative';
+            anchor.parentElement.appendChild(pop);
+        },
+
+        _openTimelineFilterPopover(anchor) {
+            this._closeTimelinePopovers();
+            if (!this.timelineFilters) this.timelineFilters = this._defaultTimelineFilters();
+            const f = this.timelineFilters;
+            const facets = this.timelineFacets || {};
+            const pop = Utils.create('div', { class: 'ref-tl-popover ref-tl-popover-wide' });
+            pop.appendChild(Utils.create('div', { class: 'ref-tl-popover-title', text: '筛选' }));
+
+            const typeBox = Utils.create('div', { class: 'ref-tl-popover-group' });
+            typeBox.appendChild(Utils.create('div', { class: 'ref-tl-popover-label', text: '事件类型' }));
+            const typeOpts = [
+                { v: 'TRANSFER', t: '转账' },
+                { v: 'CONTACT', t: '联络' },
+                { v: 'INFERRED', t: '系统推测' }
+            ];
+            const typeChecks = {};
+            typeOpts.forEach((o) => {
+                const lab = Utils.create('label', { class: 'ref-tl-popover-check' });
+                const cb = Utils.create('input', { type: 'checkbox', value: o.v });
+                cb.checked = (f.event_types || []).includes(o.v);
+                const cnt = (facets.event_types && facets.event_types[o.v]) || 0;
+                lab.appendChild(cb);
+                lab.appendChild(document.createTextNode(`${o.t}（${cnt}）`));
+                typeBox.appendChild(lab);
+                typeChecks[o.v] = cb;
+            });
+            pop.appendChild(typeBox);
+
+            const modeBox = Utils.create('div', { class: 'ref-tl-popover-group' });
+            modeBox.appendChild(Utils.create('div', { class: 'ref-tl-popover-label', text: '来源' }));
+            const modeOpts = [
+                { v: 'recorded', t: '材料明确记载' },
+                { v: 'inferred', t: '系统推测' },
+                { v: 'confirmed', t: '人工确认' }
+            ];
+            const modeChecks = {};
+            modeOpts.forEach((o) => {
+                const lab = Utils.create('label', { class: 'ref-tl-popover-check' });
+                const cb = Utils.create('input', { type: 'checkbox', value: o.v });
+                cb.checked = (f.source_modes || []).includes(o.v);
+                const cnt = (facets.source_modes && facets.source_modes[o.v]) || 0;
+                lab.appendChild(cb);
+                lab.appendChild(document.createTextNode(`${o.t}（${cnt}）`));
+                modeBox.appendChild(lab);
+                modeChecks[o.v] = cb;
+            });
+            pop.appendChild(modeBox);
+
+            const caseBox = Utils.create('div', { class: 'ref-tl-popover-group' });
+            caseBox.appendChild(Utils.create('div', { class: 'ref-tl-popover-label', text: '案件' }));
+            const caseSelect = Utils.create('select');
+            caseSelect.appendChild(Utils.create('option', { value: '', text: '全部案件' }));
+            (facets.cases || []).forEach((c) => {
+                caseSelect.appendChild(Utils.create('option', {
+                    value: c.case_id,
+                    text: `${c.case_name || c.case_id}（${c.count}）`
+                }));
+            });
+            caseSelect.value = f.case_id || '';
+            caseBox.appendChild(caseSelect);
+            pop.appendChild(caseBox);
+
+            const actions = Utils.create('div', { class: 'ref-tl-popover-actions' });
+            const clearBtn = this._iconBtn('wb-btn wb-btn-ghost', 'x', '清除');
+            clearBtn.addEventListener('click', () => {
+                this.timelineFilters.event_types = [];
+                this.timelineFilters.source_modes = [];
+                this.timelineFilters.case_id = '';
+                this._closeTimelinePopovers();
+                this._renderCurrentView();
+            });
+            const applyBtn = this._iconBtn('wb-btn wb-btn-primary', 'check', '应用');
+            applyBtn.addEventListener('click', () => {
+                this.timelineFilters.event_types = Object.keys(typeChecks).filter((k) => typeChecks[k].checked);
+                this.timelineFilters.source_modes = Object.keys(modeChecks).filter((k) => modeChecks[k].checked);
+                this.timelineFilters.case_id = caseSelect.value || '';
+                this._closeTimelinePopovers();
+                this._renderCurrentView();
+            });
+            actions.appendChild(clearBtn);
+            actions.appendChild(applyBtn);
+            pop.appendChild(actions);
+            anchor.parentElement.style.position = 'relative';
+            anchor.parentElement.appendChild(pop);
         },
 
         async _openCitation(source, list, index) {
@@ -2103,6 +2295,37 @@
                 tbody.appendChild(tr);
             });
             table.appendChild(tbody);
+            content.appendChild(Utils.create('div', {
+                class: 'ref-tl-alert',
+                style: 'margin-bottom: 12px;',
+                text: '若人名被切短：可点下方「修复残缺人名跨度」按规则自动延长；或先删短映射再按完整原文新增。'
+            }));
+            const repairRow = Utils.create('div', { style: 'margin-bottom: 12px; display:flex; gap:8px; flex-wrap:wrap;' });
+            const repairBtn = this._iconBtn('wb-btn wb-btn-outline', 'shield', '修复残缺人名跨度');
+            repairBtn.addEventListener('click', async () => {
+                repairBtn.disabled = true;
+                try {
+                    const resp = await fetch('/api/mappings/repair-person-spans', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ task_id: (this.task && this.task.id) || null })
+                    });
+                    const result = await resp.json();
+                    if (result.ok) {
+                        Toast.success(`已修复 ${result.grown || 0} 处跨度（重建 ${result.chunks_rebuilt || 0} 段材料）`);
+                        modal.remove();
+                        this._openMappingManager(documentId);
+                    } else {
+                        Toast.error(result.error || result.message || '修复未完成');
+                    }
+                } catch (e) {
+                    Toast.error('修复失败：' + e.message);
+                } finally {
+                    repairBtn.disabled = false;
+                }
+            });
+            repairRow.appendChild(repairBtn);
+            content.appendChild(repairRow);
             content.appendChild(table);
 
             // 5. 新增映射区域（也改用下拉选择框）
@@ -3083,6 +3306,17 @@
                     text: (m.uploaded_at || m.created_at || '—').toString().replace('T', ' ').slice(0, 16)
                 }));
                 const actionsTd = Utils.create('td', { class: 'wb-td-actions' });
+                const mapBtn = this._iconBtn('wb-btn wb-btn-outline', 'shield', '脱敏映射');
+                mapBtn.title = '管理脱敏映射（人工改映射后会重脱敏）';
+                mapBtn.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (!m.document_id) {
+                        Toast.info('该材料尚无文档标识，无法打开映射');
+                        return;
+                    }
+                    this._openMappingManager(m.document_id);
+                });
                 const delBtn = this._iconBtn('wb-btn wb-btn-ghost wb-btn-icon-danger', 'trash', '');
                 delBtn.title = '删除材料';
                 delBtn.addEventListener('click', (e) => {
@@ -3090,6 +3324,7 @@
                     e.stopPropagation();
                     this._deleteMaterial(m.document_id);
                 });
+                actionsTd.appendChild(mapBtn);
                 actionsTd.appendChild(delBtn);
                 tr.appendChild(actionsTd);
                 tr.addEventListener('click', async (e) => {
@@ -4002,9 +4237,24 @@
                 return;
             }
 
-            const data = ensured.data || await this._fetchArtifact(art.id);
-            const payload = (data && data.payload) || {};
-            const items = payload.items || [];
+            if (!this.timelineFilters) this.timelineFilters = this._defaultTimelineFilters();
+            let items = [];
+            let totalAll = 0;
+            let matched = 0;
+            try {
+                const queried = await this._fetchTimelineQuery();
+                items = queried.items || [];
+                totalAll = queried.total != null ? queried.total : items.length;
+                matched = queried.matched != null ? queried.matched : items.length;
+                if (!this.timelineFacets && queried.facets) this.timelineFacets = queried.facets;
+            } catch (e) {
+                const data = ensured.data || await this._fetchArtifact(art.id);
+                const payload = (data && data.payload) || {};
+                items = payload.items || [];
+                totalAll = items.length;
+                matched = items.length;
+                Toast.warning('时间线筛选未生效，已显示全部：' + (e.message || ''));
+            }
 
             const caseNameSet = new Set(
                 (this.task.cases || []).map((c) => c.display_name || c.name || c.case_id).filter(Boolean)
@@ -4113,25 +4363,36 @@
             if (this.timelineSubjectKind == null) this.timelineSubjectKind = 'all';
 
             const subjectMap = new Map();
-            normalized.forEach((e) => {
-                if (e.personSubjectId || (e.subjectKind === 'PERSON' && e.subjectId)) {
-                    const id = e.personSubjectId || e.subjectId;
-                    const name = e.personSubject || (e.subjectKind === 'PERSON' ? e.subject : '') || id;
-                    if (id && !caseNameSet.has(name)) {
-                        subjectMap.set(`PERSON::${id}`, { id, name, kind: 'PERSON' });
+            if (this.timelineFacets && ((this.timelineFacets.persons || []).length || (this.timelineFacets.accounts || []).length)) {
+                (this.timelineFacets.persons || []).forEach((s) => {
+                    if (s.id) subjectMap.set(`PERSON::${s.id}`, { id: s.id, name: s.name || s.id, kind: 'PERSON' });
+                });
+                (this.timelineFacets.accounts || []).forEach((s) => {
+                    if (s.id) subjectMap.set(`ACCOUNT::${s.id}`, { id: s.id, name: s.name || s.id, kind: 'ACCOUNT' });
+                });
+            } else {
+                normalized.forEach((e) => {
+                    if (e.personSubjectId || (e.subjectKind === 'PERSON' && e.subjectId)) {
+                        const id = e.personSubjectId || e.subjectId;
+                        const name = e.personSubject || (e.subjectKind === 'PERSON' ? e.subject : '') || id;
+                        if (id && !caseNameSet.has(name)) {
+                            subjectMap.set(`PERSON::${id}`, { id, name, kind: 'PERSON' });
+                        }
                     }
-                }
-                if (e.accountSubjectId || (e.subjectKind === 'ACCOUNT' && e.subjectId)) {
-                    const id = e.accountSubjectId || e.subjectId;
-                    const name = e.accountSubject || (e.subjectKind === 'ACCOUNT' ? e.subject : '') || id;
-                    if (id && !caseNameSet.has(name)) {
-                        subjectMap.set(`ACCOUNT::${id}`, { id, name, kind: 'ACCOUNT' });
+                    if (e.accountSubjectId || (e.subjectKind === 'ACCOUNT' && e.subjectId)) {
+                        const id = e.accountSubjectId || e.subjectId;
+                        const name = e.accountSubject || (e.subjectKind === 'ACCOUNT' ? e.subject : '') || id;
+                        if (id && !caseNameSet.has(name)) {
+                            subjectMap.set(`ACCOUNT::${id}`, { id, name, kind: 'ACCOUNT' });
+                        }
                     }
-                }
-            });
+                });
+            }
             const subjectEntries = Array.from(subjectMap.values());
+            // 主体已由 GET timeline 的 subject_id/kind 过滤；此处仅在「全部」时再本地收窄
             const filtered = normalized.filter((e) => {
                 if (this.timelineSubject === 'all') return true;
+                // 查询接口已带 subject 条件时仍做一次兜底
                 const kind = this.timelineSubjectKind || 'all';
                 if (kind === 'PERSON') {
                     return e.personSubjectId === this.timelineSubject
@@ -4156,16 +4417,24 @@
                     titleH1,
                     Utils.create('span', {
                         class: 'ref-tl-node-badge',
-                        text: `${normalized.length} 个节点`
+                        text: matched < totalAll
+                            ? `${matched} / ${totalAll} 个节点`
+                            : `${totalAll} 个节点`
                     })
                 ]),
                 Utils.create('div', { class: 'sub', text: subCopy })
             ]));
             const headActions = Utils.create('div', { class: 'ref-tl-head-actions' });
             const rangeBtn = this._iconBtn('wb-btn wb-btn-outline', 'calendar', '时间范围');
-            rangeBtn.addEventListener('click', () => Toast.info('时间范围筛选即将接入'));
+            rangeBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this._openTimelineRangePopover(rangeBtn);
+            });
             const filterBtn = this._iconBtn('wb-btn wb-btn-outline', 'filter', '筛选');
-            filterBtn.addEventListener('click', () => Toast.info('高级筛选即将接入'));
+            filterBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this._openTimelineFilterPopover(filterBtn);
+            });
             const runBtn = this._iconBtn('wb-btn wb-btn-outline', 'waypoints', '重新整理');
             runBtn.addEventListener('click', () => this._runTimeline(runBtn));
             headActions.appendChild(rangeBtn);
@@ -4173,6 +4442,27 @@
             headActions.appendChild(runBtn);
             head.appendChild(headActions);
             page.appendChild(head);
+
+            const f = this.timelineFilters || this._defaultTimelineFilters();
+            const filterChips = [];
+            if (f.date_from || f.date_to) {
+                filterChips.push(`时间 ${f.date_from || '…'} ~ ${f.date_to || '…'}`);
+            }
+            if (f.include_uncertain === false) filterChips.push('已排除时间不明');
+            if ((f.event_types || []).length) filterChips.push(`类型 ${(f.event_types || []).join('/')}`);
+            if ((f.source_modes || []).length) filterChips.push(`来源 ${(f.source_modes || []).join('/')}`);
+            if (f.case_id) filterChips.push('已按案件筛选');
+            if (filterChips.length) {
+                const bar = Utils.create('div', { class: 'ref-tl-filter-bar' });
+                filterChips.forEach((t) => bar.appendChild(Utils.create('span', { class: 'ref-tl-filter-chip', text: t })));
+                const clear = this._iconBtn('wb-btn wb-btn-link', 'x', '清除筛选');
+                clear.addEventListener('click', () => {
+                    this.timelineFilters = this._defaultTimelineFilters();
+                    this._renderCurrentView();
+                });
+                bar.appendChild(clear);
+                page.appendChild(bar);
+            }
 
             page.appendChild(Utils.create('div', { class: 'ref-tl-alert' }, [
                 window.Icons
@@ -4182,7 +4472,7 @@
                         html: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>'
                     }),
                 Utils.create('span', {
-                    text: '材料明确记载与标注的系统推测分开展示；时间不明仅标「时间不确定」。虚线连接不代表事实上的连续行为。'
+                    text: '材料明确记载与标注的系统推测分开展示；时间不明仅标「时间不确定」。点「时间范围 / 筛选」可过滤，不重抽；「重新整理」才会重抽。虚线连接不代表事实上的连续行为。'
                 })
             ]));
 
@@ -4223,7 +4513,9 @@
             if (!filtered.length) {
                 body.appendChild(Utils.create('div', {
                     class: 'wb-empty',
-                    text: '暂无匹配节点'
+                    text: totalAll > 0
+                        ? '当前筛选条件下暂无节点，可调整时间范围或筛选条件。'
+                        : '暂无匹配节点'
                 }));
             } else {
                 const rail = Utils.create('div', { class: 'ref-tl-rail' });

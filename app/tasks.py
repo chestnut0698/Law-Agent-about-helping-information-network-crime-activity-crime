@@ -2448,6 +2448,14 @@ class TaskService:
         if task["status"] == "SCOPE_DRAFT":
             raise TaskError(TASK_ERROR_CODES["STATE_CONFLICT"], "计划尚未确认")
 
+        # 先按同一人名右扩规则修复已落库残缺脱敏跨度，再抽取
+        try:
+            from app.files import get_global_mapper
+
+            get_global_mapper(self.db_path).repair_truncated_person_spans(task_id=task_id)
+        except Exception:
+            pass
+
         result = extract_and_collide(task_id, task["cases"], db_path=self.db_path)
         existing = self.find_artifact(task_id, "ENTITY_CANDIDATE_SET", "entity-candidates")
         previous = {}
@@ -2531,19 +2539,23 @@ class TaskService:
         self,
         task_id: str,
         user_id: str | None = None,
+        *,
+        enrich: bool = True,
     ) -> dict[str, Any]:
         """先把转账/联络事件落成可核验产物，再可选做角色表述增强。"""
-        from tools.entities import (
-            EVENT_EXTRACTOR_VERSION,
-            apply_subject_resolve,
-            extract_task_events,
-            pick_timeline_subject_refs,
-            timeline_event_sort_key,
-        )
+        from tools.entities import EVENT_EXTRACTOR_VERSION, apply_subject_resolve, extract_task_events
+        from tools.timeline_subjects import pick_timeline_subject_refs, timeline_event_sort_key
 
         task = self.get_task(task_id)
         if task["status"] == "SCOPE_DRAFT":
             raise TaskError(TASK_ERROR_CODES["STATE_CONFLICT"], "计划尚未确认")
+
+        try:
+            from app.files import get_global_mapper
+
+            get_global_mapper(self.db_path).repair_truncated_person_spans(task_id=task_id)
+        except Exception:
+            pass
 
         result = extract_task_events(
             task_id,
@@ -2638,16 +2650,19 @@ class TaskService:
             "enriched_count": 0,
             "inferred_count": 0,
             "rejected_inferred": 0,
+            "skipped": not enrich,
         }
-        try:
-            from agents.timeline_enrich_agent import enrich_role_timeline_items
+        if enrich:
+            try:
+                from agents.timeline_enrich_agent import enrich_role_timeline_items
 
-            enrich_result = enrich_role_timeline_items(items, task_id=task_id)
-            if enrich_result.get("ok") and not enrich_result.get("fallback"):
-                items = enrich_result.get("items") or items
-                enrich_meta = enrich_result.get("enrich_meta") or enrich_meta
-        except Exception:
-            pass
+                enrich_result = enrich_role_timeline_items(items, task_id=task_id)
+                if enrich_result.get("ok") and not enrich_result.get("fallback"):
+                    items = enrich_result.get("items") or items
+                    enrich_meta = enrich_result.get("enrich_meta") or enrich_meta
+                    enrich_meta["skipped"] = False
+            except Exception:
+                pass
 
         items.sort(key=timeline_event_sort_key)
         artifact = self.write_artifact(
@@ -2685,6 +2700,68 @@ class TaskService:
             "artifact": artifact,
             "event_count": len(items),
             "task": self.get_task(task_id),
+        }
+
+    def query_role_timeline(
+        self,
+        task_id: str,
+        *,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        include_uncertain: bool = True,
+        event_type: str | None = None,
+        source_mode: str | None = None,
+        subject_kind: str | None = None,
+        subject_id: str | None = None,
+        case_id: str | None = None,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """读取已有 ROLE_TIMELINE 产物并按条件投影；不重抽。"""
+        from tools.timeline_subjects import (
+            build_timeline_facets,
+            filter_timeline_items,
+            parse_csv_set,
+            timeline_event_sort_key,
+        )
+
+        self.get_task(task_id)
+        art = self.find_artifact(task_id, "ROLE_TIMELINE", "role-timeline")
+        if not art:
+            raise TaskError(TASK_ERROR_CODES["ARTIFACT_NOT_FOUND"], "尚未生成角色时间线")
+        detail = self.get_artifact(task_id, art["id"])
+        payload = detail.get("payload") or {}
+        all_items = list(payload.get("items") or [])
+        facets = build_timeline_facets(all_items)
+        filtered = filter_timeline_items(
+            all_items,
+            date_from=date_from,
+            date_to=date_to,
+            include_uncertain=include_uncertain,
+            event_types=parse_csv_set(event_type),
+            source_modes=parse_csv_set(source_mode),
+            subject_kind=subject_kind,
+            subject_id=subject_id,
+            case_id=case_id,
+        )
+        filtered.sort(key=timeline_event_sort_key)
+        return {
+            "artifact_id": art["id"],
+            "summary": payload.get("summary") or {},
+            "facets": facets,
+            "filters": {
+                "date_from": date_from or "",
+                "date_to": date_to or "",
+                "include_uncertain": include_uncertain,
+                "event_type": event_type or "",
+                "source_mode": source_mode or "",
+                "subject_kind": subject_kind or "",
+                "subject_id": subject_id or "",
+                "case_id": case_id or "",
+            },
+            "total": len(all_items),
+            "matched": len(filtered),
+            "items": filtered,
+            "boundary": payload.get("boundary"),
         }
 
     def material_overview(self, task_id: str, user_id: str | None = None) -> dict[str, Any]:

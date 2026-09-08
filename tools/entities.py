@@ -28,6 +28,12 @@ from app.files import (
     _COMPOUND_SURNAMES,
 )
 
+from tools.timeline_subjects import (  # noqa: F401 — 兼容旧导入路径
+    classify_timeline_subject_kind,
+    pick_timeline_subject_refs,
+    timeline_event_sort_key,
+)
+
 EXTRACTOR_VERSION = "stage9-quote-v1"
 EVENT_EXTRACTOR_VERSION = "stage7-role-subject-v1"
 STRONG_TYPES = ("PHONE", "ACCOUNT", "DEVICE", "ID_CARD", "NAME", "ORGANIZATION", "MERCHANT", "IP")
@@ -636,6 +642,7 @@ _COMPOUND_SURNAME_SET = frozenset(_COMPOUND_SURNAMES)
 # 人名右侧停字（虚词/动词），避免「侯博元于/曾」被并入
 _PERSON_RIGHT_STOP = frozenset(
     "于在向对把将从与和及的了着过来说道讲问答称供辩述到案犯所部庭级记诉判书曾又再则即并或而由用拿借凭"
+    "等们其之号省市县区院所室年月日時分人员款币条项次籍贯族去来回进出做找给让"
 )
 # 「赵瑞/明知」「赵某陈述」类：法律常用词不可吞进姓名（多字优先匹配）
 _LEGAL_PERSON_RIGHT_TOKENS = (
@@ -701,7 +708,7 @@ def _clamp_person_span(source: str, start: int, end: int) -> tuple[int, int]:
 
 
 def _extend_person_span(source: str, start: int, end: int) -> tuple[int, int]:
-    """补全 spaCy 残缺人名：裸姓向右并入；两字名若左侧是姓且贴角色边界则向左并入一字。"""
+    """补全 spaCy 残缺人名：裸姓向右；两字名向左并姓或向右补一字名；避法律词/停用字。"""
     if start < 0 or end <= start or end > len(source):
         return start, end
     start, end = _clamp_person_span(source, start, end)
@@ -712,20 +719,22 @@ def _extend_person_span(source: str, start: int, end: int) -> tuple[int, int]:
     def _is_cjk(ch: str) -> bool:
         return "\u4e00" <= ch <= "\u9fff"
 
+    def _can_take_right(pos: int) -> bool:
+        if pos >= len(source) or not _is_cjk(source[pos]):
+            return False
+        ch = source[pos]
+        if ch in _BAD_PERSON_SUFFIX or ch in _PERSON_RIGHT_STOP or ch in _PERSON_INLINE_SEPS:
+            return False
+        if _legal_token_at(source, pos):
+            return False
+        return True
+
     bare_single = len(span) == 1 and span in _COMMON_SURNAMES
     bare_compound = len(span) == 2 and span in _COMPOUND_SURNAME_SET
     if bare_single or bare_compound:
         # 单姓最多 3 字、复姓最多 4 字；遇右侧停字/法律词立即停
         max_len = 4 if bare_compound else 3
-        while (
-            end < len(source)
-            and (end - start) < max_len
-            and _is_cjk(source[end])
-            and source[end] not in _BAD_PERSON_SUFFIX
-            and source[end] not in _PERSON_RIGHT_STOP
-            and source[end] not in _PERSON_INLINE_SEPS
-            and not _legal_token_at(source, end)
-        ):
+        while end < len(source) and (end - start) < max_len and _can_take_right(end):
             end += 1
         return _clamp_person_span(source, start, end)
 
@@ -738,6 +747,37 @@ def _extend_person_span(source: str, start: int, end: int) -> tuple[int, int]:
             )
             if boundary_ok and (end - (start - 1)) <= 4:
                 start -= 1
+                span = source[start:end]
+
+    # 姓+一字被切成两字时：右侧再吃一字名，但第三字之后须收界（标点/停用/法律词/非汉字），
+    # 避免「姓+单名+后续实词」被误扩；「某」作为第三字时允许（某某）。
+    if len(span) == 2 and span[0] in _COMMON_SURNAMES and end < len(source) and _can_take_right(end):
+        after = end + 1
+        third = source[end]
+        closed = (
+            after >= len(source)
+            or not _is_cjk(source[after])
+            or source[after] in _PERSON_RIGHT_STOP
+            or source[after] in _BAD_PERSON_SUFFIX
+            or source[after] in _PERSON_INLINE_SEPS
+            or _legal_token_at(source, after)
+        )
+        if (third == "某" or closed) and (end + 1 - start) <= 3:
+            end += 1
+    elif len(span) == 3 and span[:2] in _COMPOUND_SURNAME_SET and end < len(source) and _can_take_right(end):
+        after = end + 1
+        third = source[end]
+        closed = (
+            after >= len(source)
+            or not _is_cjk(source[after])
+            or source[after] in _PERSON_RIGHT_STOP
+            or source[after] in _BAD_PERSON_SUFFIX
+            or source[after] in _PERSON_INLINE_SEPS
+            or _legal_token_at(source, after)
+        )
+        if (third == "某" or closed) and (end + 1 - start) <= 4:
+            end += 1
+
     return _clamp_person_span(source, start, end)
 
 
@@ -1202,59 +1242,6 @@ def apply_subject_resolve(
             obj["subject_id"] = obj.get("subject_id") or f"auto:{obj['object_type']}:{key_val}"
         out.append(obj)
     return out
-
-
-_PERSON_SUBJECT_TYPES = frozenset({"NAME", "PERSON"})
-_ACCOUNT_SUBJECT_TYPES = frozenset({"ACCOUNT"})
-# 角色时间线默认主体：人物；辅视角：账户。案件/商户不当主体。
-_TIMELINE_SUBJECT_KINDS = frozenset({"PERSON", "ACCOUNT"})
-
-
-def classify_timeline_subject_kind(object_type: str | None) -> str | None:
-    """将 object_type 映射为时间线主体种类；案件等返回 None。"""
-    ot = (object_type or "").strip().upper()
-    if ot in _PERSON_SUBJECT_TYPES:
-        return "PERSON"
-    if ot in _ACCOUNT_SUBJECT_TYPES:
-        return "ACCOUNT"
-    return None
-
-
-def pick_timeline_subject_refs(parties: list[Any]) -> dict[str, Any]:
-    """从 parties 选出人物主主体与账户辅主体；绝不回退到案件名。"""
-    resolved = [p for p in (parties or []) if isinstance(p, dict)]
-    person = next(
-        (p for p in resolved if classify_timeline_subject_kind(p.get("object_type")) == "PERSON"),
-        None,
-    )
-    account = next(
-        (p for p in resolved if classify_timeline_subject_kind(p.get("object_type")) == "ACCOUNT"),
-        None,
-    )
-    objects = []
-    for p in resolved:
-        kind = classify_timeline_subject_kind(p.get("object_type"))
-        if kind in _TIMELINE_SUBJECT_KINDS:
-            continue
-        objects.append(
-            {
-                "object_type": p.get("object_type"),
-                "display_name": p.get("display_name") or p.get("surface") or "",
-                "subject_id": p.get("subject_id") or "",
-            }
-        )
-    return {
-        "person": person,
-        "account": account,
-        "objects": objects[:6],
-    }
-
-
-def timeline_event_sort_key(item: dict[str, Any]) -> tuple:
-    """真实时间优先；时间不明置底，不因推测插队。"""
-    ts = (item.get("event_time") or item.get("time") or "").strip()
-    uncertain = bool(item.get("time_uncertain")) or not ts or ts in {"时间不明", "未知"}
-    return (1 if uncertain else 0, ts or "\uffff", str(item.get("event_id") or ""))
 
 
 def extract_event_mentions(text: str) -> list[dict[str, Any]]:

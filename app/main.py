@@ -29,6 +29,19 @@ init_task_db()
 def material_error_response(exc: MaterialError) -> JSONResponse:
     return JSONResponse(status_code=400, content=exc.to_dict())
 
+@app.post("/api/mappings/repair-person-spans")
+async def repair_person_spans(
+    payload: dict | None = None,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    """按通用右扩规则修复已落库残缺人名脱敏跨度（不特化具体人名）。"""
+    body = payload or {}
+    task_id = body.get("task_id")
+    mapper = get_global_mapper()
+    result = mapper.repair_truncated_person_spans(task_id=task_id)
+    return {"ok": True, **result}
+
+
 @app.post("/api/mappings/batch")
 async def batch_update_mappings(payload: dict):
     """
@@ -515,10 +528,51 @@ async def task_generate_clues(
 @app.post("/api/tasks/{task_id}/timeline/run")
 async def task_run_role_timeline(
     task_id: str,
+    request: Request,
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
+    enrich = True
     try:
-        return get_task_service().run_role_timeline(task_id, user_id=x_user_id)
+        body = await request.json()
+        if isinstance(body, dict) and "enrich" in body:
+            enrich = bool(body.get("enrich"))
+    except Exception:
+        pass
+    try:
+        return get_task_service().run_role_timeline(
+            task_id, user_id=x_user_id, enrich=enrich
+        )
+    except TaskError as exc:
+        return task_error_response(exc)
+
+
+@app.get("/api/tasks/{task_id}/timeline")
+async def task_query_role_timeline(
+    task_id: str,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    include_uncertain: int = 1,
+    event_type: Optional[str] = None,
+    source_mode: Optional[str] = None,
+    subject_kind: Optional[str] = None,
+    subject_id: Optional[str] = None,
+    case_id: Optional[str] = None,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    """查询已有角色时间线产物并过滤；不重抽。"""
+    try:
+        return get_task_service().query_role_timeline(
+            task_id,
+            date_from=date_from,
+            date_to=date_to,
+            include_uncertain=bool(include_uncertain),
+            event_type=event_type,
+            source_mode=source_mode,
+            subject_kind=subject_kind,
+            subject_id=subject_id,
+            case_id=case_id,
+            user_id=x_user_id,
+        )
     except TaskError as exc:
         return task_error_response(exc)
 

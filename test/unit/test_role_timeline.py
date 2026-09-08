@@ -1,7 +1,7 @@
 """角色时间线：主体类型、source_mode、增强契约。"""
 
 from agents.timeline_enrich_agent import apply_timeline_enrichment
-from tools.entities import (
+from tools.timeline_subjects import (
     classify_timeline_subject_kind,
     pick_timeline_subject_refs,
     timeline_event_sort_key,

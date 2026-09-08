@@ -1,9 +1,20 @@
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+# 本地缺重依赖时仍可收集/跑纯函数单测
+if "prikit" not in sys.modules:
+    _prikit = MagicMock()
+    _prikit.PDFAnonymizer = MagicMock
+    sys.modules["prikit"] = _prikit
+if "presidio_analyzer" not in sys.modules:
+    _presidio = MagicMock()
+    sys.modules["presidio_analyzer"] = _presidio
+    sys.modules["presidio_analyzer.nlp_engine"] = MagicMock()
 
 
 # ---------- 测试样例文件构造 ----------
