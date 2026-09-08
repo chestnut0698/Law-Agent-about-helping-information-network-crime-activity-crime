@@ -3044,14 +3044,13 @@ class MaterialService:
 
             quote_ok = None
             reanchored = False
+            from tools.entities import (
+                quote_hash as compute_quote_hash,
+                reanchor_citation,
+                verify_quote_hash,
+                _review_display_value,
+            )
             if quote or quote_hash:
-                from tools.entities import (
-                    quote_hash as compute_quote_hash,
-                    reanchor_citation,
-                    verify_quote_hash,
-                    _review_display_value,
-                )
-
                 if not quote or not quote_hash:
                     # 缺 hash 但有锚点时尝试重切；否则判失效
                     recovered = reanchor_citation(
