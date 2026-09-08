@@ -9,4 +9,5 @@ data/workspace/
 data/conversations/*.json
 !data/conversations/.gitkeep
 .cursor/
+.claude/
 notes/

@@ -7,6 +7,7 @@ import pytest
 from app.entity_review_schema import bank_account_example
 from app.tasks import TaskService
 from tools.entity_review import (
+    build_candidate_field_table,
     compare_candidate_fields,
     get_entity_candidate_context,
     list_candidate_relations,
@@ -91,3 +92,25 @@ def test_validate_candidate_evidence_rejects_missing(task_with_candidates):
     )
     assert data["ok"] is False
     assert data["verified"] is False
+
+
+def test_field_table_failure_marks_once_and_caches(task_with_candidates, monkeypatch):
+    """生成失败也要落一次尝试标记，避免同一候选每次打开页面都重新触发模型。"""
+    import app.config as config
+
+    monkeypatch.setattr(config, "DEEPSEEK_EXTERNAL_CALLS_ENABLED", False)
+    monkeypatch.setattr(config, "API_KEY", None)
+
+    task_id, cid, service = task_with_candidates
+
+    first = json.loads(build_candidate_field_table(task_id, cid))
+    assert first["ok"] is False and first["fallback"] is True
+
+    art = service.find_artifact(task_id, "ENTITY_CANDIDATE_SET", "entity-candidates")
+    detail = service.get_artifact(task_id, art["id"])
+    cand = next(c for c in detail["payload"]["candidates"] if c["candidate_id"] == cid)
+    assert cand["field_table_meta"]["producer"] == "RULE_FALLBACK"
+
+    # 已标记过：再次调用直接命中缓存，不再尝试
+    second = json.loads(build_candidate_field_table(task_id, cid))
+    assert second["ok"] is True and second.get("cached") is True

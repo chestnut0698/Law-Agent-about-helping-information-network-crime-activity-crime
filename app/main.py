@@ -448,9 +448,13 @@ async def build_candidate_field_table_api(
     from tools.entity_review import build_candidate_field_table
 
     body = payload or {}
+    # 模型调用是同步阻塞的，丢进线程池避免堵死事件循环
     result = _json.loads(
-        build_candidate_field_table(
-            task_id, candidate_id, force=bool(body.get("force"))
+        await asyncio.to_thread(
+            build_candidate_field_table,
+            task_id,
+            candidate_id,
+            force=bool(body.get("force")),
         )
     )
     if not result.get("ok"):
@@ -469,7 +473,12 @@ async def run_entity_review_agent_api(
         from agents.entity_review_agent import run_entity_review_for_task
 
         body = payload or {}
-        return run_entity_review_for_task(task_id, candidate_id=body.get("candidate_id"))
+        # 内部逐候选同步调用模型，丢进线程池避免堵死事件循环
+        return await asyncio.to_thread(
+            run_entity_review_for_task,
+            task_id,
+            candidate_id=body.get("candidate_id"),
+        )
     except Exception as exc:
         return JSONResponse(
             status_code=400,
@@ -630,7 +639,9 @@ async def refresh_task_materials(
 async def get_task_artifact(task_id: str, artifact_id: str, version: Optional[int] = None):
     """任务目录与智能体消息链接共用此入口，保证解析到同一产物对象。"""
     try:
-        return get_task_service().get_artifact(task_id, artifact_id, version=version)
+        service = get_task_service()
+        # 实体候选产物 hydrate 较大（数百 ms），丢线程池避免堵死事件循环
+        return await asyncio.to_thread(service.get_artifact, task_id, artifact_id, version)
     except TaskError as exc:
         return task_error_response(exc)
 

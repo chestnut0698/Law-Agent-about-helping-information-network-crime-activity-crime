@@ -3354,6 +3354,12 @@
         async _ensureEntitySet() {
             const art = (this.task.artifacts || []).find((a) => a.type === 'ENTITY_CANDIDATE_SET');
             if (!art) return null;
+            const cached = this.artifactCache[art.id];
+            // 同一产物版本已加载过：点候选/切筛选只做本地重渲染，不再整包重拉
+            //（产物版本由写操作推进：决策/碰撞/字段表都会置新版本并刷新，从而失效这里）
+            if (cached && Number(cached.version) === Number(art.current_version)) {
+                return cached;
+            }
             delete this.artifactCache[art.id];
             let data = await this._fetchArtifact(art.id);
             const ver = (((data || {}).payload || {}).summary || {}).extractor_version || '';

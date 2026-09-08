@@ -790,6 +790,40 @@ def _accept_table_value(field_key: str, label: str, value: str) -> bool:
     return 11 <= len(digits) <= 19
 
 
+def _field_table_fallback(
+    task_id: str,
+    candidate: dict[str, Any] | None,
+    *,
+    error: str,
+    user_id: str | None = None,
+) -> str:
+    """字段表未生成时返回 fallback，并把本次失败落成一次尝试标记。
+
+    仅当候选此前从未生成过（无 producer）才落标记：此后重新打开页面不会再
+    自动触发模型，需要重试时由检察官点「重建字段表」（force）覆盖。
+    """
+    meta = (candidate or {}).get("field_table_meta") or {}
+    if candidate and not meta.get("producer"):
+        try:
+            get_task_service().persist_candidate_field_table(
+                task_id,
+                str(candidate.get("candidate_id") or ""),
+                field_compare=candidate.get("field_compare") or [],
+                field_table_meta={
+                    "producer": "RULE_FALLBACK",
+                    "table_title": meta.get("table_title") or "字段对照与差异说明",
+                    "partial": True,
+                    "error": str(error)[:160],
+                },
+                field_compare_columns=candidate.get("field_compare_columns"),
+                clear_field_compare_columns=False,
+                user_id=user_id or "system",
+            )
+        except Exception:
+            pass
+    return _tool_json({"ok": False, "error": error, "fallback": True})
+
+
 def build_candidate_field_table(
     task_id: str,
     candidate_id: str,
@@ -814,7 +848,8 @@ def build_candidate_field_table(
         return _tool_json({"ok": False, "error": "候选不存在"})
 
     meta = cand.get("field_table_meta") or {}
-    if not force and meta.get("producer") == FIELD_TABLE_PRODUCER:
+    # 有任何 producer（含 RULE_FALLBACK 失败标记）即视为已尝试过，不再自动触发模型
+    if not force and meta.get("producer"):
         return _tool_json(
             {
                 "ok": True,
@@ -826,22 +861,20 @@ def build_candidate_field_table(
         )
 
     if not DEEPSEEK_EXTERNAL_CALLS_ENABLED:
-        return _tool_json(
-            {
-                "ok": False,
-                "error": "材料外呼开关已关闭（DEEPSEEK_EXTERNAL_CALLS_ENABLED），当前使用规则字段表",
-                "fallback": True,
-            }
+        return _field_table_fallback(
+            task_id,
+            cand,
+            error="材料外呼开关已关闭（DEEPSEEK_EXTERNAL_CALLS_ENABLED），当前使用规则字段表",
         )
     if not API_KEY:
-        return _tool_json(
-            {"ok": False, "error": "未配置模型密钥，当前使用规则字段表", "fallback": True}
+        return _field_table_fallback(
+            task_id, cand, error="未配置模型密钥，当前使用规则字段表"
         )
 
     materials, chunk_by_id = _candidate_materials(cand)
     if not materials:
-        return _tool_json(
-            {"ok": False, "error": "未取到可读材料摘录，无法生成字段表", "fallback": True}
+        return _field_table_fallback(
+            task_id, cand, error="未取到可读材料摘录，无法生成字段表"
         )
 
     cases = _candidate_cases(cand)
@@ -1034,12 +1067,10 @@ def build_candidate_field_table(
             raw = re.sub(r"^```(?:json)?\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw)
         if not raw:
-            return _tool_json(
-                {
-                    "ok": False,
-                    "error": f"模型未返回内容（finish_reason={choice.finish_reason}）",
-                    "fallback": True,
-                }
+            return _field_table_fallback(
+                task_id,
+                cand,
+                error=f"模型未返回内容（finish_reason={choice.finish_reason}）",
             )
         parsed = json.loads(raw)
         # 模型偶尔整表交白卷（只给表头不填值），补一次带催填提示的重试
@@ -1118,8 +1149,8 @@ def build_candidate_field_table(
                 )
             except Exception:
                 pass
-        return _tool_json(
-            {"ok": False, "error": f"DeepSeek 生成字段表失败：{exc}", "fallback": True}
+        return _field_table_fallback(
+            task_id, cand, error=f"DeepSeek 生成字段表失败：{exc}"
         )
 
     rows_in = parsed.get("rows") if isinstance(parsed, dict) else parsed
@@ -1355,16 +1386,14 @@ def build_candidate_field_table(
     if not any(
         cell.get("value") for row in field_compare for cell in row.get("per_case") or []
     ):
-        return _tool_json(
-            {
-                "ok": False,
-                "error": (
-                    f"模型给出 {proposed} 个字段值，均无法在材料中逐字命中，已全部丢弃"
-                    if proposed
-                    else "模型未从材料中摘出任何字段值"
-                ),
-                "fallback": True,
-            }
+        return _field_table_fallback(
+            task_id,
+            cand,
+            error=(
+                f"模型给出 {proposed} 个字段值，均无法在材料中逐字命中，已全部丢弃"
+                if proposed
+                else "模型未从材料中摘出任何字段值"
+            ),
         )
 
     supporting: list[str] = []
