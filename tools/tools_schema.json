@@ -567,5 +567,38 @@
         "required": ["candidate_id", "suggestion"]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "read_report",
+      "description": "撰写或更新《跨案关联线索核验单》前先调用本工具：返回任务范围、实体复核结论（视为同一/保留独立/待核统计）、存活线索清单（标题/核验方面/处置/依据条数）、既有报告草稿（版本与正文）以及写作规范。若返回的 blocked 不为空，表示当前还不能撰写报告，请先按提示让用户在中间工作区完成实体确认或整理线索。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "write_report",
+      "description": "把你撰写完成的《跨案关联线索核验单》整篇正文提交保存。body 是完整正文 markdown（不含标题、固定边界声明与文末「系统自动核对清单」，这些由系统自动生成）；建议 800～1600 字；只依据 read_report 返回的素材写作，禁止编造页码/原文引文/统计，禁止定罪、并案、主从犯或量刑等法律结论，禁止内部编号、长 ID、英文/工具名/接口路径/占位符称谓。报告为单份持续迭代：重复提交会生成新版本。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "body": {
+            "type": "string",
+            "description": "你撰写的整篇正文 markdown，不含边界声明与系统核对清单"
+          },
+          "note": {
+            "type": "string",
+            "description": "可选：本次撰写/迭代说明，面向检察官的一句话，如『按用户要求补充甲案资金去向段的解释』"
+          }
+        },
+        "required": ["body"]
+      }
+    }
   }
 ]

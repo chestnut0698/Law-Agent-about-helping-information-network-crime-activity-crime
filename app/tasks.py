@@ -34,6 +34,16 @@ from app.files import (
 )
 from tools.entities import init_entity_db
 
+# 报告正文是面向检察官的可读文档：禁止混入内部工程代号 / chunk / 引用 hash / 长 ID。
+_ENGINEERING_TOKEN_RE = re.compile(
+    r"[0-9a-f]{16,}|document_version_id|quote_hash|chunk_[A-Za-z0-9_\-]{6,}"
+)
+
+
+def _report_engineering_tokens(text: str) -> bool:
+    return bool(_ENGINEERING_TOKEN_RE.search(text or ""))
+
+
 # ---------- 状态与错误码 ----------
 
 TASK_STATUSES = {
@@ -1392,112 +1402,251 @@ class TaskService:
             },
         )
 
-    def build_report_draft(self, task_id: str) -> dict[str, Any]:
-        """汇总范围、实体、线索为跨案关联线索核验单草稿。"""
-        task = self.get_task(task_id)
-        scope = None
-        entity = None
-        clues: list[dict[str, Any]] = []
-        for art in task.get("artifacts") or []:
-            if art["type"] == "TASK_SCOPE":
-                scope = self.get_artifact(task_id, art["id"])
-            elif art["type"] == "ENTITY_CANDIDATE_SET" and art["status"] not in {"STALE", "INVALID"}:
-                entity = self.get_artifact(task_id, art["id"])
-            elif art["type"] == "CLUE_ITEM" and art["status"] not in {"STALE", "INVALID"}:
-                clues.append(self.get_artifact(task_id, art["id"]))
+    # ----- 报告：模型读素材 → 写整篇正文 → 单份迭代 -----
 
+    @staticmethod
+    def _report_aspect_label(aspect: Any) -> str:
+        return {
+            "ID": "标识",
+            "FUND": "资金",
+            "TIME": "时空",
+            "ROLE": "角色",
+            "QUAL": "材料质量",
+            "PLAT": "平台",
+        }.get(str(aspect or "").upper(), "")
+
+    @staticmethod
+    def _report_disposition_label(disp: Any) -> str:
+        return {
+            "PENDING": "待确认",
+            "CONTINUE": "继续核查",
+            "CONFIRMED": "已确认关联",
+            "NEED_MATERIAL": "待补材料",
+            "EXCLUDE": "已排除",
+            "DEFER": "暂缓",
+        }.get(str(disp or "").upper(), str(disp or "PENDING"))
+
+    @staticmethod
+    def _report_entity_pending(entity_payload: dict[str, Any]) -> int:
+        """待核实体数：优先产物 summary.pending，缺失时按 decision 兜底。"""
+        summary = entity_payload.get("summary") or {}
+        pending = summary.get("pending")
+        if isinstance(pending, int) and pending >= 0:
+            return pending
+        return sum(
+            1
+            for c in (entity_payload.get("candidates") or [])
+            if (c.get("decision") or "PENDING") == "PENDING"
+        )
+
+    def _report_state_blocked(self, state: dict[str, Any]) -> str | None:
+        """严格门禁：实体复核未完成或尚无存活线索时，返回阻止报告写作的原因。"""
+        if state["entity_payload"] and self._report_entity_pending(state["entity_payload"]) > 0:
+            return (
+                "跨案对象仍有待人工确认。请先在中间工作区完成「视为同一 / 保留独立」"
+                "确认，确认完成后再撰写报告。"
+            )
+        if not state["clues"]:
+            return "当前尚无待核线索。请先在右侧对话中整理出疑似关联线索、写入线索中心，再撰写报告。"
+        return None
+
+    def _report_state(self, task_id: str) -> dict[str, Any]:
+        """只读快照：可入报告的范围/实体/存活线索（原始 payload，不触发回链修复写库）。"""
+        task = self.get_task(task_id)
+        scope = self.find_artifact(task_id, "TASK_SCOPE", "scope")
+        scope_payload = (
+            self._read_artifact_payload_raw(task_id, scope["id"])[1] or {}
+            if scope
+            else {}
+        )
+        entity = self.find_artifact(task_id, "ENTITY_CANDIDATE_SET", "entity-candidates")
+        entity_payload = {}
+        if entity and entity.get("status") not in {"STALE", "INVALID"}:
+            entity_payload = self._read_artifact_payload_raw(task_id, entity["id"])[1] or {}
+        return {
+            "task": task,
+            "scope_id": scope["id"] if scope else None,
+            "scope_payload": scope_payload,
+            "entity_id": entity["id"] if entity_payload else None,
+            "entity_payload": entity_payload,
+            "clues": self._active_clue_items(task_id),  # [(artifact, payload)]
+        }
+
+    def _report_entity_stats(self, entity_payload: dict[str, Any]) -> dict[str, Any]:
+        candidates = entity_payload.get("candidates") or []
+        counts: dict[str, int] = {}
+        for cand in candidates:
+            key = str(cand.get("decision") or "PENDING")
+            counts[key] = counts.get(key, 0) + 1
+        return {
+            "total": len(candidates),
+            "merge": counts.get("MERGE", 0),
+            "keep_separate": counts.get("KEEP_SEPARATE", 0),
+            "correct": counts.get("CORRECT", 0),
+            "defer": counts.get("DEFER", 0),
+            "pending": self._report_entity_pending(entity_payload),
+        }
+
+    def report_write_context(self, task_id: str) -> dict[str, Any]:
+        """报告读工具：把任务范围、实体复核结论、存活线索与既有草稿压缩给模型写作用。"""
+        from agents.prompts.report_writing import REPORT_WRITING_CONTRACT
+
+        state = self._report_state(task_id)
+        task = state["task"]
+        scope_payload = state["scope_payload"] or {}
+
+        clues: list[dict[str, Any]] = []
+        for idx, (_art, payload) in enumerate(state["clues"], start=1):
+            evidence = payload.get("evidence") or []
+            case_names = {
+                str(ev.get("case_name") or "").strip()
+                for ev in evidence
+                if str(ev.get("case_name") or "").strip()
+            }
+            clues.append(
+                {
+                    "idx": idx,
+                    "title": payload.get("title") or "",
+                    "aspect": self._report_aspect_label(payload.get("aspect")) or "未标注",
+                    "disposition": self._report_disposition_label(payload.get("disposition")),
+                    "evidence_count": len(evidence),
+                    "case_count": len(case_names),
+                }
+            )
+
+        draft: dict[str, Any] = {"exists": False}
+        report = self.find_artifact(task_id, "REPORT_DRAFT", "report-draft")
+        if report:
+            art, payload = self._read_artifact_payload_raw(task_id, report["id"])
+            draft = {
+                "exists": True,
+                "version": int(art["current_version"]),
+                "valid": bool((payload or {}).get("valid")),
+                "note": (payload or {}).get("note") or "",
+                "body": (payload or {}).get("body") or "",
+                "updated_at": art.get("updated_at"),
+            }
+
+        return {
+            "ok": True,
+            "title": task.get("title"),
+            "purpose": task.get("purpose") or scope_payload.get("purpose") or "",
+            "authorized_until": task.get("authorized_until")
+            or scope_payload.get("authorized_until")
+            or "",
+            "cases": [
+                str(c.get("display_name") or c.get("name") or c.get("case_id") or "").strip()
+                for c in (task.get("cases") or [])
+                if c
+            ],
+            "entity": self._report_entity_stats(state["entity_payload"]),
+            "clues": clues,
+            "blocked": self._report_state_blocked(state) or None,
+            "draft": draft,
+            "contract": REPORT_WRITING_CONTRACT,
+        }
+
+    def write_report_draft(
+        self, task_id: str, body: str, note: str = "", user_id: str | None = None
+    ) -> dict[str, Any]:
+        """写报告：严格门禁 → 收口校验 → 固定边界 + 模型整篇正文 + 系统自动核对清单；单份迭代。"""
+        from agents.prompts.report_writing import REPORT_BODY_MIN_CHARS
+
+        state = self._report_state(task_id)
+        blocked = self._report_state_blocked(state)
+        if blocked:
+            raise TaskError(TASK_ERROR_CODES["STATE_CONFLICT"], blocked)
+
+        text = (body or "").strip()
+        if len(text) < REPORT_BODY_MIN_CHARS:
+            raise TaskError(
+                TASK_ERROR_CODES["INVALID_SCOPE"],
+                f"正文过短（约 {len(text)} 字），不足以构成核验单，请补充后重新提交整篇正文",
+            )
+        if _report_engineering_tokens(text):
+            raise TaskError(
+                TASK_ERROR_CODES["INVALID_SCOPE"],
+                "正文疑似含内部工程代号 / 长 ID，请改用办案可读称谓（案件名、脱敏标签）后重写",
+            )
+
+        task = state["task"]
+        scope_payload = state["scope_payload"] or {}
+        alive = state["clues"]
+        invalid_refs = sum(
+            1 for _art, payload in alive if not (payload.get("evidence") or [])
+        )
         boundary = (
             "本文件仅汇集跨案关联候选、待核验事项及材料原文依据，"
             "不构成对犯罪事实、人员责任、证据能力、证明力或证明标准的认定。"
         )
-        invalid_refs = 0
+
         clue_lines: list[str] = []
-        for item in clues:
-            payload = item.get("payload") or {}
+        for idx, (_art, payload) in enumerate(alive, start=1):
             evidence = payload.get("evidence") or []
-            if not evidence:
-                invalid_refs += 1
-            aspect = str(payload.get("aspect") or "").upper()
-            aspect_zh = {
-                "ID": "标识",
-                "FUND": "资金",
-                "TIME": "时空",
-                "ROLE": "角色",
-                "QUAL": "材料质量",
-                "PLAT": "平台",
-            }.get(aspect, "")
-            tag = f"[{aspect_zh}] " if aspect_zh else ""
             clue_lines.append(
-                f"- {tag}{payload.get('title') or item['artifact']['title']} "
-                f"（处置：{payload.get('disposition') or 'PENDING'}；"
+                f"- {idx}) {payload.get('title') or '未命名待核事项'} "
+                f"（{self._report_aspect_label(payload.get('aspect')) or '未标注'} · "
+                f"处置 {self._report_disposition_label(payload.get('disposition'))} · "
                 f"支持材料 {len(evidence)} 处）"
             )
 
-        path_lines = self._compose_path_synthesis(clues)
-
-        entity_payload = (entity or {}).get("payload") or {}
-        candidates = entity_payload.get("candidates") or []
-        confirmed = sum(1 for c in candidates if c.get("decision") == "MERGE")
-        separated = sum(1 for c in candidates if c.get("decision") == "KEEP_SEPARATE")
-        pending = sum(1 for c in candidates if c.get("decision", "PENDING") == "PENDING")
-
-        scope_payload = (scope or {}).get("payload") or {}
+        entity_stats = self._report_entity_stats(state["entity_payload"])
+        path_lines = self._compose_path_synthesis([{"payload": p} for _art, p in alive])
         case_names = "、".join(
-            c.get("display_name") or c.get("name") or ""
+            str(c.get("display_name") or c.get("name") or "")
             for c in (scope_payload.get("cases") or task.get("cases") or [])
         ) or "—"
+        report = self.find_artifact(task_id, "REPORT_DRAFT", "report-draft")
+        next_version = int(report["current_version"]) + 1 if report else 1
 
         markdown = "\n".join(
             [
                 "# 跨案关联线索核验单",
                 "",
                 f"**任务**：{task.get('title') or '—'}",
-                f"**生成时间**：{utc_now()}",
+                f"**版本 v{next_version}** · **生成/更新时间**：{utc_now()}",
                 "",
                 "## 边界声明",
                 boundary,
                 "",
-                "## 1. 分析范围概览",
+                "## 正文",
+                "",
+                text,
+                "",
+                "## 系统自动核对清单（依据当前已确认产物，写作时刻快照，系统生成）",
                 f"- 监督目的：{task.get('purpose') or scope_payload.get('purpose') or '—'}",
                 f"- 授权有效期：{task.get('authorized_until') or scope_payload.get('authorized_until') or '—'}",
                 f"- 案件范围：{case_names}",
+                f"- 实体：候选 {entity_stats['total']} · 视为同一 {entity_stats['merge']} · "
+                f"保留独立 {entity_stats['keep_separate']} · 待核 {entity_stats['pending']}",
                 "",
-                "## 2. 实体处理摘要",
-                f"- 候选总数：{len(candidates)}",
-                f"- 视为同一：{confirmed} · 不是同一：{separated} · 待核：{pending}",
+                *(clue_lines or ["- 暂无待核线索。"]),
                 "",
-                "## 3. 待核验线索清单",
-                *(clue_lines or ["- （暂无线索）"]),
+                "### 材料路径合成（由多张处置为「继续核查」的线索排列，非法律结论）",
+                *(path_lines or ["- 尚无两条以上可合成路径的已确认线索。"]),
                 "",
-                "## 4. 材料路径合成（由多张已确认线索排列，非法律结论）",
-                *(
-                    path_lines
-                    or [
-                        "- （尚无足够「继续核查」处置的线索可合成路径；请先在线索中心确认后再生成）"
-                    ]
-                ),
-                "",
-                "## 5. 有效性",
+                "### 有效性",
                 (
-                    "- 存在缺少原文依据的线索，正式导出前需补证或排除。"
+                    "- 部分线索缺少原文依据，正式导出前需补证或排除。"
                     if invalid_refs
-                    else "- 当前纳入线索均可回链，可导出。"
+                    else "- 纳入线索均可回链原文；正文由智能体撰写，以当前版本为准。"
                 ),
                 "",
             ]
         )
-        valid = invalid_refs == 0 and len(clues) > 0
-        parent_ids = []
-        if scope:
-            parent_ids.append(scope["artifact"]["id"])
-        if entity:
-            parent_ids.append(entity["artifact"]["id"])
-        parent_ids.extend(c["artifact"]["id"] for c in clues)
+
+        valid = invalid_refs == 0 and bool(alive)
+        parent_ids: list[str] = []
+        if state["scope_id"]:
+            parent_ids.append(state["scope_id"])
+        if state["entity_id"]:
+            parent_ids.append(state["entity_id"])
+        parent_ids.extend(a["id"] for a, _p in alive)
 
         artifact = self.write_artifact(
             task_id=task_id,
             type="REPORT_DRAFT",
-            title="跨案关联线索核验单（草稿）",
+            title="跨案关联线索核验单",
             ref_key="report-draft",
             status="VALID" if valid else "PENDING_REVIEW",
             parent_ids=parent_ids,
@@ -1505,9 +1654,11 @@ class TaskService:
                 "title": "跨案关联线索核验单",
                 "markdown": markdown,
                 "text": markdown,
+                "body": text,
+                "note": (note or "").strip(),
                 "valid": valid,
                 "invalid_refs": invalid_refs,
-                "clue_count": len(clues),
+                "clue_count": len(alive),
                 "boundary": boundary,
                 "generated_at": utc_now(),
             },
@@ -1515,15 +1666,26 @@ class TaskService:
         self.append_source_verify(
             task_id,
             {
-                "action": "生成报告草稿",
-                "type": "report_draft",
+                "action": "报告撰写",
+                "type": "report_ai_write",
+                "actor": "智能体",
                 "target": artifact["id"],
-                "summary": f"线索 {len(clues)} 条 · {'有效' if valid else '含待补证'}",
+                "summary": (
+                    f"v{next_version} · 线索 {len(alive)} 条 · "
+                    f"{'有效' if valid else '含待补原文依据'}"
+                ),
                 "result": "ok" if valid else "warn",
                 "at": utc_now(),
             },
         )
-        return {"artifact": artifact, "task": self.get_task(task_id), "valid": valid}
+        return {
+            "artifact": artifact,
+            "task": self.get_task(task_id),
+            "valid": valid,
+            "clue_count": len(alive),
+            "invalid_refs": invalid_refs,
+            "version": next_version,
+        }
 
     # ----- 产物 -----
 

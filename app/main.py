@@ -502,10 +502,14 @@ async def dispose_task_clue(task_id: str, artifact_id: str, payload: dict):
 
 @app.post("/api/tasks/{task_id}/report/draft")
 async def task_report_draft(task_id: str):
-    try:
-        return get_task_service().build_report_draft(task_id)
-    except TaskError as exc:
-        return task_error_response(exc)
+    """已下线：报告改由右侧智能体经读写工具撰写。保留路由以免旧前端 404。"""
+    return JSONResponse(
+        status_code=410,
+        content={
+            "error_code": "REPORT_DRAFT_GONE",
+            "message": "报告已改为由右侧助手撰写：请在「报告与审计」页点「新建报告」，助手会读取素材后起草并持续迭代。",
+        },
+    )
 
 
 @app.post("/api/tasks/{task_id}/collision/run")

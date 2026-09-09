@@ -4925,12 +4925,12 @@
                 a.type === 'REPORT_DRAFT' || a.type === 'REPORT_EXPORT'
             );
             const draftBtn = this._iconBtn('wb-btn wb-btn-primary', 'plus', '新建报告');
-            draftBtn.addEventListener('click', () => this._generateReportDraft(draftBtn));
+            draftBtn.addEventListener('click', () => this._askAssistantToWriteReport(draftBtn));
             root.appendChild(this._pageHead(
                 '报告与审计',
-                '生成可追溯的跨案关联线索核验单，并查看核验留痕。',
+                '由右侧智能体起草可追溯的跨案关联线索核验单（单份持续迭代），并查看核验留痕。',
                 draftBtn,
-                `${reportArts.length} 份报告`
+                reportArts.length ? '单份核验单 · 可反复迭代' : '尚未撰写'
             ));
 
             const grid = Utils.create('div', { class: 'wb-report-grid' });
@@ -4940,16 +4940,18 @@
                 Utils.create('div', { class: 'wb-entity-title', text: '报告列表' })
             ]));
             const reportBody = Utils.create('div', { class: 'wb-panel-card-body' });
+            let validReportCount = 0;
             if (!reportArts.length) {
                 reportBody.appendChild(Utils.create('div', {
                     class: 'wb-file-meta',
-                    text: '尚未生成报告。完成实体/线索核验后可生成「跨案关联线索核验单」。'
+                    text: '尚未撰写报告。完成实体复核与线索整理后，点右上「新建报告」，由右侧智能体起草；报告为单份，可反复迭代。'
                 }));
             } else {
                 for (const art of reportArts) {
                     const data = await this._fetchArtifact(art.id);
                     const p = (data && data.payload) || {};
                     const valid = p.valid !== false;
+                    if (p.valid === true) validReportCount += 1;
                     const row = Utils.create('div', {
                         style: 'display:flex;justify-content:space-between;gap:12px;align-items:center;padding:12px 0;border-bottom:1px solid var(--border-color)'
                     }, [
@@ -4958,7 +4960,7 @@
                                 style: 'display:flex;align-items:center;gap:8px;flex-wrap:wrap'
                             }, [
                                 Utils.create('div', { class: 'wb-list-item-title', text: art.title || '核验单' }),
-                                this._statusTag(valid ? '有效版本' : '存在失效引用', valid ? 'ok' : 'danger')
+                                this._statusTag(valid ? '有效版本' : '含待补原文依据', valid ? 'ok' : 'danger')
                             ]),
                             Utils.create('div', {
                                 class: 'wb-file-meta',
@@ -4990,8 +4992,8 @@
                 window.Icons ? Icons.el('shieldCheck') : null,
                 Utils.create('span', {
                     text: eventCount
-                        ? `审计链路完整：已记录 ${eventCount} 条操作，有效报告 ${reportArts.length} 份。`
-                        : '完成实体决策、线索处置或打开原文后，审计链路将自动补齐。'
+                        ? `审计链路：已记录 ${eventCount} 条操作${validReportCount ? `；有效报告 ${validReportCount} 份` : ''}。`
+                        : '完成实体决策、线索处置后会自动留痕；报告每撰写或迭代一版也会留痕。'
                 })
             ].filter(Boolean)));
             sumBody.appendChild(Utils.create('div', {
@@ -5048,24 +5050,31 @@
             root.appendChild(auditCard);
         },
 
-        async _generateReportDraft(button) {
+        async _askAssistantToWriteReport(button) {
             if (!this.task) return;
             if (button) {
                 button.disabled = true;
-                button.textContent = '生成中…';
+                button.textContent = '撰写中…';
             }
+            const hasDraft = (this.task.artifacts || []).some((a) =>
+                a.type === 'REPORT_DRAFT' || a.type === 'REPORT_EXPORT'
+            );
+            const prompt = [
+                `请为当前监督分析任务${hasDraft ? '更新' : '撰写'}《跨案关联线索核验单》：`,
+                '先读取任务范围、实体复核结论、已形成线索与既有草稿；',
+                '若实体复核尚未完成或尚无待核线索，请先请用户到中间工作区完成确认或整理线索后再出报告；',
+                '随后撰写整篇正文并保存到报告中心（报告为单份，可反复迭代）。',
+                '禁止定罪、并案、主从犯或量刑等法律结论；',
+                '回复不必复述全文，简要说明要点或本次改动即可。'
+            ].join('');
             try {
-                const resp = await fetch(`/api/tasks/${this.task.id}/report/draft`, { method: 'POST' });
-                const data = await resp.json();
-                if (data.error_code) {
-                    Toast.error(data.message || '报告生成失败');
-                    return;
-                }
-                this.task = data.task || this.task;
-                Toast.success('核验单草稿已生成');
+                if (!window.Agent) throw new Error('智能体未就绪');
+                await Agent.process(prompt);
+                await this.refreshTask();
                 await this.setView('reports');
+                Toast.success('已请助手撰写报告，结果见右侧对话与下方报告列表');
             } catch (e) {
-                Toast.error('报告生成失败：' + e.message);
+                Toast.error(e.message || '撰写未能完成');
             } finally {
                 if (button) {
                     button.disabled = false;

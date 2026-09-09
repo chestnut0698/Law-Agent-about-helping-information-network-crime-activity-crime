@@ -38,6 +38,8 @@ tool_functions = {
     "put_task_clue": put_task_clue,
     "delete_task_clue": delete_task_clue,
     "read_artifact": read_artifact,
+    "read_report": read_report,
+    "write_report": write_report,
     "compare_candidate_fields": compare_candidate_fields,
     "build_candidate_field_table": build_candidate_field_table,
     "search_candidate_evidence": search_candidate_evidence,
