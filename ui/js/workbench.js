@@ -4750,33 +4750,63 @@
             const layout = Utils.create('div', { class: 'wb-graph-layout' });
             const canvas = Utils.create('div', { class: 'wb-graph-canvas' });
             const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-            svg.setAttribute('width', '100%');
-            svg.setAttribute('height', '100%');
             svg.style.position = 'absolute';
-            svg.style.inset = '0';
+            svg.style.top = '0';
+            svg.style.left = '0';
             canvas.appendChild(svg);
+            layout.appendChild(canvas);
+            // 先挂到文档，便于用实际可用宽度做自适应网格布局
+            root.appendChild(layout);
 
+            // —— 双带排布（贴近原始观感）：案件在顶部一行，其余在下方网格；
+            //    放不下时加高画布并允许滚动，不再把画布外的节点裁掉 ——
             const caseNodes = nodes.filter((n) => n.type === '案件');
             const other = nodes.filter((n) => n.type !== '案件');
             const positions = {};
+            const baseW = canvas.clientWidth || 760;
+            const totalW = baseW;
+            const CASE_Y = 72;         // 顶部案件带
+            const OTHER_TOP = 172;     // 其余节点起始 y
+            const ROW_STEP = 118;      // 行距
+            const otherCols = 3;   // 固定三列（用户偏好）
+            // 三列下按列中心间距收缩卡宽，窄画布里也不会左右重叠；宽时保持 160
+            const nodeW = Math.min(160, Math.max(120, Math.floor((totalW / (otherCols + 1)) * 0.86)));
+            const otherRows = Math.max(1, Math.ceil(other.length / otherCols));
+            const canvasH = Math.max(380, OTHER_TOP + otherRows * ROW_STEP + 30);
+            const pad = 0.2; // 左右各留 3% 的空白（可调小至 0.01 或 0）
+            const fracAt = (i, n) => {
+                if (n <= 1) return 0.5;
+                return pad + (i / (n - 1)) * (1 - 2 * pad);
+            };
+
             caseNodes.forEach((n, i) => {
-                positions[n.id] = { x: 18 + (i * 28), y: 22 };
+                positions[n.id] = { x: totalW * fracAt(i, caseNodes.length), y: CASE_Y };
             });
             other.forEach((n, i) => {
-                const col = i % 3;
-                const row = Math.floor(i / 3);
-                positions[n.id] = { x: 22 + col * 28, y: 48 + row * 22 };
+                const col = i % otherCols;
+                const row = Math.floor(i / otherCols);
+                positions[n.id] = {
+                    x: totalW * fracAt(col, otherCols),
+                    y: OTHER_TOP + row * ROW_STEP
+                };
             });
+
+            canvas.style.overflow = 'auto';
+            canvas.style.height = `${canvasH}px`;
+            svg.setAttribute('width', String(totalW));
+            svg.setAttribute('height', String(canvasH));
+            svg.style.width = `${totalW}px`;
+            svg.style.height = `${canvasH}px`;
 
             edges.forEach((e) => {
                 const a = positions[e.from];
                 const b = positions[e.to];
                 if (!a || !b) return;
                 const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-                line.setAttribute('x1', `${a.x}%`);
-                line.setAttribute('y1', `${a.y}%`);
-                line.setAttribute('x2', `${b.x}%`);
-                line.setAttribute('y2', `${b.y}%`);
+                line.setAttribute('x1', String(a.x));
+                line.setAttribute('y1', String(a.y));
+                line.setAttribute('x2', String(b.x));
+                line.setAttribute('y2', String(b.y));
                 line.setAttribute('stroke', 'currentColor');
                 line.setAttribute('stroke-opacity', e.strength === 'weak' ? '0.35' : '0.25');
                 line.setAttribute('stroke-width', e.strength === 'weak' ? '1.5' : '2');
@@ -4787,7 +4817,7 @@
             });
 
             nodes.forEach((n) => {
-                const pos = positions[n.id] || { x: 50, y: 50 };
+                const pos = positions[n.id] || { x: totalW / 2, y: canvasH / 2 };
                 const typeIcon = n.type === '案件'
                     ? 'fileText'
                     : (window.Icons ? Icons.forEntityType(n.type || n.label) : 'users');
@@ -4795,21 +4825,22 @@
                 if (window.Icons) {
                     titleRow.appendChild(Icons.el(typeIcon, 'wb-list-type-ico'));
                 }
-                titleRow.appendChild(document.createTextNode(n.label));
+                const textEl = Utils.create('span', { class: 'cl', text: n.label });
+                titleRow.appendChild(textEl);
                 const node = Utils.create('div', {
                     class: `wb-graph-node${n.id === selected.id ? ' active' : ''}`,
-                    style: `left:${pos.x}%;top:${pos.y}%`
+                    style: `left:${pos.x}px;top:${pos.y}px;width:${nodeW}px`
                 }, [
                     titleRow,
-                    Utils.create('div', { class: 's', text: n.type })
+                    Utils.create('div', { class: 's', style: 'text-align:center; padding-right: 40px;',text: n.type })
                 ]);
+                node.setAttribute('title', `${n.label}（${n.type}）`);
                 node.addEventListener('click', () => {
                     this.selectedGraphNodeId = n.id;
                     this._renderCurrentView();
                 });
                 canvas.appendChild(node);
             });
-            layout.appendChild(canvas);
 
             const side = Utils.create('div', { class: 'wb-detail-card' });
             side.appendChild(Utils.create('div', { class: 'wb-detail-card-head' }, [
