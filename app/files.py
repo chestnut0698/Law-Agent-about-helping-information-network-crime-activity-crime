@@ -18,13 +18,13 @@ import contextvars
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Optional, Protocol, List, Tuple
+from typing import Any, Optional, Protocol, List, Tuple
 from prikit import PDFAnonymizer
 from presidio_analyzer import AnalyzerEngine
 from presidio_analyzer.nlp_engine import NlpEngineProvider
 from presidio_analyzer import RecognizerResult
 
-from app.config import DATABASE_PATH, MATERIAL_STORAGE_DIR, REDACTION_STORAGE_DIR
+from app.config import DATABASE_PATH, MATERIAL_STORAGE_DIR
 
 _db_connection_ctx = contextvars.ContextVar('_db_connection_ctx', default=None)
 

@@ -16,8 +16,6 @@
 | 浏览器 | 现代 Chromium / Firefox / Edge 即可 |
 | 模型 API | 配置 **DeepSeek** |
 
-当前阶段**不依赖** Neo4j、Redis 等外部服务；`.env.example` 里的 Neo4j 项留给后续图谱阶段，本地演示可留空。
-
 可选：安装 [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) 以启用更强 OCR；未安装时会走内置 Fallback 引擎，不影响启动。
 
 ---
@@ -27,7 +25,7 @@
 依赖锁定在仓库根目录 `requirements.txt`，主要包括：
 
 - **Web**：`fastapi`、`uvicorn`、`python-multipart`
-- **模型**：`openai`（兼容 DeepSeek / NVIDIA OpenAI 风格接口）
+- **模型**：`openai`（兼容 DeepSeek OpenAI 风格接口）
 - **配置**：`python-dotenv`
 - **卷宗解析**：`pymupdf`、`Pillow`、`python-docx`
 - **公网检索**：`baidusearch`、`requests`
@@ -48,22 +46,12 @@ OCR 重依赖默认注释掉，需要时自行取消注释安装：
 
 ```bash
 # 1. 拉取代码
-git pull
+git clone https://github.com/chestnut0698/Law-Agent-about-helping-information-network-crime-activity-crime.git
+cd Law-Agent-about-helping-information-network-crime-activity-crime
 
-# 2. 创建并激活虚拟环境（任选一种）
-python -m venv .venv
-
-# Windows PowerShell
-.\.venv\Scripts\Activate.ps1
-
-# Windows CMD
-.\.venv\Scripts\activate.bat
-
-# macOS / Linux
-source .venv/bin/activate
-
-# 3. 安装依赖
+# 3. 安装依赖,
 pip install -r requirements.txt
+python -m spacy download zh_core_web_trf
 
 # 4. 配置环境变量
 # 复制 .env.example 为 .env，填入自己的密钥（不要提交 .env）
@@ -76,7 +64,7 @@ cp .env.example .env          # Windows 可用 copy .env.example .env
 # 推荐：默认模型链路 DeepSeek
 DEEPSEEK_API_KEY=你的密钥
 DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-v4-flash
+DEEPSEEK_MODEL=deepseek-flash
 ```
 
 启动服务（仍在仓库根目录、虚拟环境已激活）：
@@ -95,14 +83,14 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 
 ## 环境变量说明（常用）
 
-完整模板见 `.env.example`。队友日常最常改的是：
+完整模板见 `.env.example`。最常改的是：
 
 | 变量 | 含义 | 本地建议 |
 | --- | --- | --- |
 | `DEEPSEEK_API_KEY` | DeepSeek 密钥 | 有则优先使用 |
 | `DEEPSEEK_MODEL` | 模型名 | 默认 `deepseek-v4-flash` |
 
-密钥、真实 `.env` **不要提交**。NVIDIA 探针保留在 `test/test.py`，给只用 NVIDIA 的队友本地排查用。
+密钥、真实 `.env` **不要提交**。
 
 ---
 
@@ -129,7 +117,7 @@ test/         # 测试（请勿随意改；功能验证走智能体全流程）
    检查 `.env` 是否为 `MATERIAL_AUTH_MODE=allow_all`，改完后重启进程。
 
 2. **智能体不调模型 / 报无 API Key**  
-   确认至少配置了 `DEEPSEEK_API_KEY` 或 `NVIDIA_API_KEY`，且服务从仓库根目录启动（才会读到根目录 `.env`）。
+   确认至少配置了 `DEEPSEEK_API_KEY`，且服务从仓库根目录启动（才会读到根目录 `.env`）。
 
 3. **依赖冲突 / 装不上 Paddle**  
    先不装 OCR 重依赖，用 Fallback 即可开发；Paddle 按本机 CUDA/CPU 说明单独装。

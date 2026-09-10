@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Form, Header, Request, UploadFile, File
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import asyncio
@@ -8,7 +8,7 @@ from typing import Optional
 import json
 from app.config import REPO_ROOT
 from app.files import MaterialError, get_material_service, init_db, get_global_mapper
-from app.tasks import TaskError, get_task_service, init_task_db
+from app.tasks import TaskError, TASK_ERROR_CODES, get_task_service, init_task_db
 
 
 app = FastAPI()
@@ -508,6 +508,35 @@ async def task_report_draft(task_id: str):
         content={
             "error_code": "REPORT_DRAFT_GONE",
             "message": "报告已改为由右侧助手撰写：请在「报告与审计」页点「新建报告」，助手会读取素材后起草并持续迭代。",
+        },
+    )
+
+
+@app.get("/api/tasks/{task_id}/report.docx")
+async def export_report_docx(task_id: str):
+    """下载报告：读取当前版本 markdown 即时转 docx。服务端只存储管理 markdown。"""
+    from urllib.parse import quote
+
+    from app.report_export import markdown_to_docx
+
+    try:
+        document = get_task_service().report_export_document(task_id)
+    except TaskError as exc:
+        status = 409 if exc.code == TASK_ERROR_CODES["STATE_CONFLICT"] else 404
+        return JSONResponse(status_code=status, content=exc.to_dict())
+
+    data = await asyncio.to_thread(
+        markdown_to_docx, document["markdown"], document["title"]
+    )
+    filename = f"{document['title']}-v{document['version']}.docx"
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={
+            "Content-Disposition": (
+                f"attachment; filename=report-v{document['version']}.docx; "
+                f"filename*=UTF-8''{quote(filename)}"
+            )
         },
     )
 

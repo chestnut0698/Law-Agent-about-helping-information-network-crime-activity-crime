@@ -44,6 +44,41 @@ def _report_engineering_tokens(text: str) -> bool:
     return bool(_ENGINEERING_TOKEN_RE.search(text or ""))
 
 
+# 线索确认状态的唯一判据：人工在线索中心处置写入 disposition；实体复核确认同一会把
+# 关联线索升格（promotion=confirmed）。历史数据常只有后者、没有 disposition，两者
+# 必须统一解析，否则模型会一直把已确认线索当作待核。
+CLUE_DISPOSITION_LABELS = {
+    "PENDING": "待确认",
+    "CONTINUE": "已确认关联",
+    "CONFIRMED": "已确认关联",
+    "NEED_MATERIAL": "待补材料",
+    "EXCLUDE": "已排除",
+    "DEFER": "暂缓",
+}
+
+
+def clue_disposition_code(payload: dict[str, Any]) -> str:
+    disp = str(payload.get("disposition") or "").upper()
+    if disp:
+        return disp
+    return "CONFIRMED" if payload.get("promotion") == "confirmed" else "PENDING"
+
+
+def clue_is_confirmed(payload: dict[str, Any]) -> bool:
+    """线索是否已被人工确认关联（含实体复核升格）。"""
+    return clue_disposition_code(payload) in {"CONTINUE", "CONFIRMED"}
+
+
+def clue_is_human_set(payload: dict[str, Any]) -> bool:
+    """线索是否已带人工判断（任何处置，或实体升格）——用于锁定模型改写。"""
+    return bool(payload.get("disposition")) or payload.get("promotion") == "confirmed"
+
+
+def clue_state_label(payload: dict[str, Any]) -> str:
+    code = clue_disposition_code(payload)
+    return CLUE_DISPOSITION_LABELS.get(code, code)
+
+
 # ---------- 状态与错误码 ----------
 
 TASK_STATUSES = {
@@ -1416,17 +1451,6 @@ class TaskService:
         }.get(str(aspect or "").upper(), "")
 
     @staticmethod
-    def _report_disposition_label(disp: Any) -> str:
-        return {
-            "PENDING": "待确认",
-            "CONTINUE": "继续核查",
-            "CONFIRMED": "已确认关联",
-            "NEED_MATERIAL": "待补材料",
-            "EXCLUDE": "已排除",
-            "DEFER": "暂缓",
-        }.get(str(disp or "").upper(), str(disp or "PENDING"))
-
-    @staticmethod
     def _report_entity_pending(entity_payload: dict[str, Any]) -> int:
         """待核实体数：优先产物 summary.pending，缺失时按 decision 兜底。"""
         summary = entity_payload.get("summary") or {}
@@ -1508,7 +1532,7 @@ class TaskService:
                     "idx": idx,
                     "title": payload.get("title") or "",
                     "aspect": self._report_aspect_label(payload.get("aspect")) or "未标注",
-                    "disposition": self._report_disposition_label(payload.get("disposition")),
+                    "disposition": clue_state_label(payload),
                     "evidence_count": len(evidence),
                     "case_count": len(case_names),
                 }
@@ -1586,7 +1610,7 @@ class TaskService:
             clue_lines.append(
                 f"- {idx}) {payload.get('title') or '未命名待核事项'} "
                 f"（{self._report_aspect_label(payload.get('aspect')) or '未标注'} · "
-                f"处置 {self._report_disposition_label(payload.get('disposition'))} · "
+                f"处置 {clue_state_label(payload)} · "
                 f"支持材料 {len(evidence)} 处）"
             )
 
@@ -1685,6 +1709,27 @@ class TaskService:
             "clue_count": len(alive),
             "invalid_refs": invalid_refs,
             "version": next_version,
+        }
+
+    def report_export_document(self, task_id: str) -> dict[str, Any]:
+        """导出用：只读返回报告当前版本的 markdown 与版本号（不落库、不转换）。"""
+        art = self.find_artifact(task_id, "REPORT_DRAFT", "report-draft")
+        if not art or art.get("status") in {"STALE", "INVALID"}:
+            raise TaskError(TASK_ERROR_CODES["ARTIFACT_NOT_FOUND"], "尚未撰写报告或报告已失效")
+        row, payload = self._read_artifact_payload_raw(task_id, art["id"])
+        payload = payload or {}
+        markdown = payload.get("markdown") or payload.get("text") or ""
+        if not markdown.strip():
+            raise TaskError(TASK_ERROR_CODES["ARTIFACT_NOT_FOUND"], "报告内容为空")
+        if payload.get("valid") is False:
+            raise TaskError(
+                TASK_ERROR_CODES["STATE_CONFLICT"],
+                "报告存在待补原文依据，补证或排除后方可导出",
+            )
+        return {
+            "markdown": markdown,
+            "title": art.get("title") or "跨案关联线索核验单",
+            "version": int(row["current_version"]),
         }
 
     # ----- 产物 -----
@@ -2313,8 +2358,7 @@ class TaskService:
         confirmed: list[dict[str, Any]] = []
         for item in clues:
             payload = item.get("payload") or {}
-            disp = str(payload.get("disposition") or "PENDING").upper()
-            if disp not in {"CONTINUE", "CONFIRMED"}:
+            if not clue_is_confirmed(payload):
                 continue
             confirmed.append(payload)
         if len(confirmed) < 2:
@@ -2727,7 +2771,7 @@ class TaskService:
                 continue
             if self._clue_dedup_key(existing) != key:
                 continue
-            if existing.get("disposition"):
+            if clue_is_human_set(existing):
                 raise TaskError(
                     TASK_ERROR_CODES["STATE_CONFLICT"],
                     "该对象该核验维度的线索已由人工处置，智能体不能覆盖；如需重新形成请向用户说明",
@@ -2822,7 +2866,7 @@ class TaskService:
                 f"序号 {index} 越界：当前存活线索 {len(active)} 条，请先重新 list_task_clues",
             )
         art, payload = active[index]
-        if payload.get("disposition"):
+        if clue_is_human_set(payload):
             raise TaskError(
                 TASK_ERROR_CODES["STATE_CONFLICT"],
                 "该线索已由人工处置，智能体不能删除；请向用户说明",
@@ -2838,7 +2882,11 @@ class TaskService:
         }
 
     def list_clue_items_for_model(self, task_id: str) -> dict[str, Any]:
-        """给模型看的存活线索快照（精简，序号供 delete/覆盖引用）。"""
+        """给模型看的存活线索快照（精简，序号供 delete/覆盖引用）。
+
+        state/confirmed 已合并「人工处置」与「实体复核升格」，模型据此判断线索
+        是否已确认；confirmed=true 的线索不得覆盖或删除。
+        """
         active = self._active_clue_items(task_id)
         clues: list[dict[str, Any]] = []
         for index, (art, payload) in enumerate(active):
@@ -2850,7 +2898,8 @@ class TaskService:
                     "aspect": str(payload.get("aspect") or "").upper() or "QUAL",
                     "analysis": str(payload.get("analysis") or "")[:80],
                     "objects": (payload.get("objects") or [])[:5],
-                    "disposition": payload.get("disposition") or "PENDING",
+                    "state": clue_state_label(payload),
+                    "confirmed": clue_is_confirmed(payload),
                 }
             )
         return {"ok": True, "clue_count": len(clues), "clues": clues}

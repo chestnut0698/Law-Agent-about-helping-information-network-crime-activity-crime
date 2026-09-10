@@ -615,6 +615,8 @@
             this.task = task;
             this._renderNav();
             this._renderContext();
+            // 报告页内容会因助手在对话中改写而变化，刷新任务后同步重绘，避免停留在旧版本。
+            if (this.currentView === 'reports') await this._renderCurrentView();
             return task;
         },
 
@@ -842,7 +844,7 @@
 
         async _fetchArtifact(artifactId) {
             try {
-                const resp = await fetch(`/api/tasks/${this.task.id}/artifacts/${artifactId}`);
+                const resp = await fetch(`/api/tasks/${this.task.id}/artifacts/${artifactId}?_=${Date.now()}`);
                 const data = await resp.json();
                 if (data.error_code) {
                     Toast.error(data.message || '分析成果打开失败');
@@ -1062,6 +1064,19 @@
                 return (art && art.status === 'DRAFT') || false;
             }
             return true;
+        },
+
+        _clueState(payload) {
+            // 线索确认状态：人工处置(disposition) 或 实体复核升格(promotion=confirmed) 二者取其一。
+            const disp = (payload && payload.disposition) || '';
+            const code = disp || ((payload && payload.promotion) === 'confirmed' ? 'CONFIRMED' : 'PENDING');
+            const label = {
+                PENDING: '待确认', CONTINUE: '已确认关联', CONFIRMED: '已确认关联',
+                NEED_MATERIAL: '待补证', EXCLUDE: '已排除', DEFER: '暂缓'
+            }[code] || code;
+            const tone = code === 'EXCLUDE' ? 'danger'
+                : (code === 'PENDING' || code === 'NEED_MATERIAL' || code === 'DEFER' ? 'warn' : 'ok');
+            return { code, label, tone, confirmed: code === 'CONTINUE' || code === 'CONFIRMED' };
         },
 
         _entityCandidateCard(candidate, index, artifactStatus, version) {
@@ -4053,7 +4068,8 @@
                 const p = d.payload || {};
                 const artId = d.artifact && d.artifact.id;
                 if (!this._clueMatchesEntityFilter(p, artId)) return false;
-                const disp = p.disposition || 'PENDING';
+                const st = this._clueState(p);
+                const disp = st.code === 'CONFIRMED' ? 'CONTINUE' : st.code;
                 if (this.leadsStatusFilter !== 'all' && disp !== this.leadsStatusFilter) return false;
                 const hay = `${p.title || ''} ${(p.objects || []).join(' ')} ${(p.cases || []).join(' ')}`.toLowerCase();
                 return !q || hay.includes(q);
@@ -4072,12 +4088,7 @@
             const listBody = Utils.create('div', { class: 'wb-list-card-body' });
             filtered.forEach((d) => {
                 const p = d.payload || {};
-                const disp = p.disposition || 'PENDING';
-                const label = {
-                    PENDING: '待确认', CONTINUE: '已确认关联', NEED_MATERIAL: '待补证',
-                    EXCLUDE: '已排除', DEFER: '暂缓'
-                }[disp] || disp;
-                const tone = disp === 'EXCLUDE' ? 'danger' : (disp === 'PENDING' || disp === 'NEED_MATERIAL' || disp === 'DEFER' ? 'warn' : 'ok');
+                const { label, tone } = this._clueState(p);
                 const basis = p.match_basis || p.rule_id || '';
                 const aspectLabel = {
                     ID: '标识同一性',
@@ -4186,7 +4197,8 @@
             });
             detailBody.appendChild(openEv);
 
-            if (!p.disposition || p.disposition === 'PENDING') {
+            const clueState = this._clueState(p);
+            if (!p.disposition && !clueState.confirmed) {
                 const review = Utils.create('div', { class: 'wb-entity-review', style: 'margin-top:12px' });
                 const reason = Utils.create('textarea', {
                     class: 'wb-decision-reason',
@@ -4210,7 +4222,7 @@
             } else {
                 detailBody.appendChild(Utils.create('div', {
                     class: 'wb-file-meta',
-                    text: `已处置：${p.disposition} · ${p.disposition_reason || ''}`
+                    text: `已处置：${clueState.label} · ${p.disposition_reason || (clueState.confirmed ? '经实体复核确认同一后自动确认关联' : '')}`
                 }));
             }
             detail.appendChild(detailBody);
@@ -4970,7 +4982,7 @@
                     ]);
                     const dl = this._iconBtn('wb-btn wb-btn-outline', 'download', '下载');
                     if (!valid) dl.disabled = true;
-                    dl.addEventListener('click', () => this._downloadReport(art.id, p));
+                    dl.addEventListener('click', () => this._downloadReport());
                     row.appendChild(dl);
                     reportBody.appendChild(row);
                 }
@@ -5083,23 +5095,33 @@
             }
         },
 
-        _downloadReport(artifactId, payload) {
-            const text = (payload && (payload.markdown || payload.text)) || '';
-            if (!text) {
-                Toast.warning('报告内容为空');
-                return;
+        async _downloadReport() {
+            // 始终向服务端取当前版本并即时转 docx：既避免拿到渲染时缓存的旧版，也无需前端做格式转换。
+            const url = `/api/tasks/${this.task.id}/report.docx?_=${Date.now()}`;
+            try {
+                const resp = await fetch(url);
+                if (!resp.ok) {
+                    let msg = '报告下载失败';
+                    try {
+                        const data = await resp.json();
+                        msg = data.message || msg;
+                    } catch (_) { /* 非 JSON 响应 */ }
+                    Toast.warning(msg);
+                    return;
+                }
+                const blob = await resp.blob();
+                const dispo = resp.headers.get('Content-Disposition') || '';
+                const matched = /filename\*=UTF-8''([^;]+)/i.exec(dispo);
+                const filename = matched ? decodeURIComponent(matched[1]) : '跨案关联线索核验单.docx';
+                const objectUrl = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = objectUrl;
+                a.download = filename;
+                a.click();
+                URL.revokeObjectURL(objectUrl);
+            } catch (e) {
+                Toast.error('报告下载失败：' + e.message);
             }
-            if (payload && payload.valid === false) {
-                Toast.warning('存在失效引用，禁止下载');
-                return;
-            }
-            const blob = new Blob([text], { type: 'text/markdown;charset=utf-8' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = `跨案关联线索核验单-${artifactId.slice(0, 8)}.md`;
-            a.click();
-            URL.revokeObjectURL(url);
         }
 
     };

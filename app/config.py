@@ -39,22 +39,10 @@ PLANS = [
     ],
 ]
 
-# 默认走 DeepSeek；队友本地若只配置 NVIDIA，则自动切到 NVIDIA，互不影响。
-DEEPSEEK_KEY = os.getenv("DEEPSEEK_API_KEY")
-NVIDIA_KEY = os.getenv("NVIDIA_API_KEY")
+API_KEY = os.getenv("DEEPSEEK_API_KEY", None)
+BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+MODEL_NAME = os.getenv("DEEPSEEK_MODEL", "deepseek-flash")
 
-if DEEPSEEK_KEY:
-    API_KEY = DEEPSEEK_KEY
-    BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-    MODEL_NAME = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
-elif NVIDIA_KEY:
-    API_KEY = NVIDIA_KEY
-    BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
-    MODEL_NAME = os.getenv("MODEL_NAME", "meta/muse-glimmer-30b")
-else:
-    API_KEY = None
-    BASE_URL = "https://api.deepseek.com"
-    MODEL_NAME = "deepseek-v4-flash"
 
 
 def _env_bool(name: str, default: bool = False) -> bool:

@@ -326,7 +326,7 @@
     "type": "function",
     "function": {
       "name": "list_task_clues",
-      "description": "查看当前存活待核线索清单（含序号与核验维度）。整理或调整线索前先调用以了解现状；本工具不修改任何数据。",
+      "description": "查看当前存活待核线索清单（含序号与核验维度）。整理或调整线索前先调用以了解现状；本工具不修改任何数据。返回每条线索的 state（中文确认状态）与 confirmed（是否已确认）：confirmed=true 表示该线索已由人工确认关联——可能是人工在线索中心处置，也可能是实体复核确认同一后系统升格；已确认的线索不得再覆盖或删除，撰写报告时应作为已确认关联陈述。confirmed=false 且 state=待确认 的才是真正待人工核验的线索。",
       "parameters": {
         "type": "object",
         "properties": {},
