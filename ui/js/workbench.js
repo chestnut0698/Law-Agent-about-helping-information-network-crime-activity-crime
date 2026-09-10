@@ -276,8 +276,8 @@
             this.task = null;
             this._renderNav();
             if (!Utils.$$('.wb-case-row').length) {
-                this._addCaseRow('案件 A');
-                this._addCaseRow('案件 B');
+                this._addCaseRow();
+                this._addCaseRow();
             }
             this._checkScope();
         },
@@ -389,7 +389,7 @@
 
         _bindScopeForm() {
             const addCase = Utils.$('#wb-add-case');
-            if (addCase) addCase.addEventListener('click', () => this._addCaseRow(''));
+            if (addCase) addCase.addEventListener('click', () => this._addCaseRow());
 
             ['#wb-purpose', '#wb-until', '#wb-title'].forEach(sel => {
                 const el = Utils.$(sel);
@@ -400,10 +400,21 @@
             if (gen) gen.addEventListener('click', () => this._createTask());
         },
 
+        _defaultCaseLabel(index) {
+            const letter = String.fromCharCode(65 + (index % 26));
+            return `案件 ${letter}`;
+        },
+
+        _caseNameFromInput(input) {
+            if (!input) return '';
+            return (input.value || '').trim() || (input.placeholder || '').trim();
+        },
+
         _addCaseRow(value) {
             const list = Utils.$('#wb-case-list');
             if (!list) return;
-            const input = Utils.create('input', { type: 'text', placeholder: '案件名称或案号' });
+            const placeholder = this._defaultCaseLabel(Utils.$$('.wb-case-row').length);
+            const input = Utils.create('input', { type: 'text', placeholder });
             input.value = value || '';
             input.addEventListener('input', () => this._checkScope());
 
@@ -441,7 +452,7 @@
 
         _scopeValues() {
             const cases = Utils.$$('.wb-case-row input[type="text"]')
-                .map(i => i.value.trim())
+                .map(i => this._caseNameFromInput(i))
                 .filter(Boolean)
                 .map(name => ({ name }));  // 返回对象数组
             return {
@@ -531,10 +542,7 @@
         },
 
         async _uploadStartFiles(task) {
-            const rows = Utils.$$('.wb-case-row').filter(row => {
-                const name = (row.querySelector('input[type="text"]') || {}).value || '';
-                return name.trim();
-            });
+            const rows = Utils.$$('.wb-case-row');
             for (let i = 0; i < rows.length; i++) {
                 const files = rows[i]._files || [];
                 const caseId = ((task.cases || [])[i] || {}).case_id;
@@ -1653,12 +1661,11 @@
                 container.textContent = raw;
                 return;
             }
-            // 在原文中定位：优先完整 quote，再定位被提取字段值
+            // 核验：在原文中定位摘录，优先完整 quote，再字段值
             let html = this._escapeHtml(raw);
             terms.forEach((term) => {
                 const esc = this._escapeHtml(term);
                 if (!esc || html.indexOf(esc) < 0) return;
-                // 只替换首次出现，避免整篇刷黄
                 html = html.replace(
                     esc,
                     `<mark class="wb-cite-mark"><strong>${esc}</strong></mark>`
@@ -1743,7 +1750,7 @@
                 // 失效时也只展示展示态摘要，禁止落存储态 quote
                 textBox.textContent = this._displayQuote(source) || view.message || '原文不可展示';
             } else {
-                // data.text 已是展示态；高亮词也只用展示态
+                // 核验以定位摘录为准：展示态纯文本窗口 + 高亮，不做整页 Markdown 排版
                 this._renderVerifyText(
                     textBox,
                     data.text || this._displayQuote(source) || '',
@@ -1760,6 +1767,7 @@
             bodyEl.appendChild(panel);
 
             const nav = Utils.create('div', { class: 'wb-cite-nav' });
+            const row1 = Utils.create('div', { class: 'wb-cite-nav-row' });
             const prev = Utils.create('button', { type: 'button', class: 'wb-btn wb-btn-outline', text: '‹ 上一条' });
             const next = Utils.create('button', { type: 'button', class: 'wb-btn wb-btn-outline', text: '下一条 ›' });
             const counter = Utils.create('span', {
@@ -1784,17 +1792,20 @@
             const isFull = drawer && drawer.classList.contains('is-fullscreen');
             const full = Utils.create('button', {
                 type: 'button',
-                class: 'wb-btn wb-btn-ghost',
+                class: 'wb-btn wb-btn-ghost wb-cite-fullscreen-btn',
                 text: isFull ? '退出全屏核验' : '进入全屏核验模式'
             });
             full.addEventListener('click', () => {
                 if (drawer) drawer.classList.toggle('is-fullscreen');
                 this._loadCitation();
             });
-            nav.appendChild(prev);
-            nav.appendChild(counter);
-            nav.appendChild(full);
-            nav.appendChild(next);
+            row1.appendChild(prev);
+            row1.appendChild(counter);
+            row1.appendChild(next);
+            nav.appendChild(row1);
+            const row2 = Utils.create('div', { class: 'wb-cite-nav-row wb-cite-nav-row-full' });
+            row2.appendChild(full);
+            nav.appendChild(row2);
             bodyEl.appendChild(nav);
 
             requestAnimationFrame(() => {
@@ -1812,8 +1823,13 @@
             const kicker = Utils.$('#wb-cite-kicker');
             if (!bodyEl) return;
             this._openCiteDrawerShell();
-            if (kicker) kicker.textContent = view.error ? '核验未通过' : '原文对照';
-            if (title) title.textContent = view.title || '原文';
+            const isBrowse = view.mode === 'browse';
+            if (kicker) {
+                kicker.textContent = view.error
+                    ? '核验未通过'
+                    : (isBrowse ? '材料预览' : '原文对照');
+            }
+            if (title) title.textContent = view.title || (isBrowse ? '材料浏览' : '原文');
             bodyEl.innerHTML = '';
             if (view.meta) {
                 bodyEl.appendChild(Utils.create('div', { class: 'wb-file-meta', text: view.meta }));
@@ -1823,29 +1839,58 @@
                     Utils.create('span', { text: '该引用不可用于确认或导出，请重新核验。' })
                 ]));
             }
-            const body = Utils.create('div', { class: `wb-cite-body${view.error ? ' is-error' : ''}` });
-            const displayQuote = this._displayQuote(source || {});
-            const text = view.text || '';
-            if (!view.error && !displayQuote && !(source && (source.value || (source.highlight_terms || []).length)) && window.Markdown) {
-                body.classList.add('md-content');
-                body.innerHTML = Markdown.parse(text);
-            } else if (!view.error) {
-                this._renderHighlightedText(body, text, {
-                    ...source,
-                    quote_display: displayQuote,
-                    quote: displayQuote
-                });
+
+            if (isBrowse && !view.error) {
+                // mode=browse：脱敏展示文已在后端还原并结构推断；此处仅 Markdown 预览，不回写存储
+                bodyEl.appendChild(Utils.create('div', {
+                    class: 'wb-cite-desc',
+                    text: '浏览预览 · Markdown 排版（仅展示，不改存储原文）'
+                }));
+                bodyEl.appendChild(this._renderMarkdownBody(view.text || '', 'wb-cite-body wb-doc-preview md-content'));
+                bodyEl.appendChild(Utils.create('div', {
+                    class: 'wb-file-meta',
+                    text: '以上为结构化预览。脱敏占位已还原后排版；text_raw / text_redacted 未改动。'
+                }));
             } else {
-                body.textContent = text || displayQuote || '原文不可展示';
-            }
-            bodyEl.appendChild(body);
-            // 滚到首个高亮
-            requestAnimationFrame(() => {
-                const mark = body.querySelector('.wb-cite-mark');
-                if (mark && typeof mark.scrollIntoView === 'function') {
-                    mark.scrollIntoView({ block: 'center', behavior: 'smooth' });
+                const body = Utils.create('div', { class: `wb-cite-body${view.error ? ' is-error' : ''}` });
+                const displayQuote = this._displayQuote(source || {});
+                const text = view.text || '';
+                if (view.error) {
+                    body.textContent = text || displayQuote || '原文不可展示';
+                } else {
+                    // 对照/核验：定位摘录，不做整页 Markdown 排版
+                    this._renderHighlightedText(body, text, {
+                        ...source,
+                        quote_display: displayQuote,
+                        quote: displayQuote
+                    });
                 }
+                bodyEl.appendChild(body);
+            }
+
+            const drawerNav = Utils.create('div', { class: 'wb-cite-nav' });
+            const fullRow = Utils.create('div', { class: 'wb-cite-nav-row wb-cite-nav-row-full' });
+            const isFull = drawer && drawer.classList.contains('is-fullscreen');
+            const full = Utils.create('button', {
+                type: 'button',
+                class: 'wb-btn wb-btn-ghost wb-cite-fullscreen-btn',
+                text: isFull ? (isBrowse ? '退出全屏预览' : '退出全屏核验') : (isBrowse ? '进入全屏预览' : '进入全屏核验模式')
             });
+            full.addEventListener('click', () => {
+                if (drawer) drawer.classList.toggle('is-fullscreen');
+                this._renderCitePane(view, source);
+            });
+            fullRow.appendChild(full);
+            drawerNav.appendChild(fullRow);
+            bodyEl.appendChild(drawerNav);
+            if (!isBrowse) {
+                requestAnimationFrame(() => {
+                    const mark = bodyEl.querySelector('.wb-cite-mark');
+                    if (mark && typeof mark.scrollIntoView === 'function') {
+                        mark.scrollIntoView({ block: 'center', behavior: 'smooth' });
+                    }
+                });
+            }
         },
 
         _orgStyleEvidenceQuote(ev) {
@@ -2198,36 +2243,60 @@
             }
         },
         async _openMappingManager(documentId) {
-            // 1. 创建模态框
+            if (!documentId) {
+                Toast.warning('请从材料行打开，仅查看该材料上的脱敏映射');
+                return;
+            }
+            // 关闭已有弹层，避免叠多层
+            document.querySelectorAll('.wb-modal-overlay').forEach((el) => {
+                if (el.querySelector('.wb-mapping-table')) el.remove();
+            });
+
             const modal = Utils.create('div', { class: 'wb-modal-overlay' });
             const content = Utils.create('div', { class: 'wb-modal-content', style: 'max-width: 1000px; max-height: 90vh; overflow-y: auto;' });
             content.addEventListener('click', (e) => e.stopPropagation());
             modal.appendChild(content);
+            modal.addEventListener('click', (e) => {
+                if (e.target === modal) modal.remove();
+            });
             document.body.appendChild(modal);
 
-            // 2. 状态
             const changes = {
-                updates: {},      // fingerprint -> { sens_type }
+                updates: {},
                 deletions: new Set(),
-                additions: []     // { original, sens_type }
+                additions: []
             };
 
-            // 3. 加载数据
-            const resp = await fetch(`/api/mappings?limit=200`);
+            const resp = await fetch(`/api/mappings?document_id=${encodeURIComponent(documentId)}&limit=200`);
             const data = await resp.json();
             const items = data.items || [];
 
-            // 收集所有已使用的类型，并补充常见类型
+            content.appendChild(Utils.create('div', {
+                style: 'display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:12px;'
+            }, [
+                Utils.create('div', {}, [
+                    Utils.create('div', {
+                        style: 'font-size:16px;font-weight:600;',
+                        text: '本材料脱敏映射'
+                    }),
+                    Utils.create('div', {
+                        style: 'font-size:12px;color:var(--muted-foreground);margin-top:4px;',
+                        text: `仅显示本份材料出现过的映射（共 ${data.total != null ? data.total : items.length} 条）；底层仍与跨材料全局映射共用，保证同一标识跨案一致。`
+                    })
+                ]),
+                this._iconBtn('wb-btn wb-btn-ghost', 'x', '')
+            ]));
+            const closeHead = content.querySelector('.wb-btn-ghost');
+            if (closeHead) closeHead.addEventListener('click', () => modal.remove());
+
             const typeSet = new Set();
             items.forEach(item => {
                 if (item.sens_type) typeSet.add(item.sens_type);
             });
-            // 补充常见脱敏类型
             const commonTypes = ['PERSON', 'PHONE', 'ID', 'BANK_CARD', 'EMAIL', 'URL', 'IP'];
             commonTypes.forEach(t => typeSet.add(t));
             const allTypes = Array.from(typeSet).sort();
 
-            // 4. 渲染表格
             const table = Utils.create('table', { class: 'wb-mapping-table' });
             const thead = Utils.create('thead', {}, [
                 Utils.create('tr', {}, [
@@ -2242,6 +2311,14 @@
             table.appendChild(thead);
 
             const tbody = Utils.create('tbody');
+            if (!items.length) {
+                tbody.appendChild(Utils.create('tr', {}, [
+                    Utils.create('td', {
+                        colspan: '6',
+                        text: '本材料尚无脱敏映射条目。可在下方按原文新增，或先修复残缺人名跨度。'
+                    })
+                ]));
+            }
             items.forEach(item => {
                 const tr = Utils.create('tr');
                 const fp = item.fingerprint;
@@ -2249,25 +2326,21 @@
                 const isDeleted = changes.deletions.has(fp);
                 if (isDeleted) tr.style.opacity = '0.5';
 
-                // 匿名ID
                 tr.appendChild(Utils.create('td', {
                     text: item.anonymous_id || '',
                     style: 'font-family: monospace; font-size: 12px;'
                 }));
 
-                // 化名（对外展示用）
                 tr.appendChild(Utils.create('td', {
                     text: item.display_alias || '—',
                     style: 'font-weight: 600; color: var(--text-primary);'
                 }));
 
-                // 原文
                 tr.appendChild(Utils.create('td', {
                     text: item.sample_raw || '—',
                     style: 'font-family: monospace; font-size: 12px;'
                 }));
 
-                // 类型（下拉选择框）
                 const typeSelect = Utils.create('select', {
                     style: 'width: 80px; padding: 2px 4px; border: 1px solid var(--border-color); border-radius: 4px; background: var(--bg-input); color: var(--text-primary);'
                 });
@@ -2281,12 +2354,10 @@
                 });
                 tr.appendChild(Utils.create('td', {}, [typeSelect]));
 
-                // 最后出现
                 tr.appendChild(Utils.create('td', {
                     text: item.last_seen_at ? item.last_seen_at.slice(0, 16) : '—'
                 }));
 
-                // 操作
                 const btnGroup = Utils.create('div', { style: 'display: flex; gap: 4px;' });
 
                 const delBtn = Utils.create('button', {
@@ -2430,7 +2501,7 @@
                 saveBtn.disabled = true;
                 saveBtn.textContent = '处理中…';
                 try {
-                    await this._saveMappingChanges(null, changes);
+                    await this._saveMappingChanges(documentId, changes);
                     modal.remove();
                 } catch (e) {
                     // 错误已在 _saveMappingChanges 中处理
@@ -2445,12 +2516,6 @@
             closeBtn.addEventListener('click', () => modal.remove());
             footer.appendChild(closeBtn);
             content.appendChild(footer);
-
-            // 点击遮罩关闭
-            modal.addEventListener('click', (e) => {
-                if (e.target === modal && !confirm('有未保存的变更，确定关闭吗？')) return;
-                modal.remove();
-            });
         },
         _renderMarkdownBody(text, className = 'wb-doc-preview md-content') {
             const el = Utils.create('div', { class: className });
@@ -2683,6 +2748,45 @@
             modal.appendChild(select);
 
             const fileLabel = Utils.create('label', { class: 'wb-upload-field-label', text: '材料文件' });
+            const { drop, input } = this._buildUploadDropzone();
+            modal.appendChild(fileLabel);
+            modal.appendChild(drop);
+
+            const foot = Utils.create('div', { class: 'wb-upload-modal-foot' });
+            const notice = Utils.create('div', { class: 'wb-upload-legal' });
+            if (window.Icons) notice.appendChild(Icons.el('fileText', 'wb-upload-legal-ico'));
+            notice.appendChild(Utils.create('span', {
+                text: '上传即视为您确认已获得该材料的合法查阅与分析授权'
+            }));
+            const actions = Utils.create('div', { class: 'wb-upload-modal-actions' });
+            const cancel = this._iconBtn('wb-btn wb-btn-outline', 'x', '取消');
+            cancel.addEventListener('click', () => overlay.remove());
+            const start = this._iconBtn('wb-btn wb-btn-primary', 'upload', '开始上传');
+            start.addEventListener('click', async () => {
+                const ok = await this._uploadMaterials(select.value, input.files, start);
+                if (ok) {
+                    overlay.remove();
+                    if (this.currentView === 'materials') await this._renderCurrentView();
+                    else if (this.currentView === 'task' || this.currentView === 'overview') {
+                        await this.refreshTask();
+                        this._renderCurrentView();
+                    }
+                }
+            });
+            actions.appendChild(cancel);
+            actions.appendChild(start);
+            foot.appendChild(notice);
+            foot.appendChild(actions);
+            modal.appendChild(foot);
+
+            overlay.appendChild(modal);
+            overlay.addEventListener('click', (e) => {
+                if (e.target === overlay) overlay.remove();
+            });
+            document.body.appendChild(overlay);
+        },
+
+        _buildUploadDropzone() {
             const input = Utils.create('input', {
                 type: 'file',
                 multiple: 'multiple',
@@ -2738,38 +2842,104 @@
                     syncFileList();
                 }
             });
+            return { drop, input, syncFileList };
+        },
 
-            modal.appendChild(fileLabel);
+        _openAddCaseModal() {
+            if (!this.task || !this.task.id) {
+                Toast.error('请先打开分析任务');
+                return;
+            }
+            const existing = document.querySelector('.wb-upload-modal-overlay');
+            if (existing) existing.remove();
+
+            const overlay = Utils.create('div', { class: 'wb-modal-overlay wb-upload-modal-overlay' });
+            const modal = Utils.create('div', { class: 'wb-modal-content wb-upload-modal' });
+            const head = Utils.create('div', { class: 'wb-upload-modal-head' }, [
+                Utils.create('div', {}, [
+                    Utils.create('div', { class: 'wb-upload-modal-title', text: '添加案件' }),
+                    Utils.create('div', {
+                        class: 'wb-upload-modal-sub',
+                        text: '填写案件名称并可同时上传材料；与新建任务使用同一案件库与材料存储'
+                    })
+                ])
+            ]);
+            const closeBtn = this._iconBtn('wb-btn wb-btn-ghost wb-upload-modal-close', 'x', '');
+            closeBtn.title = '关闭';
+            closeBtn.addEventListener('click', () => overlay.remove());
+            head.appendChild(closeBtn);
+            modal.appendChild(head);
+
+            modal.appendChild(Utils.create('label', { class: 'wb-upload-field-label', text: '案件名称' }));
+            const nameInput = Utils.create('input', {
+                type: 'text',
+                class: 'wb-upload-select',
+                placeholder: '案件名称或案号'
+            });
+            modal.appendChild(nameInput);
+
+            modal.appendChild(Utils.create('label', { class: 'wb-upload-field-label', text: '上传材料（可选）' }));
+            const { drop, input } = this._buildUploadDropzone();
             modal.appendChild(drop);
 
             const foot = Utils.create('div', { class: 'wb-upload-modal-foot' });
             const notice = Utils.create('div', { class: 'wb-upload-legal' });
             if (window.Icons) notice.appendChild(Icons.el('fileText', 'wb-upload-legal-ico'));
             notice.appendChild(Utils.create('span', {
-                text: '上传即视为您确认已获得该材料的合法查阅与分析授权'
+                text: '案件与材料写入本任务范围，存储路径与新建分析任务一致'
             }));
             const actions = Utils.create('div', { class: 'wb-upload-modal-actions' });
             const cancel = this._iconBtn('wb-btn wb-btn-outline', 'x', '取消');
             cancel.addEventListener('click', () => overlay.remove());
-            const start = this._iconBtn('wb-btn wb-btn-primary', 'upload', '开始上传');
-            start.addEventListener('click', async () => {
-                const ok = await this._uploadMaterials(select.value, input.files, start);
-                if (ok) {
+            const submit = this._iconBtn('wb-btn wb-btn-primary', 'plus', '确认添加');
+            submit.addEventListener('click', async () => {
+                const name = (nameInput.value || '').trim();
+                if (!name) {
+                    Toast.warning('请填写案件名称');
+                    nameInput.focus();
+                    return;
+                }
+                submit.disabled = true;
+                try {
+                    const fd = new FormData();
+                    fd.append('name', name);
+                    const files = input.files ? Array.from(input.files) : [];
+                    files.forEach((f) => fd.append('files', f));
+                    const resp = await fetch(`/api/tasks/${this.task.id}/cases`, {
+                        method: 'POST',
+                        body: fd
+                    });
+                    const data = await resp.json();
+                    if (data.error_code) {
+                        Toast.error(data.message || '添加案件失败');
+                        return;
+                    }
+                    this.task = data.task || this.task;
+                    this.artifactCache = {};
+                    if (typeof this.refreshTask === 'function') {
+                        await this.refreshTask();
+                    }
                     overlay.remove();
-                    if (this.currentView === 'materials') await this._renderCurrentView();
+                    const n = data.uploaded || 0;
+                    Toast.success(n > 0 ? `已添加案件，并上传 ${n} 份材料` : '已添加案件');
+                    this._renderCurrentView();
+                } catch (e) {
+                    Toast.error('添加案件失败：' + e.message);
+                } finally {
+                    submit.disabled = false;
                 }
             });
             actions.appendChild(cancel);
-            actions.appendChild(start);
+            actions.appendChild(submit);
             foot.appendChild(notice);
             foot.appendChild(actions);
             modal.appendChild(foot);
-
             overlay.appendChild(modal);
             overlay.addEventListener('click', (e) => {
                 if (e.target === overlay) overlay.remove();
             });
             document.body.appendChild(overlay);
+            nameInput.focus();
         },
 
         async _uploadMaterials(caseId, files, btn) {
@@ -3096,10 +3266,7 @@
                 Utils.create('p', { text: `已纳入 ${cases.length} 起案件 · ${cases.length} 起已完成授权确认` })
             ]));
             const addCaseBtn = this._iconBtn('wb-btn wb-btn-outline', 'plus', '添加案件');
-            addCaseBtn.addEventListener('click', () => {
-                Toast.info('请通过「新建分析任务」调整案件范围');
-                this.showStart();
-            });
+            addCaseBtn.addEventListener('click', () => this._openAddCaseModal());
             scopeHead.appendChild(addCaseBtn);
             scopeWrap.appendChild(scopeHead);
 
@@ -3346,12 +3513,13 @@
                     if (e.target.closest('.wb-td-actions')) return;
                     if (m.document_id) {
                         const preview = await fetch(`/api/materials/${m.document_id}/preview`).then((r) => r.json()).catch(() => null);
-                        if (preview && !preview.error_code) {
+                        if (preview && !preview.error_code && (preview.ok !== false)) {
                             this._renderCitePane({
+                                mode: 'browse',
                                 error: false,
-                                title: m.filename || '材料预览',
-                                text: preview.text || preview.preview || JSON.stringify(preview).slice(0, 2000),
-                                meta: `${m.case_name || ''} · ${statusText}`
+                                title: m.filename || preview.filename || '材料预览',
+                                text: preview.text || preview.preview || '',
+                                meta: `${m.case_name || ''} · ${statusText} · ${preview.format === 'markdown' ? 'Markdown' : '文本'}`
                             }, { quote: '' });
                         } else {
                             Toast.info('暂无法预览该材料正文');

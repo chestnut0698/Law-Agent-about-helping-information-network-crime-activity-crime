@@ -830,47 +830,82 @@ class GlobalEntityMapper:
             task_id: str | None = None,
             sens_type: str | None = None,
             anonymous_id: str | None = None,
+            document_id: str | None = None,
             limit: int = 100,
             offset: int = 0
     ) -> dict[str, Any]:
         conn = get_connection(self.db_path)
         try:
-            query = """
-                SELECT fingerprint, anonymous_id, display_alias, sens_type, task_id, first_seen_at, last_seen_at
-                FROM entity_global_map
-                WHERE 1=1
-            """
-            params = []
-            if task_id is not None and task_id != "":
-                query += " AND task_id = ?"
-                params.append(task_id)
-            if sens_type:
-                query += " AND sens_type = ?"
-                params.append(sens_type)
-            if anonymous_id:
-                query += " AND anonymous_id = ?"
-                params.append(anonymous_id)
+            params: list[Any] = []
+            if document_id:
+                query = """
+                    SELECT DISTINCT m.fingerprint, m.anonymous_id, m.display_alias, m.sens_type,
+                           m.task_id, m.first_seen_at, m.last_seen_at
+                    FROM entity_global_map m
+                    JOIN redaction_items ri ON ri.map_ref = m.fingerprint
+                    JOIN document_versions dv ON dv.id = ri.document_version_id
+                    WHERE dv.document_id = ?
+                """
+                params.append(document_id)
+                if task_id:
+                    query += " AND m.task_id = ?"
+                    params.append(task_id)
+                if sens_type:
+                    query += " AND m.sens_type = ?"
+                    params.append(sens_type)
+                if anonymous_id:
+                    query += " AND m.anonymous_id = ?"
+                    params.append(anonymous_id)
+                order_col = "m.last_seen_at"
+            else:
+                query = """
+                    SELECT fingerprint, anonymous_id, display_alias, sens_type, task_id, first_seen_at, last_seen_at
+                    FROM entity_global_map
+                    WHERE 1=1
+                """
+                if task_id:
+                    query += " AND task_id = ?"
+                    params.append(task_id)
+                if sens_type:
+                    query += " AND sens_type = ?"
+                    params.append(sens_type)
+                if anonymous_id:
+                    query += " AND anonymous_id = ?"
+                    params.append(anonymous_id)
+                order_col = "last_seen_at"
 
             count_query = f"SELECT COUNT(*) as total FROM ({query})"
             total_row = conn.execute(count_query, params).fetchone()
             total = total_row[0] if total_row else 0
 
-            query += " ORDER BY last_seen_at DESC LIMIT ? OFFSET ?"
+            query += f" ORDER BY {order_col} DESC LIMIT ? OFFSET ?"
             params.extend([limit, offset])
             rows = conn.execute(query, params).fetchall()
             items = [dict(row) for row in rows]
 
             for item in items:
                 fingerprint = item["fingerprint"]
-                redact_row = conn.execute(
-                    """
-                    SELECT document_version_id, chunk_id, start_offset, end_offset
-                    FROM redaction_items
-                    WHERE map_ref = ?
-                    LIMIT 1
-                    """,
-                    (fingerprint,)
-                ).fetchone()
+                if document_id:
+                    redact_row = conn.execute(
+                        """
+                        SELECT ri.document_version_id, ri.chunk_id, ri.start_offset, ri.end_offset
+                        FROM redaction_items ri
+                        JOIN document_versions dv ON dv.id = ri.document_version_id
+                        WHERE ri.map_ref = ? AND dv.document_id = ?
+                        LIMIT 1
+                        """,
+                        (fingerprint, document_id),
+                    ).fetchone()
+                else:
+                    redact_row = conn.execute(
+                        """
+                        SELECT document_version_id, chunk_id, start_offset, end_offset
+                        FROM redaction_items
+                        WHERE map_ref = ?
+                        LIMIT 1
+                        """,
+                        (fingerprint,),
+                    ).fetchone()
                 if redact_row:
                     chunk_row = conn.execute(
                         "SELECT text_raw FROM document_chunks WHERE id = ?",
@@ -906,6 +941,7 @@ class GlobalEntityMapper:
                 "total": total,
                 "limit": limit,
                 "offset": offset,
+                "document_id": document_id or "",
                 "items": items
             }
         finally:

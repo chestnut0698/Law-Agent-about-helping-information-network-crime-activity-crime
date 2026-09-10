@@ -608,6 +608,13 @@ body,
 
 .wb-case-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
 
+.wb-field input::placeholder,
+.wb-field textarea::placeholder,
+.wb-case-row input::placeholder {
+    color: var(--text-muted);
+    opacity: 1;
+}
+
 .wb-case-row { display: flex; gap: 8px; align-items: center; }
 .wb-case-row input { flex: 1; }
 
@@ -1184,12 +1191,23 @@ body,
 }
 .wb-cite-nav {
     display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
+    flex-direction: column;
+    gap: 10px;
     margin-top: 14px;
     padding-top: 12px;
     border-top: 1px solid var(--border-color);
+}
+.wb-cite-nav-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+.wb-cite-nav-row-full {
+    justify-content: center;
+}
+.wb-cite-fullscreen-btn {
+    width: 100%;
 }
 .wb-cite-nav-count {
     flex: 1;
@@ -1854,6 +1872,11 @@ body,
 }
 .wb-cite-body.md-content {
     white-space: normal;
+    max-height: min(70vh, 640px);
+    overflow-y: auto;
+}
+.wb-cite-body.wb-doc-preview.md-content {
+    max-height: min(70vh, 720px);
 }
 .wb-cite-body.md-content table {
     width: 100%;

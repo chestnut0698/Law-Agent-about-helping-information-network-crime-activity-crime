@@ -62,15 +62,17 @@ async def list_mappings(
     task_id: str | None = None,
     sens_type: str | None = None,
     anonymous_id: str | None = None,
+    document_id: str | None = None,
     limit: int = 100,
     offset: int = 0
 ):
-    """列出脱敏映射。"""
+    """列出脱敏映射；传 document_id 时仅返回该材料出现过的映射。"""
     mapper = get_global_mapper()
     return mapper.list_mappings(
         task_id=task_id,
         sens_type=sens_type,
         anonymous_id=anonymous_id,
+        document_id=document_id,
         limit=limit,
         offset=offset
     )
@@ -239,6 +241,7 @@ async def preview_material(
 
         return JSONResponse(content={
             'ok': True,
+            'mode': 'browse',
             'document_id': document_id,
             'filename': filename,
             'text': structured,
@@ -394,6 +397,57 @@ async def update_task_scope(task_id: str, payload: dict):
         )
     except TaskError as exc:
         return task_error_response(exc)
+
+
+@app.post("/api/tasks/{task_id}/cases")
+async def add_task_case(
+    task_id: str,
+    name: str = Form(...),
+    files: list[UploadFile] = File(default=[]),
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    """向分析任务追加案件，并可同请求上传材料（与新建任务同库同路径）。"""
+    tasks = get_task_service()
+    materials = get_material_service()
+    actor = x_user_id or "system"
+    try:
+        created = tasks.add_case_to_task(task_id, name=name, user_id=actor)
+        case_id = (created.get("case") or {}).get("case_id")
+        upload_results = []
+        file_list = files or []
+        if case_id and file_list:
+            for item in file_list:
+                if not item or not (item.filename or "").strip():
+                    continue
+                upload = materials.upload_one(
+                    case_id=case_id,
+                    filename=item.filename or "unnamed.bin",
+                    content=await item.read(),
+                    user_id=actor,
+                )
+                upload_results.append(
+                    tasks.record_material(
+                        task_id=task_id,
+                        case_id=case_id,
+                        upload_result=upload,
+                        user_id=actor,
+                    )
+                )
+            if upload_results:
+                try:
+                    tasks.refresh_material_batch(task_id, user_id=actor)
+                except Exception:
+                    pass
+        return {
+            **created,
+            "task": tasks.get_task(task_id),
+            "results": upload_results,
+            "uploaded": len(upload_results),
+        }
+    except TaskError as exc:
+        return task_error_response(exc)
+    except MaterialError as exc:
+        return material_error_response(exc)
 
 
 @app.post("/api/tasks/{task_id}/plan/confirm")

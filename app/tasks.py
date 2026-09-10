@@ -351,6 +351,71 @@ class TaskService:
         )
         return {"task": self.get_task(task_id), "scope_artifact_id": scope["id"]}
 
+    def add_case_to_task(
+        self,
+        task_id: str,
+        *,
+        name: str,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """向已有任务追加案件：与 create_task 相同的 cases/材料存储路径。"""
+        display = (name or "").strip()
+        if not display:
+            raise TaskError(TASK_ERROR_CODES["INVALID_SCOPE"], "案件名称必填")
+        task = self.get_task(task_id)
+        if task.get("status") == "CLOSED":
+            raise TaskError(TASK_ERROR_CODES["STATE_CONFLICT"], "任务已关闭，不能再添加案件")
+        for item in task.get("cases") or []:
+            existing = (item.get("display_name") or item.get("name") or "").strip()
+            if existing == display:
+                raise TaskError(
+                    TASK_ERROR_CODES["INVALID_SCOPE"],
+                    "该案件已在本任务范围内",
+                    {"case_id": item.get("case_id")},
+                )
+
+        now = utc_now()
+        with db_session(self.db_path) as conn:
+            case_id = ensure_demo_case(conn, new_id())
+            _insert(
+                conn,
+                "task_cases",
+                {
+                    "id": new_id(),
+                    "task_id": task_id,
+                    "case_id": case_id,
+                    "display_name": display,
+                    "auth_status": "AUTHORIZED",
+                    "created_at": now,
+                },
+            )
+            _update(
+                conn,
+                "supervision_tasks",
+                task_id,
+                {"updated_at": now},
+            )
+
+        self.write_artifact(
+            task_id=task_id,
+            type="TASK_SCOPE",
+            title="案件范围与监督目的",
+            ref_key="scope",
+            status="VALID",
+            payload=self._scope_payload(task_id),
+        )
+        task = self.get_task(task_id)
+        case = next((c for c in task.get("cases") or [] if c.get("case_id") == case_id), None)
+        return {
+            "task": task,
+            "case": case
+            or {
+                "case_id": case_id,
+                "display_name": display,
+                "auth_status": "AUTHORIZED",
+            },
+        }
+
     def delete_task(self, task_id: str) -> dict:
         with db_session() as conn:
             docs = _rows(conn, """
