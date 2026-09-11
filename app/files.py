@@ -13,6 +13,7 @@ import mimetypes
 import re
 import sqlite3
 import uuid
+import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 import contextvars
 from dataclasses import dataclass, field
@@ -54,7 +55,9 @@ CONFIDENCE_THRESHOLD = {
     "ip": 0.9,
 }
 
-ALLOWED_MATERIAL_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".docx", ".xlsx", ".xls", ".txt"}
+ALLOWED_MATERIAL_EXTENSIONS = {
+    ".pdf", ".png", ".jpg", ".jpeg", ".docx", ".xlsx", ".xls", ".txt", ".xml"
+}
 
 # 材料类型：当前用文件名启发式；后续可由 Agent 覆写 quality_summary.material_type
 _MATERIAL_TYPE_RULES: list[tuple[str, tuple[str, ...]]] = [
@@ -82,6 +85,8 @@ def infer_material_type(filename: str) -> str:
         return "勘验照片"
     if ext in {".xlsx", ".xls"}:
         return "表格材料"
+    if ext == ".xml":
+        return "结构化材料"
     if ext == ".pdf":
         return "书证材料"
     if ext == ".docx":
@@ -90,7 +95,7 @@ def infer_material_type(filename: str) -> str:
 CHUNK_OVERLAP = 120
 CHUNK_SIZE = 1000
 MATERIAL_AUTH_MODE = "allow_all"
-MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 OCR_TEXT_DENSITY_THRESHOLD = 0.08
 OCR_LOW_CONFIDENCE_THRESHOLD = 0.75
 OCR_MAX_PAGE_RETRIES = 2
@@ -1744,7 +1749,8 @@ def merge_person_spans(text: str, person_results: list) -> list:
     MERGE_SEPARATORS = set("，,、；;。.！!？?：:\"\"''（）()【】[]《》<>／/\\\t\n\r ")
     MERGE_STOP_WORDS = {"的", "和", "与", "及", "或", "以及", "及其", "暨"}
     VERB_PREFIXES = set("受被让给为由将把向对与同跟从在到予以用拿借凭靠沿顺朝往冲离除比")
-    VERB_SUFFIXES = ["说", "道", "讲", "问", "答"]
+    VERB_SUFFIXES = ["说", "道", "讲", "问", "答", "看", "带", "收", "买", "卖", "叫", "询", "领"]
+    NICK_SUFFIXES = "哥姐叔总嫂爷"
     # 与 entities 人名右边界一致：法律词不可并入姓名
     LEGAL_RIGHT_TOKENS = (
         "明知", "应知", "得知", "涉嫌", "供认", "供述", "陈述", "辩称", "表示", "承认", "否认",
@@ -1815,6 +1821,13 @@ def merge_person_spans(text: str, person_results: list) -> list:
         name = text[r.start:r.end]
         while len(name) >= 2 and name[-1] in VERB_SUFFIXES:
             name = name[:-1]
+        for i, ch in enumerate(name[:-1]):
+            if ch in NICK_SUFFIXES and (
+                (i == 1 and "\u4e00" <= name[0] <= "\u9fff")
+                or (i == 2)
+            ):
+                name = name[: i + 1]
+                break
         if name != text[r.start:r.end]:
             r = RecognizerResult(
                 entity_type="PERSON",
@@ -1882,8 +1895,8 @@ def redact_text(
     person_results = [r for r in results if r.entity_type == "PERSON"]
     other_results = [r for r in results if r.entity_type != "PERSON"]
 
-    # 与抽取链路统一：先补残缺人名跨度，再邻接合并
-    from tools.entities import _extend_person_span
+    # 与抽取链路统一：先补残缺人名跨度，再邻接合并，最后裁称呼后的动词
+    from tools.entities import _clamp_person_span, _extend_person_span
 
     extended_persons = []
     for r in person_results:
@@ -1900,6 +1913,18 @@ def redact_text(
 
     person_results.sort(key=lambda r: (r.start, r.end))
     person_results = merge_person_spans(text, person_results)
+    clamped_persons = []
+    for r in person_results:
+        ns, ne = _clamp_person_span(text, r.start, r.end)
+        if ne - ns < 2:
+            continue
+        if ns == r.start and ne == r.end:
+            clamped_persons.append(r)
+        else:
+            clamped_persons.append(
+                RecognizerResult(entity_type="PERSON", start=ns, end=ne, score=r.score)
+            )
+    person_results = clamped_persons
     filtered_person_results = []
     for r in person_results:
         name = text[r.start:r.end]
@@ -2295,6 +2320,128 @@ def _extract_xlsx(path: Path) -> list[PageResult]:
     return [PageResult(1, "xlsx", "\n\n".join(parts), text_density=1.0)]
 
 
+def _xml_local_name(tag: str) -> str:
+    if not tag:
+        return ""
+    if "}" in tag:
+        return tag.rsplit("}", 1)[-1]
+    return tag
+
+
+def _xml_element_text(elem: ET.Element) -> str:
+    return " ".join(part.strip() for part in elem.itertext() if part and str(part).strip())
+
+
+def _xml_try_table(elem: ET.Element) -> list[str] | None:
+    children = [child for child in list(elem) if isinstance(child.tag, str)]
+    if len(children) < 2:
+        return None
+    names = [_xml_local_name(child.tag) for child in children]
+    if len(set(names)) != 1:
+        return None
+    records: list[list[tuple[str, str]]] = []
+    for child in children:
+        leaves = [sub for sub in list(child) if isinstance(sub.tag, str)]
+        if not leaves:
+            text = _xml_element_text(child)
+            if text:
+                records.append([(names[0], text)])
+            continue
+        records.append([(_xml_local_name(sub.tag), _xml_element_text(sub)) for sub in leaves])
+    if len(records) < 2:
+        return None
+    unique_ok = all(len({key for key, _ in row}) == len(row) for row in records if row)
+    if unique_ok:
+        headers: list[str] = []
+        for row in records:
+            for key, _ in row:
+                if key not in headers:
+                    headers.append(key)
+        if not headers:
+            return None
+        lines = [
+            "| " + " | ".join(headers) + " |",
+            "| " + " | ".join("---" for _ in headers) + " |",
+        ]
+        for row in records:
+            mapping = {key: value for key, value in row}
+            lines.append("| " + " | ".join(mapping.get(header, "") for header in headers) + " |")
+        return lines
+    width = max((len(row) for row in records), default=0)
+    if width < 1:
+        return None
+    lines = []
+    for row in records:
+        values = [value for _, value in row] + [""] * (width - len(row))
+        lines.append("| " + " | ".join(values) + " |")
+    return lines
+
+
+def _flatten_xml(elem: ET.Element, lines: list[str], depth: int = 0) -> None:
+    if not isinstance(elem.tag, str):
+        return
+    indent = "  " * min(depth, 8)
+    tag = _xml_local_name(elem.tag)
+    table = _xml_try_table(elem)
+    if table:
+        if tag:
+            lines.append(f"{indent}{tag}")
+        lines.extend((f"{indent}{row}" if indent else row) for row in table)
+        return
+    text = (elem.text or "").strip()
+    children = [child for child in list(elem) if isinstance(child.tag, str)]
+    attr_bits = []
+    for key, value in (elem.attrib or {}).items():
+        val = str(value).strip()
+        if val:
+            attr_bits.append(f"{_xml_local_name(str(key))}={val}")
+    label = tag
+    if attr_bits:
+        label = f"{tag} ({', '.join(attr_bits[:8])})"
+    if text and not children:
+        lines.append(f"{indent}{label}: {text}")
+        return
+    if label:
+        if text:
+            lines.append(f"{indent}{label}: {text}")
+        elif children or attr_bits:
+            lines.append(f"{indent}{label}")
+    for child in children:
+        _flatten_xml(child, lines, depth + 1)
+
+
+def _extract_xml(path: Path) -> list[PageResult]:
+    raw = path.read_bytes()
+    root: ET.Element | None = None
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        decoded = None
+        for enc in ("utf-8-sig", "utf-8", "gb18030", "utf-16"):
+            try:
+                decoded = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        if decoded is None:
+            raise MaterialError(ERROR_CODES["CORRUPT_FILE"], "Cannot decode XML file")
+        try:
+            root = ET.fromstring(decoded)
+        except ET.ParseError as exc:
+            raise MaterialError(ERROR_CODES["CORRUPT_FILE"], f"Cannot parse XML: {exc}") from exc
+    except Exception as exc:
+        raise MaterialError(ERROR_CODES["CORRUPT_FILE"], f"Cannot read XML: {exc}") from exc
+
+    lines: list[str] = []
+    _flatten_xml(root, lines)
+    text = "\n".join(line for line in lines if line and str(line).strip())
+    if not text:
+        text = _xml_element_text(root)
+    if not text.strip():
+        raise MaterialError(ERROR_CODES["CORRUPT_FILE"], "XML has no extractable text")
+    return [PageResult(1, "xml", text, text_density=1.0)]
+
+
 def _extract_image(path: Path) -> list[PageResult]:
     return [
         PageResult(
@@ -2353,6 +2500,7 @@ def parse_file_to_pages(path: Path | str, max_retries: int | None = None) -> lis
         ".docx": _extract_docx,
         ".xlsx": _extract_xlsx,
         ".xls": _extract_xlsx,
+        ".xml": _extract_xml,
         ".txt": _extract_txt,
         ".png": _extract_image,
         ".jpg": _extract_image,

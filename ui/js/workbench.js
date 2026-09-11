@@ -18,6 +18,10 @@
         DELETED: '已删除'
     };
     const ATTENTION = ['NEEDS_OCR_REVIEW', 'OCR_FAILED', 'FAILED', 'DUPLICATE_PENDING'];
+    const MATERIAL_ACCEPT_EXTS = ['.pdf', '.docx', '.xlsx', '.xls', '.xml', '.txt', '.png', '.jpg', '.jpeg'];
+    const MATERIAL_ACCEPT = MATERIAL_ACCEPT_EXTS.join(',');
+    const MATERIAL_ACCEPT_HINT = '支持 PDF / DOCX / XLSX / XML / TXT / PNG / JPEG，单个文件不超过 100MB';
+    const MATERIAL_ACCEPT_SUB = '支持 PDF、Word、Excel、XML、图片与文本，上传后将自动排队处理';
 
     const Workbench = {
         task: null,
@@ -421,7 +425,7 @@
             const fileInput = Utils.create('input', {
                 type: 'file',
                 multiple: 'multiple',
-                accept: '.pdf,.docx,.txt,.png,.jpg,.jpeg'
+                accept: MATERIAL_ACCEPT
             });
             fileInput.style.display = 'none';
             const fileBtn = this._iconBtn('wb-btn wb-btn-ghost', 'paperclip', '挂材料');
@@ -431,7 +435,7 @@
                 fileInput.click();
             });
             fileInput.addEventListener('change', () => {
-                row._files = Array.from(fileInput.files || []);
+                row._files = this._filterMaterialFiles(fileInput.files);
                 fileMeta.textContent = row._files.length
                     ? row._files.map(f => f.name).join('、')
                     : '未选文件';
@@ -2701,6 +2705,28 @@
             return (size / 1024 / 1024).toFixed(1) + ' MB';
         },
 
+        _isAllowedMaterialFile(file) {
+            const name = ((file && file.name) || '').toLowerCase();
+            return MATERIAL_ACCEPT_EXTS.some((ext) => name.endsWith(ext));
+        },
+
+        _filterMaterialFiles(fileList) {
+            const files = Array.from(fileList || []);
+            const allowed = files.filter((f) => this._isAllowedMaterialFile(f));
+            const skipped = files.length - allowed.length;
+            if (skipped > 0) {
+                Toast.warning('已忽略不支持的文件，请上传 PDF / DOCX / XLSX / XML / TXT / 图片');
+            }
+            return allowed;
+        },
+
+        _assignInputFiles(input, files) {
+            const dt = new DataTransfer();
+            files.forEach((f) => dt.items.add(f));
+            input.files = dt.files;
+            return files;
+        },
+
         _uploadBox() {
             // 兼容旧入口：改为打开上传弹窗
             this._openUploadModal();
@@ -2723,7 +2749,7 @@
                     Utils.create('div', { class: 'wb-upload-modal-title', text: '上传案件材料' }),
                     Utils.create('div', {
                         class: 'wb-upload-modal-sub',
-                        text: '支持 PDF、Word、Excel、图片与文本，上传后将自动排队处理'
+                        text: MATERIAL_ACCEPT_SUB
                     })
                 ])
             ]);
@@ -2790,7 +2816,7 @@
             const input = Utils.create('input', {
                 type: 'file',
                 multiple: 'multiple',
-                accept: '.pdf,.docx,.txt,.png,.jpg,.jpeg,.xlsx,.xls',
+                accept: MATERIAL_ACCEPT,
                 class: 'wb-upload-file-input'
             });
             input.hidden = true;
@@ -2803,7 +2829,7 @@
             }));
             dropInner.appendChild(Utils.create('div', {
                 class: 'wb-upload-drop-hint',
-                text: '支持 PDF、DOCX、XLSX、JPG、PNG，单个文件不超过 100MB'
+                text: MATERIAL_ACCEPT_HINT
             }));
             const fileList = Utils.create('div', { class: 'wb-upload-file-list' });
             drop.appendChild(dropInner);
@@ -2826,7 +2852,10 @@
                 });
             };
             drop.addEventListener('click', () => input.click());
-            input.addEventListener('change', syncFileList);
+            input.addEventListener('change', () => {
+                this._assignInputFiles(input, this._filterMaterialFiles(input.files));
+                syncFileList();
+            });
             drop.addEventListener('dragover', (e) => {
                 e.preventDefault();
                 drop.classList.add('dragover');
@@ -2836,9 +2865,7 @@
                 e.preventDefault();
                 drop.classList.remove('dragover');
                 if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
-                    const dt = new DataTransfer();
-                    Array.from(e.dataTransfer.files).forEach((f) => dt.items.add(f));
-                    input.files = dt.files;
+                    this._assignInputFiles(input, this._filterMaterialFiles(e.dataTransfer.files));
                     syncFileList();
                 }
             });
@@ -2903,7 +2930,7 @@
                 try {
                     const fd = new FormData();
                     fd.append('name', name);
-                    const files = input.files ? Array.from(input.files) : [];
+                    const files = this._filterMaterialFiles(input.files);
                     files.forEach((f) => fd.append('files', f));
                     const resp = await fetch(`/api/tasks/${this.task.id}/cases`, {
                         method: 'POST',
@@ -2943,14 +2970,15 @@
         },
 
         async _uploadMaterials(caseId, files, btn) {
-            if (!files || !files.length) {
+            const allowed = this._filterMaterialFiles(files);
+            if (!allowed.length) {
                 Toast.warning('请先选择材料文件');
                 return false;
             }
             Toast.info('正在上传文件，请稍候…');
             const form = new FormData();
             form.append('case_id', caseId);
-            Array.from(files).forEach(f => form.append('files', f));
+            allowed.forEach(f => form.append('files', f));
 
             const taskId = (this.task && this.task.id) || this.draftTaskId;
             if (!taskId) {
@@ -2980,7 +3008,7 @@
                     delete this.artifactCache[batch.id];
                     if (!Utils.$('#wb-workspace').hidden && this.currentView !== 'materials') {
                         await this.openArtifact(batch.id);
-                        this._postArtifactCard(batch.id, '材料接入与质量', `已接收 ${files.length} 份材料，可在此查看逐份处理进度。`);
+                        this._postArtifactCard(batch.id, '材料接入与质量', `已接收 ${allowed.length} 份材料，可在此查看逐份处理进度。`);
                     }
                 }
                 Toast.success('材料已接入，正在处理');
@@ -3547,7 +3575,7 @@
             let data = await this._fetchArtifact(art.id);
             const ver = (((data || {}).payload || {}).summary || {}).extractor_version || '';
             // 旧产物用过时抽取器时自动重跑，否则页面会一直显示噪声人名
-            if (!this._entityRefreshTried && this.task && this.task.id && ver !== 'stage9-quote-v1') {
+            if (!this._entityRefreshTried && this.task && this.task.id && ver !== 'stage10-nick-span-v1') {
                 try {
                     Toast.info('实体识别规则已升级，正在重新抽取比对…');
                     const resp = await fetch(`/api/tasks/${this.task.id}/collision/run`, { method: 'POST' });
@@ -3567,7 +3595,7 @@
                 } catch (e) {
                     Toast.warning('自动重抽未完成，仍显示旧结果：' + (e.message || ''));
                 }
-            } else if (ver === 'stage9-quote-v1') {
+            } else if (ver === 'stage10-nick-span-v1') {
                 this._entityRefreshTried = true;
             }
             return data;

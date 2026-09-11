@@ -32,7 +32,7 @@ def svc(tmp_path, monkeypatch):
     init_db(db)
     storage = tmp_path / "storage"
     storage.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr("tools.files.MATERIAL_STORAGE_DIR", storage)
+    monkeypatch.setattr("app.files.MATERIAL_STORAGE_DIR", storage)
 
     service = MaterialService(
         db_path=db,
@@ -113,7 +113,7 @@ def test_corrupt_and_too_large_stable_errors(svc, tmp_path, monkeypatch):
         ERROR_CODES["ENCRYPTED_FILE"],
     }
 
-    monkeypatch.setattr("tools.files.MAX_UPLOAD_BYTES", 100)
+    monkeypatch.setattr("app.files.MAX_UPLOAD_BYTES", 100)
     big = tmp_path / "big.txt"
     big.write_bytes(b"x" * 200)
     with pytest.raises(MaterialError) as ej:

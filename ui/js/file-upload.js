@@ -87,7 +87,7 @@
             const icons = {
                 pdf: '📕', doc: '📘', docx: '📘', xls: '📗', xlsx: '📗',
                 png: '🖼️', jpg: '🖼️', jpeg: '🖼️', gif: '🖼️', webp: '🖼️',
-                txt: '📄', md: '📄', json: '📄', csv: '📊',
+                txt: '📄', md: '📄', json: '📄', xml: '📄', csv: '📊',
                 py: '🐍', js: '📜', html: '🌐', css: '🎨'
             };
             return icons[ext] || '📎';

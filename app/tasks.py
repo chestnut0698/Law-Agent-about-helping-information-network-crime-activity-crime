@@ -2349,6 +2349,7 @@ class TaskService:
             collect_rule_hits,
             collect_weak_platform_hints,
             collect_within_case_consistency,
+            collect_nick_relation_hints,
         )
 
         task = self.get_task(task_id)
@@ -2385,6 +2386,11 @@ class TaskService:
         )
         hints.extend(platform_hints)
 
+        nick_hints = collect_nick_relation_hints(
+            task_id, task["cases"], db_path=self.db_path
+        )
+        hints.extend(nick_hints)
+
         consistency = collect_within_case_consistency(task_id, db_path=self.db_path)
         return {
             "ok": True,
@@ -2392,8 +2398,10 @@ class TaskService:
             "hints": hints[:40],
             "within_case_consistency": consistency,
             "message": (
-                "以上含跨案提示与弱平台共现；若有案內多卡同号，请在实体复核或材料核对中处理，"
-                "不要写成跨案关联线索。上下游路径由多张已确认线索在报告与图谱中合成。"
+                "以上含跨案标识、外号/代称与弱平台共现提示。"
+                "外号上线、外号与代称是否同指，应单独写成待核线索；"
+                "仅某一案出现的共同参与人可写一条核验「勿挂到其他案」。"
+                "案內多卡同号请在实体复核或材料核对中处理，不要写成跨案关联。"
             ),
         }
 

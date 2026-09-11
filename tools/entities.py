@@ -34,7 +34,7 @@ from tools.timeline_subjects import (  # noqa: F401 — 兼容旧导入路径
     timeline_event_sort_key,
 )
 
-EXTRACTOR_VERSION = "stage9-quote-v1"
+EXTRACTOR_VERSION = "stage10-nick-span-v1"
 EVENT_EXTRACTOR_VERSION = "stage7-role-subject-v1"
 STRONG_TYPES = ("PHONE", "ACCOUNT", "DEVICE", "ID_CARD", "NAME", "ORGANIZATION", "MERCHANT", "IP")
 RULE_TYPE_MAP = {
@@ -639,11 +639,14 @@ _COMMON_SURNAMES = frozenset(
 _COMPOUND_SURNAME_SET = frozenset(_COMPOUND_SURNAMES)
 
 
-# 人名右侧停字（虚词/动词），避免「侯博元于/曾」被并入
+# 人名右侧停字（虚词/动词），避免「侯博元于/曾」「宋哥看/带」被并入
 _PERSON_RIGHT_STOP = frozenset(
     "于在向对把将从与和及的了着过来说道讲问答称供辩述到案犯所部庭级记诉判书曾又再则即并或而由用拿借凭"
     "等们其之号省市县区院所室年月日時分人员款币条项次籍贯族去来回进出做找给让"
+    "看带收买卖叫询领跟帮另"
 )
+# 称呼类人名后缀：已形成「姓+哥/姐」后不得再向右吞动词
+_NICK_SUFFIX = ("哥", "姐", "叔", "总", "嫂", "爷")
 # 「赵瑞/明知」「赵某陈述」类：法律常用词不可吞进姓名（多字优先匹配）
 _LEGAL_PERSON_RIGHT_TOKENS = (
     "明知",
@@ -681,8 +684,29 @@ def _legal_token_at(source: str, pos: int) -> str | None:
     return None
 
 
+def _is_nick_surface(text: str) -> bool:
+    raw = (text or "").strip()
+    return 2 <= len(raw) <= 4 and any(raw.endswith(s) for s in _NICK_SUFFIX)
+
+
+def _nick_core_end(source: str, start: int, end: int) -> int | None:
+    """称呼被右侧实词吞入时，返回应裁到的结束位置（宋哥看 → 宋哥）。"""
+    if start < 0 or end <= start + 1 or end > len(source):
+        return None
+    text = source[start:end]
+    for i, ch in enumerate(text[:-1]):
+        if ch not in _NICK_SUFFIX:
+            continue
+        prefix = text[:i]
+        if i == 1 and prefix and prefix[0] in _COMMON_SURNAMES:
+            return start + i + 1
+        if i == 2 and prefix in _COMPOUND_SURNAME_SET:
+            return start + i + 1
+    return None
+
+
 def _clamp_person_span(source: str, start: int, end: int) -> tuple[int, int]:
-    """裁掉斜线右侧与法律词重叠：赵瑞/明知、赵瑞明知 → 赵瑞。"""
+    """裁掉斜线右侧、法律词以及称呼后的动词：赵瑞/明知、宋哥看 → 赵瑞、宋哥。"""
     if start < 0 or end <= start or end > len(source):
         return start, end
     for i in range(start, end):
@@ -702,6 +726,9 @@ def _clamp_person_span(source: str, start: int, end: int) -> tuple[int, int]:
                 break
         if end <= start:
             return start, start
+    nick_end = _nick_core_end(source, start, end)
+    if nick_end is not None:
+        end = nick_end
     while end > start and source[end - 1] in _PERSON_INLINE_SEPS:
         end -= 1
     return start, end
@@ -732,10 +759,19 @@ def _extend_person_span(source: str, start: int, end: int) -> tuple[int, int]:
     bare_single = len(span) == 1 and span in _COMMON_SURNAMES
     bare_compound = len(span) == 2 and span in _COMPOUND_SURNAME_SET
     if bare_single or bare_compound:
-        # 单姓最多 3 字、复姓最多 4 字；遇右侧停字/法律词立即停
+        # 单姓最多 3 字、复姓最多 4 字；遇右侧停字/法律词/称呼后缀立即停
         max_len = 4 if bare_compound else 3
         while end < len(source) and (end - start) < max_len and _can_take_right(end):
             end += 1
+            if _is_nick_surface(source[start:end]):
+                break
+        return _clamp_person_span(source, start, end)
+
+    # 已是「姓+哥/姐」等称呼，禁止再吞「看/带/询」
+    if _is_nick_surface(span):
+        return _clamp_person_span(source, start, end)
+    # 「X某/X某某」已是完整代称，禁止再吞「另案处理」等
+    if span.endswith("某"):
         return _clamp_person_span(source, start, end)
 
     # 「博元」←「侯」：仅当左侧一字是单姓，且再左侧不是姓名续写
@@ -785,6 +821,9 @@ def _person_surface_ok(raw: str, exclusions: dict[str, Any]) -> bool:
     if not re.fullmatch(r"[\u4e00-\u9fff·]{2,4}", raw or ""):
         return False
     if is_excluded("NAME", raw, exclusions):
+        return False
+    # 称呼后仍带实词（宋哥看）视为误切，不入库
+    if _nick_core_end(raw, 0, len(raw)) is not None:
         return False
     if raw[-1] in _BAD_PERSON_SUFFIX:
         return False
@@ -2484,9 +2523,8 @@ def _enrich_candidate_for_review(
     }
 
 
-# ---------- 疑似同一人（别名表 + 同案称呼簇） ----------
+# ---------- 疑似同一人（别名表 + 外号/代称簇） ----------
 
-_NICK_SUFFIX = ("哥", "姐", "叔", "总", "嫂", "爷")
 _ALIAS_TABLE_NAME_HINT = ("别名", "化名", "实体别名")
 
 
@@ -2633,11 +2671,11 @@ def _load_alias_seeds_from_materials(
     return seeds
 
 
-def _cluster_same_case_name_variants(
+def _cluster_nick_anon_variants(
     mentions: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """同案同姓：外号 / X某 / 全名 → 疑似簇。"""
-    by_case: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    """同姓外号与「X某」成疑似簇，可跨案；不含全名，避免把无关同姓卷进来。"""
+    by_surname: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for m in mentions:
         if m.get("object_type") != "NAME":
             continue
@@ -2649,40 +2687,35 @@ def _cluster_same_case_name_variants(
         if (info or {}).get("kind") == "placeholder":
             continue
         surface = (m.get("surface_raw") or m.get("normalized_value") or "").strip()
-        if not surface or _person_variant_kind(surface) == "other":
+        kind = _person_variant_kind(surface)
+        if kind not in {"nick", "anon"}:
             continue
-        by_case[m["case_id"]].append(m)
+        surname = _person_surname(surface)
+        if surname:
+            by_surname[surname].append(m)
 
     clusters: list[dict[str, Any]] = []
-    for case_id, items in by_case.items():
-        by_surname: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for item in items:
-            surface = (item.get("surface_raw") or item.get("normalized_value") or "").strip()
-            surname = _person_surname(surface)
-            if surname:
-                by_surname[surname].append(item)
-        for surname, group in by_surname.items():
-            surfaces = sorted(
-                {
-                    (item.get("normalized_value") or item.get("surface_raw") or "").strip()
-                    for item in group
-                    if (item.get("normalized_value") or item.get("surface_raw") or "").strip()
-                }
-            )
-            if len(surfaces) < 2:
-                continue
-            kinds = {_person_variant_kind(s) for s in surfaces}
-            # 必须有外号（X哥/姐等）才同姓成簇；禁止仅凭「全名+X某」误并（赵瑞≠赵某）
-            if "nick" not in kinds:
-                continue
-            clusters.append(
-                {
-                    "case_id": case_id,
-                    "aliases": surfaces,
-                    "items": group,
-                    "basis": f"同案同姓称呼簇（{surname}）",
-                }
-            )
+    for surname, group in by_surname.items():
+        surfaces = sorted(
+            {
+                (item.get("normalized_value") or item.get("surface_raw") or "").strip()
+                for item in group
+                if (item.get("normalized_value") or item.get("surface_raw") or "").strip()
+            }
+        )
+        if len(surfaces) < 2:
+            continue
+        kinds = {_person_variant_kind(s) for s in surfaces}
+        # 必须有外号才成簇；禁止仅凭「全名+X某」误并（赵瑞≠赵某）；全名不入簇
+        if "nick" not in kinds:
+            continue
+        clusters.append(
+            {
+                "aliases": surfaces,
+                "items": group,
+                "basis": f"同姓外号与代称（{surname}）",
+            }
+        )
     return clusters
 
 
@@ -2723,7 +2756,7 @@ def build_alias_suspect_candidates(
         root = uf.find(aliases[0])
         basis_by_key[root].append(seed.get("basis") or "实体别名表")
 
-    for cluster in _cluster_same_case_name_variants(mentions):
+    for cluster in _cluster_nick_anon_variants(mentions):
         aliases = cluster["aliases"]
         for a in aliases:
             uf.add(a)
@@ -3453,6 +3486,151 @@ def collect_weak_platform_hints(
                 "evidence_count": len(bucket["chunks"]),
                 "suggested_aspect": "PLAT",
                 "note": "证据可能偏弱，宜单独作为「平台共现」待核，勿直接写成犯罪链条",
+            }
+        )
+    return hints[:20]
+
+
+def collect_nick_relation_hints(
+    task_id: str,
+    cases: list[dict[str, Any]],
+    db_path=None,
+) -> list[dict[str, Any]]:
+    """外号跨案、外号与代称、跨案人员的同案共现人。仅作关联提示，不写入线索。"""
+    init_entity_db(db_path)
+    case_name = {
+        c.get("case_id"): (c.get("display_name") or c.get("name") or c.get("case_id"))
+        for c in cases
+        if c.get("case_id")
+    }
+    with db_session(db_path) as conn:
+        rows = _rows(
+            conn,
+            """
+            SELECT case_id, surface_raw, normalized_value, chunk_id, mask_info_json
+            FROM entity_mentions
+            WHERE task_id = ? AND object_type = 'NAME'
+            """,
+            (task_id,),
+        )
+    usable: list[dict[str, Any]] = []
+    for row in rows:
+        info = row.get("mask_info_json")
+        if isinstance(info, str):
+            info = json.loads(info or "{}")
+        if (info or {}).get("kind") == "placeholder":
+            continue
+        surface = (row.get("surface_raw") or row.get("normalized_value") or "").strip()
+        kind = _person_variant_kind(surface)
+        if kind not in {"nick", "anon", "full"}:
+            continue
+        usable.append(
+            {
+                "case_id": row.get("case_id"),
+                "surface": surface,
+                "kind": kind,
+                "chunk_id": row.get("chunk_id"),
+            }
+        )
+    if not usable:
+        return []
+
+    by_surface: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for item in usable:
+        by_surface[item["surface"]].append(item)
+
+    hints: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for surface, items in by_surface.items():
+        if _person_variant_kind(surface) != "nick":
+            continue
+        cids = {i.get("case_id") for i in items if i.get("case_id")}
+        if len(cids) < 2:
+            continue
+        key = "nick:" + surface
+        if key in seen:
+            continue
+        seen.add(key)
+        hints.append(
+            {
+                "kind": "cross_case_nick",
+                "label": f"外号「{surface}」在多起案件中出现，是否同一上线/组织者待核",
+                "surface": surface,
+                "cases": [case_name.get(cid, cid) for cid in sorted(cids)],
+                "suggested_aspect": "ID",
+                "note": "仅外号记载，缺少证件等强标识；应单独写成待核线索，不要并进其他人员的线索卡",
+            }
+        )
+
+    by_surname: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for item in usable:
+        if item["kind"] in {"nick", "anon"}:
+            surname = _person_surname(item["surface"])
+            if surname:
+                by_surname[surname].append(item)
+    linked_aliases: set[str] = set()
+    for surname, group in by_surname.items():
+        surfaces = sorted({i["surface"] for i in group})
+        kinds = {_person_variant_kind(s) for s in surfaces}
+        if "nick" not in kinds or "anon" not in kinds or len(surfaces) < 2:
+            continue
+        key = "nickanon:" + "|".join(surfaces)
+        if key in seen:
+            continue
+        seen.add(key)
+        linked_aliases.update(surfaces)
+        cids = {i.get("case_id") for i in group if i.get("case_id")}
+        hints.append(
+            {
+                "kind": "nick_anon",
+                "label": f"外号与代称可能同指：{' / '.join(surfaces[:4])}",
+                "aliases": surfaces,
+                "cases": [case_name.get(cid, cid) for cid in sorted(cids)],
+                "suggested_aspect": "ID",
+                "note": "系统不自动认定同一人；写入待核线索并到实体复核核对",
+            }
+        )
+
+    cross_surfaces = {
+        surface
+        for surface, items in by_surface.items()
+        if len({i.get("case_id") for i in items if i.get("case_id")}) >= 2
+    }
+    surface_cases: dict[str, set[str]] = defaultdict(set)
+    chunk_has_cross: set[str] = set()
+    for item in usable:
+        cid = item.get("case_id")
+        if cid:
+            surface_cases[item["surface"]].add(cid)
+        if item["surface"] in cross_surfaces and item.get("chunk_id"):
+            chunk_has_cross.add(item["chunk_id"])
+
+    companion_hits: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for item in usable:
+        surface = item["surface"]
+        cid = item.get("case_id")
+        if not cid or surface in cross_surfaces or surface in linked_aliases:
+            continue
+        if len(surface_cases.get(surface) or ()) != 1:
+            continue
+        if item.get("chunk_id") not in chunk_has_cross:
+            continue
+        companion_hits[cid][surface] += 1
+
+    for cid, counts in companion_hits.items():
+        ordered = sorted(counts, key=lambda n: (-counts[n], n))[:8]
+        if not ordered:
+            continue
+        hints.append(
+            {
+                "kind": "case_internal_coparty",
+                "label": f"{case_name.get(cid, cid)}中与跨案人员共同出现、其他案未见的人员",
+                "names": ordered,
+                "cases": [case_name.get(cid, cid)],
+                "suggested_aspect": "ROLE",
+                "scope": "case_internal",
+                "note": "可写一条线索核验这些人员是否仅该案参与，勿关联到其他案件",
             }
         )
     return hints[:20]
