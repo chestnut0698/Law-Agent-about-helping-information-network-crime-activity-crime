@@ -16,7 +16,7 @@
 | 浏览器 | 现代 Chromium / Firefox / Edge 即可 |
 | 模型 API | 配置 **DeepSeek** |
 
-可选：安装 [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) 以启用更强 OCR；未安装时会走内置 Fallback 引擎，不影响启动。
+可选：安装 [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) 作为离线识字兜底。默认用 DeepSeek 多模态识别 PNG/JPG 以及扫描件 PDF 中的文字，**不必先装 Paddle**。关闭 `DEEPSEEK_EXTERNAL_CALLS_ENABLED` 或未配置密钥时，才会尝试 Paddle，再退回内置 Fallback。
 
 ---
 
@@ -31,7 +31,7 @@
 - **公网检索**：`baidusearch`、`requests`
 - **测试**：`pytest`
 
-OCR 重依赖默认注释掉，需要时自行取消注释安装：
+OCR 重依赖默认注释掉，仅在需要离线兜底时取消注释安装：
 
 ```text
 # paddleocr>=2.7.0

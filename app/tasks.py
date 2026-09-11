@@ -17,6 +17,7 @@ from pathlib import Path
 from app.config import MATERIAL_STORAGE_DIR, REDACTION_STORAGE_DIR
 
 from app.files import (
+    PARSER_VERSION,
     MaterialError,
     MaterialService,
     _insert,
@@ -999,8 +1000,10 @@ class TaskService:
         detail = self.get_artifact(task_id, current["id"])
         payload = detail["payload"]
         found = None
+        previous = "PENDING"
         for candidate in payload.get("candidates", []):
             if candidate.get("candidate_id") == candidate_id:
+                previous = str(candidate.get("decision") or "PENDING")
                 candidate["decision"] = decision
                 candidate["reason"] = reason.strip()
                 candidate["correction"] = correction
@@ -1010,16 +1013,21 @@ class TaskService:
         if not found:
             raise TaskError(TASK_ERROR_CODES["ARTIFACT_NOT_FOUND"], "待核对象不存在")
 
-        if decision == "KEEP_SEPARATE" and found.get("fingerprint"):
+        fingerprint = str(found.get("fingerprint") or "").strip()
+        if decision == "KEEP_SEPARATE" and fingerprint:
             from tools.entities import remember_rejection
 
             remember_rejection(
                 task_id,
-                found["fingerprint"],
+                fingerprint,
                 decision,
                 reason.strip(),
                 db_path=self.db_path,
             )
+        elif previous == "KEEP_SEPARATE" and decision != "KEEP_SEPARATE" and fingerprint:
+            from tools.entities import forget_rejection
+
+            forget_rejection(task_id, fingerprint, db_path=self.db_path)
 
         if decision in {"MERGE", "KEEP_SEPARATE"}:
             payload["subject_resolve"] = self._update_subject_resolve(
@@ -1224,6 +1232,8 @@ class TaskService:
         if not found:
             return {"actions": [], "message": "候选不存在"}
 
+        if decision != "MERGE":
+            self._demote_clues_for_candidate(task_id, found, actions)
         if decision == "MERGE":
             # 将关联草稿线索升格为 VALID
             for art in self.get_task(task_id).get("artifacts") or []:
@@ -1281,6 +1291,76 @@ class TaskService:
             },
         )
         return {"actions": actions, "task": self.get_task(task_id)}
+
+    def _demote_clues_for_candidate(
+        self,
+        task_id: str,
+        candidate: dict[str, Any],
+        actions: list[str],
+    ) -> None:
+        """改判为保留独立等后，撤回仅因该实体确认同一而自动升格的线索。"""
+        candidate_id = str(candidate.get("candidate_id") or "").strip()
+        fingerprint = str(candidate.get("fingerprint") or "").strip()
+        if not candidate_id and not fingerprint:
+            return
+        for art in self.get_task(task_id).get("artifacts") or []:
+            if art.get("type") != "CLUE_ITEM" or art.get("status") in {"STALE", "INVALID"}:
+                continue
+            clue_detail = self.get_artifact(task_id, art["id"])
+            payload = dict(clue_detail.get("payload") or {})
+            linked = [
+                str(x).strip()
+                for x in (payload.get("linked_candidate_ids") or [])
+                if str(x).strip()
+            ]
+            fps = [str(x).strip() for x in (payload.get("fingerprints") or []) if str(x).strip()]
+            linked_hit = bool(candidate_id and candidate_id in linked)
+            fp_hit = bool(fingerprint and fingerprint in fps)
+            if not linked_hit and not fp_hit:
+                continue
+            if linked_hit:
+                linked = [item for item in linked if item != candidate_id]
+                payload["linked_candidate_ids"] = linked
+            if payload.get("disposition"):
+                self.write_artifact(
+                    task_id=task_id,
+                    type="CLUE_ITEM",
+                    title=payload.get("title") or art["title"],
+                    ref_key=art.get("ref_key"),
+                    status=art.get("status") or "VALID",
+                    parent_ids=json.loads(art["parent_ids_json"] or "[]"),
+                    payload=payload,
+                )
+                continue
+            if payload.get("promotion") != "confirmed":
+                if linked_hit:
+                    self.write_artifact(
+                        task_id=task_id,
+                        type="CLUE_ITEM",
+                        title=payload.get("title") or art["title"],
+                        ref_key=art.get("ref_key"),
+                        status=art.get("status") or "DRAFT",
+                        parent_ids=json.loads(art["parent_ids_json"] or "[]"),
+                        payload=payload,
+                    )
+                continue
+            if linked:
+                payload["promotion"] = "confirmed"
+                status = "VALID"
+            else:
+                payload.pop("promotion", None)
+                status = "DRAFT"
+            self.write_artifact(
+                task_id=task_id,
+                type="CLUE_ITEM",
+                title=payload.get("title") or art["title"],
+                ref_key=art.get("ref_key"),
+                status=status,
+                parent_ids=json.loads(art["parent_ids_json"] or "[]"),
+                payload=payload,
+            )
+            if status == "DRAFT":
+                actions.append(f"已撤回自动确认：{art.get('title')}")
 
     def _candidate_surfaces(self, candidate: dict[str, Any]) -> list[str]:
         import re
@@ -1343,6 +1423,26 @@ class TaskService:
             object_type = "NAME"
         display_name = (candidate.get("display_name") or (surfaces[0] if surfaces else "")).strip()
         subject_id = candidate.get("candidate_id") or new_id()
+        candidate_id = str(candidate.get("candidate_id") or "").strip()
+        surface_set = set(surfaces)
+
+        if candidate_id:
+            subjects = {
+                key: value
+                for key, value in subjects.items()
+                if str((value or {}).get("candidate_id") or "") != candidate_id
+            }
+        if surface_set:
+            surface_index = {
+                surface: sid
+                for surface, sid in surface_index.items()
+                if surface not in surface_set
+            }
+            keep_separate = [
+                group
+                for group in keep_separate
+                if not (isinstance(group, list) and any(item in surface_set for item in group))
+            ]
 
         if decision == "MERGE" and surfaces:
             subjects[subject_id] = {
@@ -3371,6 +3471,7 @@ class TaskService:
                         "low_confidence_pages": low_pages,
                         "version_count": item.get("version_count"),
                         "version": version_no,
+                        "parser_version": current.get("parser_version") or "",
                         "material_type": material_type,
                         "doc_type": material_type,
                         "uploaded_at": uploaded_at,
@@ -3385,7 +3486,7 @@ class TaskService:
                     "materials": rows,
                 }
             )
-        return {"groups": groups, "totals": totals}
+        return {"groups": groups, "totals": totals, "parser_target": PARSER_VERSION}
 
     def refresh_material_batch(self, task_id: str, user_id: str | None = None) -> dict[str, Any]:
         self._sync_material_doc_artifacts(task_id)

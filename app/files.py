@@ -25,7 +25,14 @@ from presidio_analyzer import AnalyzerEngine
 from presidio_analyzer.nlp_engine import NlpEngineProvider
 from presidio_analyzer import RecognizerResult
 
-from app.config import DATABASE_PATH, MATERIAL_STORAGE_DIR
+from app.config import (
+    API_KEY,
+    BASE_URL,
+    DATABASE_PATH,
+    DEEPSEEK_EXTERNAL_CALLS_ENABLED,
+    MATERIAL_STORAGE_DIR,
+    MODEL_NAME,
+)
 
 _db_connection_ctx = contextvars.ContextVar('_db_connection_ctx', default=None)
 
@@ -99,7 +106,10 @@ MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 OCR_TEXT_DENSITY_THRESHOLD = 0.08
 OCR_LOW_CONFIDENCE_THRESHOLD = 0.75
 OCR_MAX_PAGE_RETRIES = 2
-PARSER_VERSION = "stage4-structure-v1"
+PARSER_VERSION = "stage4-vision-ocr-v1"
+VISION_OCR_MAX_SIDE = 2048
+VISION_OCR_CONFIDENCE = 0.82
+VISION_OCR_EMPTY_MARKERS = ("【无文字】", "[无文字]", "无可见文字")
 
 MATERIAL_STATUSES = {
     "UPLOADED",
@@ -2081,6 +2091,8 @@ class OCREngine(Protocol):
 
 
 class FallbackOCREngine:
+    kind = "fallback"
+
     def recognize(self, image_bytes: bytes) -> list[OCRLine]:
         marker = b"__OCR_TEXT__:"
         if marker in image_bytes:
@@ -2095,6 +2107,8 @@ class FallbackOCREngine:
 
 
 class PaddleOCREngine:
+    kind = "paddle"
+
     def __init__(self):
         from paddleocr import PaddleOCR
         self._ocr = PaddleOCR(use_angle_cls=True, lang="ch", show_log=False)
@@ -2115,7 +2129,64 @@ class PaddleOCREngine:
         return lines
 
 
+class DeepSeekVisionOCREngine:
+    """用已接入的 DeepSeek 多模态只做文字转录，结果仍走分块/脱敏/回链。"""
+
+    kind = "vision"
+    _PROMPT = (
+        "你只做图中可见文字的逐字转录，供卷宗检索使用。\n"
+        "按从上到下、从左到右抄写全部可见印刷体或手写文字。\n"
+        "不要解释画面、不要概括、不要补全看不清的字、不要翻译、不要输出 Markdown。\n"
+        "看不清的字用□，不要猜测。\n"
+        "若图中完全没有文字，只输出：【无文字】"
+    )
+
+    def __init__(self):
+        from openai import OpenAI
+
+        self._client = OpenAI(api_key=API_KEY, base_url=BASE_URL, timeout=90.0)
+        self._model = MODEL_NAME or "deepseek-flash"
+
+    def recognize(self, image_bytes: bytes) -> list[OCRLine]:
+        import base64
+
+        payload, mime = _prepare_vision_image(image_bytes)
+        data_url = f"data:{mime};base64,{base64.b64encode(payload).decode('ascii')}"
+        kwargs = {
+            "model": self._model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": self._PROMPT},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": data_url, "detail": "high"},
+                        },
+                    ],
+                }
+            ],
+            "temperature": 0,
+            "max_tokens": 4096,
+        }
+        try:
+            resp = self._client.chat.completions.create(
+                extra_body={"thinking": {"type": "disabled"}},
+                **kwargs,
+            )
+        except Exception:
+            resp = self._client.chat.completions.create(**kwargs)
+        message = resp.choices[0].message
+        content = (getattr(message, "content", None) or "").strip()
+        if not content:
+            content = str(getattr(message, "reasoning_content", None) or "").strip()
+        return _vision_text_to_lines(content)
+
+
 _ocr_engine: OCREngine | None = None
+_vision_engine: DeepSeekVisionOCREngine | None = None
+_paddle_engine: PaddleOCREngine | None = None
+_paddle_unavailable = False
 
 
 def set_ocr_engine(engine: OCREngine | None) -> None:
@@ -2123,23 +2194,81 @@ def set_ocr_engine(engine: OCREngine | None) -> None:
     _ocr_engine = engine
 
 
+def _prepare_vision_image(image_bytes: bytes) -> tuple[bytes, str]:
+    from PIL import Image
+
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    width, height = image.size
+    longest = max(width, height) or 1
+    resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+    if longest > VISION_OCR_MAX_SIDE:
+        scale = VISION_OCR_MAX_SIDE / longest
+        image = image.resize(
+            (max(1, int(width * scale)), max(1, int(height * scale))),
+            resample,
+        )
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG", optimize=True)
+    payload = buffer.getvalue()
+    if len(payload) > 8 * 1024 * 1024:
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=85)
+        return buffer.getvalue(), "image/jpeg"
+    return payload, "image/png"
+
+
+def _vision_text_to_lines(raw: str) -> list[OCRLine]:
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text).strip()
+    compact = text.replace(" ", "")
+    if not text or any(mark in compact for mark in VISION_OCR_EMPTY_MARKERS):
+        return [OCRLine("", 0.2, [0, 0, 1, 1])]
+    lines = [part.strip() for part in re.split(r"\r?\n+", text) if part.strip()]
+    if not lines:
+        return [OCRLine("", 0.2, [0, 0, 1, 1])]
+    return [
+        OCRLine(line, VISION_OCR_CONFIDENCE, [0, float(index * 20), 100, float(index * 20 + 18)])
+        for index, line in enumerate(lines)
+    ]
+
+
+def _iter_ocr_engines():
+    global _vision_engine, _paddle_engine, _paddle_unavailable
+    if _ocr_engine is not None:
+        yield _ocr_engine
+        return
+    if DEEPSEEK_EXTERNAL_CALLS_ENABLED and API_KEY:
+        if _vision_engine is None:
+            _vision_engine = DeepSeekVisionOCREngine()
+        yield _vision_engine
+    if not _paddle_unavailable:
+        if _paddle_engine is None:
+            try:
+                _paddle_engine = PaddleOCREngine()
+            except Exception:
+                _paddle_unavailable = True
+        if _paddle_engine is not None:
+            yield _paddle_engine
+    yield FallbackOCREngine()
+
+
 def _get_ocr_engine() -> OCREngine:
-    global _ocr_engine
-    if _ocr_engine is None:
-        try:
-            _ocr_engine = PaddleOCREngine()
-        except Exception:
-            _ocr_engine = FallbackOCREngine()
-    return _ocr_engine
+    for engine in _iter_ocr_engines():
+        return engine
+    return FallbackOCREngine()
 
 
-def _recognize_image(image_bytes: bytes) -> dict[str, Any]:
-    lines = _get_ocr_engine().recognize(image_bytes)
+def _pack_ocr_result(lines: list[OCRLine], engine: OCREngine | None) -> dict[str, Any]:
     texts = [line.text for line in lines if line.text]
     confidences = [line.confidence for line in lines] or [0.0]
     average = sum(confidences) / len(confidences)
     minimum = min(confidences)
     flags = []
+    kind = getattr(engine, "kind", "") if engine is not None else ""
+    if kind == "vision":
+        flags.append("VISION_OCR")
     if minimum < OCR_LOW_CONFIDENCE_THRESHOLD or average < OCR_LOW_CONFIDENCE_THRESHOLD:
         flags.append("LOW_OCR_CONFIDENCE")
     if not "".join(texts).strip():
@@ -2155,6 +2284,31 @@ def _recognize_image(image_bytes: bytes) -> dict[str, Any]:
         "quality_flags": flags,
         "bbox": [line.bbox for line in lines],
     }
+
+
+def _recognize_image(image_bytes: bytes) -> dict[str, Any]:
+    last_error: Exception | None = None
+    last_empty: tuple[list[OCRLine], OCREngine | None] | None = None
+    tried_real = False
+    for engine in _iter_ocr_engines():
+        is_fallback = getattr(engine, "kind", "") == "fallback"
+        if is_fallback and tried_real:
+            break
+        if not is_fallback:
+            tried_real = True
+        try:
+            lines = engine.recognize(image_bytes)
+        except Exception as exc:
+            last_error = exc
+            continue
+        if any((line.text or "").strip() for line in lines):
+            return _pack_ocr_result(lines, engine)
+        last_empty = (lines, engine)
+    if last_empty is not None:
+        return _pack_ocr_result(last_empty[0], last_empty[1])
+    if last_error is not None:
+        raise last_error
+    return _pack_ocr_result([OCRLine("", 0.1, [0, 0, 1, 1])], None)
 
 
 def _extract_pdf(path: Path) -> list[PageResult]:
@@ -3039,15 +3193,24 @@ class MaterialService:
                 chunk.pop("_hits", None)
             replace_chunks(conn, version_id, chunks)
 
+            quality_json = json.dumps(quality, ensure_ascii=False)
+            conn.execute(
+                "DELETE FROM redaction_items WHERE document_version_id = ?",
+                (version_id,),
+            )
             for row in redaction_rows:
                 _insert(conn, "redaction_items", row)
-
-            quality_json = json.dumps(quality, ensure_ascii=False)
             _update(
                 conn,
                 "document_versions",
                 version_id,
-                {"status": status, "quality_summary_json": quality_json},
+                {
+                    "status": status,
+                    "parser_version": PARSER_VERSION,
+                    "quality_summary_json": quality_json,
+                    "error_code": None,
+                    "error_message": None,
+                },
             )
             _update(
                 conn,

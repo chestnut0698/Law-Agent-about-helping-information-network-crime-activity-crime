@@ -20,8 +20,8 @@
     const ATTENTION = ['NEEDS_OCR_REVIEW', 'OCR_FAILED', 'FAILED', 'DUPLICATE_PENDING'];
     const MATERIAL_ACCEPT_EXTS = ['.pdf', '.docx', '.xlsx', '.xls', '.xml', '.txt', '.png', '.jpg', '.jpeg'];
     const MATERIAL_ACCEPT = MATERIAL_ACCEPT_EXTS.join(',');
-    const MATERIAL_ACCEPT_HINT = '支持 PDF / DOCX / XLSX / XML / TXT / PNG / JPEG，单个文件不超过 100MB';
-    const MATERIAL_ACCEPT_SUB = '支持 PDF、Word、Excel、XML、图片与文本，上传后将自动排队处理';
+    const MATERIAL_ACCEPT_HINT = '支持 PDF / DOCX / XLSX / XML / TXT / PNG / JPEG，图片会识别其中文字后纳入分析，单个文件不超过 100MB';
+    const MATERIAL_ACCEPT_SUB = '支持 PDF、Word、Excel、XML、图片与文本；图片按页识别文字，上传后将自动排队处理';
 
     const Workbench = {
         task: null,
@@ -33,6 +33,14 @@
         selectedLeadId: null,
         selectedLeadEvidenceIndex: 0,
         selectedGraphNodeId: null,
+        selectedGraphEdgeId: null,
+        graphHideWeak: true,
+        graphShowAll: false,
+        graphShowEvents: false,
+        graphTypeFilter: 'all',
+        graphCaseFilter: 'all',
+        graphStatusFilter: 'all',
+        graphPan: null,
         materialsQuery: '',
         materialsCaseFilter: 'all',
         leadsQuery: '',
@@ -594,6 +602,9 @@
             this.artifactCache = {};
             this._entityRefreshTried = false;
             this._timelineRefreshTried = false;
+            this._ocrReparseTried = false;
+            this.entityReviseId = null;
+            this.leadReviseId = null;
             this.currentView = 'tasks';
 
             await this._bindConversation(task);
@@ -1143,12 +1154,15 @@
             ]);
 
             const reviewArea = Utils.create('div', { class: 'wb-entity-review' });
-            if (candidate.decision !== 'PENDING') {
+            const stale = ['STALE', 'INVALID'].includes(artifactStatus);
+            const decided = candidate.decision && candidate.decision !== 'PENDING';
+            if (decided) {
                 reviewArea.appendChild(Utils.create('div', {
                     class: 'wb-callout',
                     text: `${decisionLabel}：${candidate.reason || '已记录'}`
                 }));
-            } else if (!['STALE', 'INVALID'].includes(artifactStatus)) {
+            }
+            if (!stale && (!decided || this.entityReviseId === candidate.candidate_id)) {
                 const actions = [
                     ['MERGE', '视为同一对象（待继续核查）', 'check'],
                     ['KEEP_SEPARATE', '不是同一对象', 'x'],
@@ -1167,6 +1181,23 @@
                     });
                     buttons.appendChild(button);
                 });
+                if (decided) {
+                    const cancel = this._iconBtn('wb-btn wb-btn-ghost', 'x', '取消');
+                    cancel.addEventListener('click', () => {
+                        this.entityReviseId = null;
+                        this._renderCurrentView();
+                    });
+                    buttons.appendChild(cancel);
+                }
+                reviewArea.appendChild(buttons);
+            } else if (!stale && decided) {
+                const buttons = Utils.create('div', { class: 'wb-entity-actions' });
+                const revise = this._iconBtn('wb-btn wb-btn-outline', 'pencil', '修改');
+                revise.addEventListener('click', () => {
+                    this.entityReviseId = candidate.candidate_id;
+                    this._renderCurrentView();
+                });
+                buttons.appendChild(revise);
                 reviewArea.appendChild(buttons);
             }
 
@@ -1207,8 +1238,12 @@
                 rows: '2',
                 placeholder: `填写“${label}”的理由（必填）`
             });
+            if (candidate.reason) reason.value = candidate.reason;
             const cancel = this._iconBtn('wb-btn wb-btn-ghost', 'x', '取消');
-            cancel.addEventListener('click', () => this._renderPanel());
+            cancel.addEventListener('click', () => {
+                this.entityReviseId = null;
+                this._renderCurrentView();
+            });
             const submit = this._iconBtn('wb-btn wb-btn-primary', 'check', '确认提交');
             submit.addEventListener('click', () => {
                 this._submitEntityDecision(candidate.candidate_id, decision, reason.value, submit, version);
@@ -1243,7 +1278,15 @@
                     return;
                 }
                 this.task = data.task;
-                await this.openArtifact(data.artifact.id);
+                this.entityReviseId = null;
+                this.selectedEntityId = candidateId;
+                this.artifactCache = {};
+                if (this.currentView === 'entities') {
+                    await this.refreshTask();
+                    await this._renderCurrentView();
+                } else {
+                    await this.openArtifact(data.artifact.id);
+                }
                 const followups = data.followup_actions || [];
                 if (followups.length) {
                     Toast.success(followups.slice(0, 2).join('；'));
@@ -2134,7 +2177,15 @@
                     return;
                 }
                 this.task = data.task;
-                await this.openArtifact(data.artifact.id);
+                this.leadReviseId = null;
+                this.selectedLeadId = artifactId;
+                delete this.artifactCache[artifactId];
+                if (this.currentView === 'leads') {
+                    await this.refreshTask();
+                    await this._renderCurrentView();
+                } else {
+                    await this.openArtifact(data.artifact.id);
+                }
                 Toast.success('线索处置已记录');
             } catch (e) {
                 Toast.error('处置未能保存：' + e.message);
@@ -3193,6 +3244,7 @@
         async _renderCurrentView() {
             const root = Utils.$('#wb-view');
             if (!root || !this.task) return;
+            this._teardownGraphView();
             root.innerHTML = '';
             const map = {
                 tasks: () => this._viewTasks(root),
@@ -3477,7 +3529,7 @@
                     Utils.create('th', { text: '版本' }),
                     Utils.create('th', { text: '处理状态' }),
                     Utils.create('th', { text: '脱敏' }),
-                    Utils.create('th', { text: '分析授权' }),
+                    Utils.create('th', { text: '纳入分析' }),
                     Utils.create('th', { text: '上传时间' }),
                     Utils.create('th', { text: '操作', class: 'wb-th-actions' })
                 ])
@@ -3495,7 +3547,7 @@
                 const fail = m.status === 'FAILED' || m.status === 'OCR_FAILED';
                 const statusTone = fail ? 'danger' : (warn ? 'warn' : (ready ? 'ok' : 'neutral'));
                 const availTone = ready ? 'ok' : (warn || fail ? 'danger' : 'warn');
-                const availText = ready ? '允许分析' : (warn || fail ? '暂不允许' : '处理中');
+                const availText = ready ? '允许纳入' : (fail ? '识字失败' : (warn ? '待复核' : '处理中'));
                 const redacted = m.redacted !== false;
                 const tr = Utils.create('tr');
                 tr.appendChild(Utils.create('td', { text: m.filename || '—' }));
@@ -3560,6 +3612,54 @@
             wrap.appendChild(table);
             root.appendChild(wrap);
             this._schedulePoll(payload);
+            void this._reparseStaleImageOcr(payload, rows);
+        },
+
+        _isImageMaterial(m) {
+            const name = String((m && m.filename) || '').toLowerCase();
+            return name.endsWith('.png') || name.endsWith('.jpg') || name.endsWith('.jpeg');
+        },
+
+        async _reparseStaleImageOcr(payload, rows) {
+            const target = (payload && payload.parser_target) || '';
+            if (!target || this._ocrReparseTried || !this.task) return;
+            const stale = (rows || []).filter((m) => (
+                m.document_id
+                && this._isImageMaterial(m)
+                && (m.parser_version || '') !== target
+            ));
+            if (!stale.length) {
+                this._ocrReparseTried = true;
+                return;
+            }
+            this._ocrReparseTried = true;
+            Toast.info('图片识字已升级，正在重新识别文字…');
+            let failed = 0;
+            for (const m of stale) {
+                try {
+                    const resp = await fetch(`/api/materials/documents/${m.document_id}/reparse`, { method: 'POST' });
+                    const data = await resp.json();
+                    if (data.error_code) failed += 1;
+                } catch (_) {
+                    failed += 1;
+                }
+            }
+            await this._refreshBatch();
+            if (failed) {
+                Toast.warning(`${stale.length - failed} 份已更新，${failed} 份识字未完成`);
+            } else {
+                Toast.success('图片文字已重新识别，可纳入分析');
+            }
+            if (this.task.status && this.task.status !== 'SCOPE_DRAFT') {
+                this._entityRefreshTried = false;
+                this._timelineRefreshTried = false;
+                try {
+                    await fetch(`/api/tasks/${this.task.id}/collision/run`, { method: 'POST' });
+                    await fetch(`/api/tasks/${this.task.id}/timeline/run`, { method: 'POST' });
+                    this.artifactCache = {};
+                    await this.refreshTask();
+                } catch (_) { /* 计划未确认时允许跳过 */ }
+            }
         },
 
         async _ensureEntitySet() {
@@ -3985,7 +4085,9 @@
             ]);
             overviewHead.appendChild(heading);
             const overviewActions = Utils.create('div', { class: 'wb-entity-actions' });
-            if (artifact && (selected.decision || 'PENDING') === 'PENDING' && status !== 'STALE') {
+            const decided = (selected.decision || 'PENDING') !== 'PENDING';
+            const revising = decided && this.entityReviseId === selected.candidate_id;
+            if (artifact && status !== 'STALE' && (!decided || revising)) {
                 [
                     ['KEEP_SEPARATE', '保留为独立主体', 'shield', 'wb-btn wb-btn-outline'],
                     ['MERGE', '确认关联', 'link2', 'wb-btn wb-btn-primary']
@@ -3996,6 +4098,22 @@
                     });
                     overviewActions.appendChild(btn);
                 });
+                if (revising) {
+                    const cancel = this._iconBtn('wb-btn wb-btn-ghost', 'x', '取消');
+                    cancel.addEventListener('click', () => {
+                        this.entityReviseId = null;
+                        this._renderCurrentView();
+                    });
+                    overviewActions.appendChild(cancel);
+                }
+            } else if (artifact && status !== 'STALE' && decided) {
+                const revise = this._iconBtn('wb-btn wb-btn-outline', 'pencil', '修改');
+                revise.title = '改判当前结论，核验留痕会追加一条新记录';
+                revise.addEventListener('click', () => {
+                    this.entityReviseId = selected.candidate_id;
+                    this._renderCurrentView();
+                });
+                overviewActions.appendChild(revise);
             }
             overviewHead.appendChild(overviewActions);
             overview.appendChild(overviewHead);
@@ -4394,12 +4512,29 @@
             detailBody.appendChild(openEv);
 
             const clueState = this._clueState(p);
-            if (!p.disposition && !clueState.confirmed) {
-                const review = Utils.create('div', { class: 'wb-entity-review', style: 'margin-top:12px' });
+            const decided = !!(p.disposition || clueState.confirmed);
+            const revising = decided && this.leadReviseId === selected.artifact.id;
+            const review = Utils.create('div', { class: 'wb-entity-review', style: 'margin-top:12px' });
+            if (decided && !revising) {
+                review.appendChild(Utils.create('div', {
+                    class: 'wb-file-meta',
+                    text: `已处置：${clueState.label} · ${p.disposition_reason || (clueState.confirmed ? '经实体复核确认同一后自动确认关联' : '')}`
+                }));
+                const actions = Utils.create('div', { class: 'wb-entity-actions', style: 'justify-content:flex-start' });
+                const revise = this._iconBtn('wb-btn wb-btn-outline', 'pencil', '修改');
+                revise.title = '改判当前结论，核验留痕会追加一条新记录';
+                revise.addEventListener('click', () => {
+                    this.leadReviseId = selected.artifact.id;
+                    this._renderCurrentView();
+                });
+                actions.appendChild(revise);
+                review.appendChild(actions);
+            } else {
                 const reason = Utils.create('textarea', {
                     class: 'wb-decision-reason',
                     placeholder: '填写处置意见、补证要求或排除理由'
                 });
+                if (p.disposition_reason) reason.value = p.disposition_reason;
                 review.appendChild(reason);
                 const actions = Utils.create('div', { class: 'wb-entity-actions', style: 'justify-content:flex-start' });
                 [
@@ -4413,14 +4548,17 @@
                     });
                     actions.appendChild(btn);
                 });
+                if (revising) {
+                    const cancel = this._iconBtn('wb-btn wb-btn-ghost', 'x', '取消');
+                    cancel.addEventListener('click', () => {
+                        this.leadReviseId = null;
+                        this._renderCurrentView();
+                    });
+                    actions.appendChild(cancel);
+                }
                 review.appendChild(actions);
-                detailBody.appendChild(review);
-            } else {
-                detailBody.appendChild(Utils.create('div', {
-                    class: 'wb-file-meta',
-                    text: `已处置：${clueState.label} · ${p.disposition_reason || (clueState.confirmed ? '经实体复核确认同一后自动确认关联' : '')}`
-                }));
             }
+            detailBody.appendChild(review);
             detail.appendChild(detailBody);
             split.appendChild(detail);
             root.appendChild(split);
@@ -4826,287 +4964,1696 @@
             page.appendChild(card);
         },
 
-        _buildGraphModel() {
+        _teardownGraphView() {
+            const viewport = this._graphViewportEl;
+            if (viewport && this._graphViewportListeners) {
+                this._graphViewportListeners.forEach((item) => {
+                    viewport.removeEventListener(item.type, item.fn, item.opts);
+                });
+            }
+            this._graphViewportEl = null;
+            this._graphViewportListeners = null;
+        },
+
+        _graphPublicType(raw) {
+            const u = String(raw || '').toUpperCase();
+            if (u === 'ACCOUNT' || u === 'BANK_ACCOUNT' || u === 'TRANSFER_ACCOUNT') return 'BANK_ACCOUNT';
+            if (u === 'NAME' || u === 'PERSON') return 'PERSON';
+            if (u === 'ORG' || u === 'ORGANIZATION') return 'ORGANIZATION';
+            if (u === 'CONTACT_PHONE') return 'PHONE';
+            return u || 'PERSON';
+        },
+
+        _graphTypeLabel(type) {
+            return {
+                PERSON: '人员',
+                BANK_ACCOUNT: '银行账户',
+                PHONE: '手机号码',
+                DEVICE: '电子设备',
+                ORGANIZATION: '组织主体',
+                MERCHANT: '商户',
+                ID_CARD: '身份证件',
+                IP: '网络地址',
+                CASE: '案件',
+                EVENT: '行为'
+            }[String(type || '').toUpperCase() === 'EVENT' ? 'EVENT' : this._graphPublicType(type)] || '对象';
+        },
+
+        _graphEventLabel(item) {
+            const role = String((item && (item.role_or_action || item.summary_text)) || '').trim();
+            if (role) return role.length > 22 ? role.slice(0, 21) + '…' : role;
+            const t = String((item && item.event_type) || '').toUpperCase();
+            if (t === 'TRANSFER') return '转账记载';
+            if (t === 'CONTACT') return '联络记载';
+            if (t === 'INFERRED') return '系统推测环节';
+            return '行为记载';
+        },
+
+        _graphEventUncertain(item) {
+            if (!item) return true;
+            if (item.time_uncertain || item.timeUncertain) return true;
+            if (String(item.time_precision || '').toUpperCase() === 'UNKNOWN') return true;
+            const ts = String(item.time_text || item.event_time || item.time || item.timeText || '').trim();
+            return !ts || ts === '时间不明' || ts === '未知';
+        },
+
+        _graphEventTimeKey(item) {
+            const ts = String((item && (item.time_text || item.event_time || item.time || item.timeText)) || '').trim();
+            const uncertain = this._graphEventUncertain(item);
+            return [uncertain ? 1 : 0, ts || '\uffff', String((item && (item.event_id || item.id)) || '')];
+        },
+
+        _graphCandidateLabel(candidate) {
+            const type = this._graphPublicType(candidate.entity_type || candidate.object_type);
+            const existing = String(candidate.display_name || candidate.title || '').trim();
+            if (existing && !/^同一.+跨案出现$/.test(existing) && !/^(实体)?候选/.test(existing)) {
+                return existing;
+            }
+            const first = (candidate.records || [])[0] || {};
+            const raw = String(first.value || candidate.value || '').trim();
+            const digits = raw.replace(/\D/g, '');
+            if (type === 'BANK_ACCOUNT') return digits.length >= 4 ? `尾号 ${digits.slice(-4)} 银行账户` : '银行账户';
+            if (type === 'PHONE') return digits.length >= 4 ? `尾号 ${digits.slice(-4)} 手机号码` : '手机号码';
+            if (type === 'DEVICE') return digits.length >= 4 ? `IMEI 尾号 ${digits.slice(-4)} 设备` : '电子设备';
+            if (type === 'ID_CARD') return digits.length >= 4 ? `尾号 ${digits.slice(-4)} 身份证件` : '身份证件';
+            if (type === 'MERCHANT') return raw ? `商户号 ${raw}` : '商户';
+            if (type === 'IP') return raw || '网络地址';
+            if (type === 'ORGANIZATION') return raw ? `“${raw}”组织` : '组织主体';
+            return raw || '人员';
+        },
+
+        _graphIndexKeys(type, surface, normalized) {
+            const t = this._graphPublicType(type);
+            const keys = [];
+            const push = (v) => {
+                const s = String(v || '').trim();
+                if (!s) return;
+                keys.push(`${t}:${s.toLowerCase()}`);
+                keys.push(`${t}:${s.replace(/\s+/g, '').toLowerCase()}`);
+                const digits = s.replace(/\D/g, '');
+                if (digits.length >= 4) keys.push(`${t}:d:${digits}`);
+            };
+            push(surface);
+            push(normalized);
+            return keys;
+        },
+
+        _graphStatusOfCandidate(candidate) {
+            const decision = String((candidate && candidate.decision) || 'PENDING').toUpperCase();
+            if (decision === 'MERGE') return 'confirmed';
+            if (decision === 'KEEP_SEPARATE') return 'recorded';
+            const tier = String((candidate && candidate.match_tier) || '').toUpperCase();
+            if (tier === 'SUSPECTED' || decision === 'PENDING' || decision === 'DEFER') return 'pending';
+            return 'recorded';
+        },
+
+        _graphStatusLabel(status) {
+            return {
+                recorded: '材料记载',
+                confirmed: '人工确认',
+                pending: '待确认',
+                inferred: '系统推测'
+            }[status] || '材料记载';
+        },
+
+        _graphAsCitation(raw, extra) {
+            if (!raw || typeof raw !== 'object') return extra || null;
+            const nested = raw.source && typeof raw.source === 'object' ? raw.source : {};
+            const src = Object.assign({}, extra || {}, raw, nested);
+            const chunk = src.chunk_id || raw.chunk_id || '';
+            const quote = src.quote || src.quote_redacted || raw.quote || '';
+            return {
+                case_id: src.case_id || raw.case_id || '',
+                case_name: src.case_name || raw.case_name || '',
+                filename: src.filename || src.document_name || raw.filename || '',
+                page_start: src.page_start || src.page_no || raw.page_start,
+                page_end: src.page_end || raw.page_end,
+                quote,
+                quote_display: src.quote_display || quote,
+                quote_hash: src.quote_hash || raw.quote_hash || '',
+                chunk_id: chunk,
+                document_version_id: src.document_version_id || raw.document_version_id || '',
+                document_id: src.document_id || raw.document_id || '',
+                value: src.value || raw.value || '',
+                highlight_terms: src.highlight_terms || extra && extra.highlight_terms || []
+            };
+        },
+
+        _graphLinkable(src) {
+            return !!(src && src.chunk_id && src.document_version_id);
+        },
+
+        _graphCaseName(caseId) {
+            const found = (this.task.cases || []).find((c) => c.case_id === caseId);
+            return (found && (found.display_name || found.name)) || caseId || '';
+        },
+
+        _graphWalkableEdge(edge) {
+            if (!edge) return false;
+            if (edge.kind === 'excluded' || edge.label === '已排除同一') return false;
+            if (edge.kind === 'sequence' || edge.kind === 'act' || edge.kind === 'involve' || edge.kind === 'event-case') {
+                return false;
+            }
+            if (edge.status === 'inferred') return false;
+            return edge.kind === 'appear' || edge.kind === 'cooccur'
+                || edge.label === '出现于' || edge.label === '同事件记载';
+        },
+
+        _graphPathsToOtherCases(selected, visible, hops) {
+            if (!selected || !visible) return [];
+            const limit = hops == null ? 2 : hops;
+            const nodeById = {};
+            (visible.nodes || []).forEach((n) => { nodeById[n.id] = n; });
+            const adj = {};
+            (visible.nodes || []).forEach((n) => { adj[n.id] = []; });
+            (visible.edges || []).forEach((e) => {
+                if (!this._graphWalkableEdge(e)) return;
+                if (!adj[e.from] || !adj[e.to]) return;
+                adj[e.from].push({ to: e.to, edge: e });
+                adj[e.to].push({ to: e.from, edge: e });
+            });
+            const ownCases = new Set(
+                selected.kind === 'case' ? [selected.caseId] : (selected.caseIds || [])
+            );
+            const dist = {};
+            const prev = {};
+            dist[selected.id] = 0;
+            const q = [selected.id];
+            for (let i = 0; i < q.length; i += 1) {
+                const u = q[i];
+                if (dist[u] >= limit) continue;
+                (adj[u] || []).forEach((step) => {
+                    const vnode = nodeById[step.to];
+                    if (!vnode || dist[step.to] !== undefined) return;
+                    if (vnode.kind === 'event') return;
+                    if (vnode.breakpoint && step.to !== selected.id) return;
+                    dist[step.to] = dist[u] + 1;
+                    prev[step.to] = { from: u, edge: step.edge };
+                    q.push(step.to);
+                });
+            }
+            const paths = [];
+            (visible.nodes || []).forEach((n) => {
+                if (n.kind !== 'case' || !n.caseId || ownCases.has(n.caseId)) return;
+                if (dist[n.id] === undefined) return;
+                const steps = [];
+                let cur = n.id;
+                while (cur !== selected.id && prev[cur]) {
+                    steps.unshift({
+                        to: nodeById[cur],
+                        from: nodeById[prev[cur].from],
+                        edge: prev[cur].edge
+                    });
+                    cur = prev[cur].from;
+                }
+                paths.push({ caseNode: n, steps });
+            });
+            return paths;
+        },
+
+        async _peekTimelinePayload() {
+            const art = (this.task.artifacts || []).find((a) => a.type === 'ROLE_TIMELINE');
+            if (!art) return null;
+            const cached = this.artifactCache[art.id];
+            if (cached && Number(cached.version) === Number(art.current_version)) return cached;
+            try {
+                return await this._fetchArtifact(art.id);
+            } catch (e) {
+                return null;
+            }
+        },
+
+        _buildGraphModel(entityData, timelineData) {
             const nodes = [];
             const edges = [];
             const seen = new Set();
-            const addNode = (id, label, type) => {
-                if (!id || seen.has(id)) return;
-                seen.add(id);
-                nodes.push({ id, label, type });
+            const keyIndex = {};
+            const caseNameSet = new Set(
+                (this.task.cases || []).map((c) => c.display_name || c.name || c.case_id).filter(Boolean)
+            );
+
+            const rememberKeys = (nodeId, keys) => {
+                (keys || []).forEach((k) => {
+                    if (k && !keyIndex[k]) keyIndex[k] = nodeId;
+                });
             };
+
+            const addNode = (node) => {
+                if (!node || !node.id || seen.has(node.id)) return seen.has(node.id) ? node.id : '';
+                seen.add(node.id);
+                nodes.push(node);
+                return node.id;
+            };
+
+            const pushEdge = (edge) => {
+                if (!edge || !edge.from || !edge.to || edge.from === edge.to) return;
+                if (!seen.has(edge.from) || !seen.has(edge.to)) return;
+                const rank = { confirmed: 3, recorded: 2, pending: 1, inferred: 0 };
+                const existing = edges.find((e) => {
+                    if (edge.directed || e.directed) return e.from === edge.from && e.to === edge.to;
+                    return (e.from === edge.from && e.to === edge.to) || (e.from === edge.to && e.to === edge.from);
+                });
+                if (existing) {
+                    if ((rank[edge.status] || 0) > (rank[existing.status] || 0)) {
+                        existing.status = edge.status;
+                        existing.strength = edge.strength;
+                        existing.label = edge.label;
+                        existing.source = edge.source;
+                        existing.citations = edge.citations || existing.citations;
+                        existing.directed = edge.directed || existing.directed;
+                        existing.kind = edge.kind || existing.kind;
+                    }
+                    return;
+                }
+                edges.push(edge);
+            };
+
             (this.task.cases || []).forEach((c, i) => {
-                addNode(`case:${c.case_id}`, c.display_name || c.name || `案件${i + 1}`, '案件');
+                const id = `case:${c.case_id}`;
+                addNode({
+                    id,
+                    kind: 'case',
+                    entityType: 'CASE',
+                    typeLabel: '案件',
+                    label: c.display_name || c.name || `案件${i + 1}`,
+                    status: 'recorded',
+                    caseId: c.case_id,
+                    caseIds: [c.case_id],
+                    candidate: null,
+                    candidateId: ''
+                });
+                rememberKeys(id, [`CASE:${c.case_id}`, `CASE:${(c.display_name || c.name || '').toLowerCase()}`]);
             });
-            const clueNodes = [];
-            Object.values(this.artifactCache).forEach((data) => {
-                if (!data || !data.artifact) return;
-                const st = data.artifact.status;
-                if (['STALE', 'INVALID'].includes(st)) return;
-                if (data.artifact.type === 'ENTITY_CANDIDATE_SET') {
-                    (data.payload.candidates || []).forEach((c) => {
-                        const nid = `ent:${c.candidate_id}`;
-                        addNode(nid, c.title || c.display_name || '对象', c.object_type || '标识');
-                        (c.cases || []).forEach((cs) => {
-                            edges.push({
-                                from: nid,
-                                to: `case:${cs.case_id}`,
-                                label: '出现于',
-                                source: '实体候选',
-                                strength: 'solid'
-                            });
-                        });
+
+            const candidates = ((entityData && entityData.payload) || {}).candidates || [];
+            candidates.forEach((raw) => {
+                if (!raw || !raw.candidate_id) return;
+                const entityType = this._graphPublicType(raw.entity_type || raw.object_type);
+                const label = this._graphCandidateLabel(raw);
+                const caseIds = [];
+                (raw.cases || []).forEach((cs) => {
+                    if (cs && cs.case_id && !caseIds.includes(cs.case_id)) caseIds.push(cs.case_id);
+                });
+                (raw.records || []).forEach((rec) => {
+                    if (rec && rec.case_id && !caseIds.includes(rec.case_id)) caseIds.push(rec.case_id);
+                });
+                const decision = String(raw.decision || 'PENDING').toUpperCase();
+                const excluded = decision === 'KEEP_SEPARATE' && caseIds.length >= 2;
+                const bridge = caseIds.length >= 2 && !excluded;
+                const typeLabel = this._graphTypeLabel(entityType);
+                const subLabel = bridge
+                    ? `${typeLabel} · 跨案桥`
+                    : (excluded ? `${typeLabel} · 已排除同一` : typeLabel);
+                const id = `ent:${raw.candidate_id}`;
+                addNode({
+                    id,
+                    kind: 'entity',
+                    entityType,
+                    typeLabel,
+                    subLabel,
+                    label,
+                    status: this._graphStatusOfCandidate(raw),
+                    caseId: '',
+                    caseIds,
+                    candidate: raw,
+                    candidateId: raw.candidate_id,
+                    bridge,
+                    breakpoint: excluded,
+                    decision
+                });
+                rememberKeys(id, [
+                    `id:${raw.candidate_id}`,
+                    raw.fingerprint ? `fp:${raw.fingerprint}` : '',
+                    raw.subject_id ? `id:${raw.subject_id}` : ''
+                ]);
+                rememberKeys(id, this._graphIndexKeys(entityType, label, raw.fingerprint));
+                (raw.aliases || []).forEach((alias) => {
+                    rememberKeys(id, this._graphIndexKeys(entityType, alias, alias));
+                });
+                const appearLabel = excluded ? '已排除同一' : '出现于';
+                const appearKind = excluded ? 'excluded' : 'appear';
+                (raw.records || []).forEach((rec) => {
+                    rememberKeys(id, this._graphIndexKeys(entityType, rec.value, rec.normalized_value));
+                    const cite = this._graphAsCitation(rec, {
+                        case_id: rec.case_id,
+                        case_name: rec.case_name,
+                        highlight_terms: [rec.value, label].filter(Boolean)
+                    });
+                    if (!rec.case_id) return;
+                    pushEdge({
+                        id: `appear:${id}:case:${rec.case_id}`,
+                        from: id,
+                        to: `case:${rec.case_id}`,
+                        label: appearLabel,
+                        source: '实体候选',
+                        status: 'recorded',
+                        strength: 'solid',
+                        kind: appearKind,
+                        citations: cite ? [cite] : []
+                    });
+                });
+                caseIds.forEach((cid) => {
+                    pushEdge({
+                        id: `appear:${id}:case:${cid}`,
+                        from: id,
+                        to: `case:${cid}`,
+                        label: appearLabel,
+                        source: '实体候选',
+                        status: 'recorded',
+                        strength: 'solid',
+                        kind: appearKind,
+                        citations: []
+                    });
+                });
+            });
+
+            const resolveParty = (party) => {
+                if (!party) return '';
+                const sid = String(party.subject_id || '').trim();
+                if (sid && seen.has(`ent:${sid}`)) return `ent:${sid}`;
+                if (sid && keyIndex[`id:${sid}`]) return keyIndex[`id:${sid}`];
+                if (sid && keyIndex[sid]) return keyIndex[sid];
+                const type = this._graphPublicType(party.object_type);
+                const keys = this._graphIndexKeys(type, party.display_name || party.surface, party.normalized_value);
+                for (let i = 0; i < keys.length; i += 1) {
+                    if (keyIndex[keys[i]]) return keyIndex[keys[i]];
+                }
+                return '';
+            };
+
+            const events = ((timelineData && timelineData.payload) || {}).items || [];
+            const pendingParties = [];
+            events.forEach((item, idx) => {
+                const parties = this._normalizeParties(item.parties || []);
+                const caseId = item.case_id || '';
+                parties.forEach((party) => {
+                    pendingParties.push({ item, idx, party, caseId, resolved: resolveParty(party) });
+                });
+            });
+
+            const eventHasBridge = {};
+            const lookup = {};
+            const refreshLookup = () => {
+                nodes.forEach((n) => { lookup[n.id] = n; });
+            };
+            refreshLookup();
+            pendingParties.forEach((row) => {
+                if (!row.resolved) return;
+                const n = lookup[row.resolved];
+                if (n && n.bridge) eventHasBridge[String(row.idx)] = true;
+            });
+            events.forEach((item, idx) => {
+                const sid = item.person_subject_id || item.account_subject_id || item.subject_id || '';
+                const hid = sid && seen.has(`ent:${sid}`) ? `ent:${sid}` : (sid ? keyIndex[`id:${sid}`] : '');
+                const n = hid && lookup[hid];
+                if (n && n.bridge) eventHasBridge[String(idx)] = true;
+            });
+
+            let ephemeralCount = 0;
+            pendingParties.forEach((row) => {
+                if (row.resolved) return;
+                const party = row.party;
+                const surface = String(party.display_name || party.surface || '').trim();
+                if (!surface || caseNameSet.has(surface)) return;
+                if (!eventHasBridge[String(row.idx)]) return;
+                if (ephemeralCount >= 24) return;
+                const entityType = this._graphPublicType(party.object_type);
+                const nid = `party:${entityType}:${(party.normalized_value || surface).replace(/\s+/g, '')}`;
+                if (seen.has(nid)) {
+                    row.resolved = nid;
+                    return;
+                }
+                const eventMode = String(row.item.source_mode || row.item.sourceMode || 'recorded');
+                const status = eventMode === 'inferred' ? 'inferred' : 'recorded';
+                addNode({
+                    id: nid,
+                    kind: 'entity',
+                    entityType,
+                    typeLabel: this._graphTypeLabel(entityType),
+                    subLabel: this._graphTypeLabel(entityType),
+                    label: surface,
+                    status,
+                    caseId: '',
+                    caseIds: row.caseId ? [row.caseId] : [],
+                    candidate: null,
+                    candidateId: '',
+                    ephemeral: true,
+                    bridge: false,
+                    breakpoint: false
+                });
+                rememberKeys(nid, this._graphIndexKeys(entityType, surface, party.normalized_value));
+                if (party.subject_id) rememberKeys(nid, [`id:${party.subject_id}`]);
+                if (row.caseId) {
+                    const cite = this._graphAsCitation(row.item.source || row.item, {
+                        case_id: row.caseId,
+                        case_name: row.item.case_name,
+                        highlight_terms: [surface]
+                    });
+                    pushEdge({
+                        id: `appear:${nid}:case:${row.caseId}`,
+                        from: nid,
+                        to: `case:${row.caseId}`,
+                        label: '出现于',
+                        source: '时间线事件',
+                        status: status === 'inferred' ? 'inferred' : 'recorded',
+                        strength: status === 'inferred' ? 'weak' : 'solid',
+                        kind: 'appear',
+                        citations: cite && this._graphLinkable(cite) ? [cite] : []
                     });
                 }
-                if (data.artifact.type === 'CLUE_ITEM') {
-                    const p = data.payload || {};
-                    if (!p.analysis || !Array.isArray(p.counter_evidence) || !p.aspect) return;
-                    const lid = `clue:${data.artifact.id}`;
-                    addNode(lid, p.title || data.artifact.title, '线索');
-                    clueNodes.push({ id: lid, payload: p });
-                    (p.objects || []).forEach((obj) => {
-                        const oid = `obj:${obj}`;
-                        addNode(oid, obj, '对象');
-                        edges.push({
-                            from: lid,
-                            to: oid,
-                            label: '涉及',
-                            source: '线索',
-                            strength: 'solid'
+                row.resolved = nid;
+                ephemeralCount += 1;
+                refreshLookup();
+            });
+
+            const resolveSubject = (item) => {
+                const sid = item.person_subject_id
+                    || (String(item.subject_kind || '').toUpperCase() === 'ACCOUNT'
+                        ? item.account_subject_id
+                        : item.subject_id)
+                    || item.account_subject_id
+                    || '';
+                if (sid && seen.has(`ent:${sid}`)) return `ent:${sid}`;
+                if (sid && keyIndex[`id:${sid}`]) return keyIndex[`id:${sid}`];
+                const type = String(item.subject_kind || '').toUpperCase() === 'ACCOUNT' ? 'BANK_ACCOUNT' : 'PERSON';
+                const keys = this._graphIndexKeys(type, item.person_subject || item.account_subject || item.subject, '');
+                for (let i = 0; i < keys.length; i += 1) {
+                    if (keyIndex[keys[i]]) return keyIndex[keys[i]];
+                }
+                return '';
+            };
+
+            const eventsByIdx = {};
+            pendingParties.forEach((row) => {
+                if (!row.resolved) return;
+                const key = String(row.idx);
+                if (!eventsByIdx[key]) eventsByIdx[key] = { item: row.item, idx: row.idx, nodes: [] };
+                if (!eventsByIdx[key].nodes.includes(row.resolved)) eventsByIdx[key].nodes.push(row.resolved);
+            });
+
+            const usableEvents = [];
+            events.forEach((item, idx) => {
+                const pack = eventsByIdx[String(idx)] || { item, idx, nodes: [] };
+                const subjectId = resolveSubject(item);
+                if (subjectId && !pack.nodes.includes(subjectId)) pack.nodes.unshift(subjectId);
+                eventsByIdx[String(idx)] = pack;
+                const inferred = String(item.source_mode || item.sourceMode || '').toLowerCase() === 'inferred'
+                    || String(item.event_type || '').toUpperCase() === 'INFERRED';
+                if (!pack.nodes.length && !inferred) return;
+                if (!pack.nodes.length && inferred && !subjectId) return;
+                usableEvents.push({ item, idx, nodes: pack.nodes, subjectId, inferred });
+            });
+
+            usableEvents.forEach((pack) => {
+                const ids = (pack.nodes || []).filter((id, i, arr) => id && arr.indexOf(id) === i);
+                if (ids.length < 2) return;
+                const cite = this._graphAsCitation(pack.item.source || pack.item, {
+                    case_id: pack.item.case_id,
+                    case_name: pack.item.case_name
+                });
+                const citations = cite && this._graphLinkable(cite) ? [cite] : [];
+                const inferred = pack.inferred;
+                for (let i = 0; i < ids.length; i += 1) {
+                    for (let j = i + 1; j < ids.length; j += 1) {
+                        const pair = [ids[i], ids[j]].sort();
+                        pushEdge({
+                            id: `cooccur:${pack.item.event_id || pack.idx}:${pair[0]}:${pair[1]}`,
+                            from: pair[0],
+                            to: pair[1],
+                            label: '同事件记载',
+                            source: '时间线事件',
+                            status: inferred ? 'inferred' : 'recorded',
+                            strength: inferred ? 'weak' : 'solid',
+                            directed: false,
+                            kind: 'cooccur',
+                            citations
+                        });
+                    }
+                }
+            });
+
+            if (this.graphShowEvents) {
+                const overlayEvents = usableEvents.filter((pack) => pack.nodes.some((id) => {
+                    const n = nodes.find((x) => x.id === id);
+                    return n && n.kind === 'entity' && n.bridge;
+                })).slice(0, 40);
+                overlayEvents.forEach((pack) => {
+                    const item = pack.item;
+                    const eventId = `evt:${item.event_id || pack.idx}`;
+                    const inferred = pack.inferred;
+                    const status = inferred
+                        ? 'inferred'
+                        : (String(item.source_mode || '').toLowerCase() === 'confirmed' ? 'confirmed' : 'recorded');
+                    const uncertain = this._graphEventUncertain(item);
+                    const timeText = String(item.time_text || item.event_time || '').trim();
+                    const cite = this._graphAsCitation(item.source || item, {
+                        case_id: item.case_id,
+                        case_name: item.case_name,
+                        highlight_terms: [item.subject, item.person_subject].filter(Boolean)
+                    });
+                    const citations = cite && this._graphLinkable(cite) ? [cite] : [];
+                    const caseIds = item.case_id ? [item.case_id] : [];
+                    addNode({
+                        id: eventId,
+                        kind: 'event',
+                        entityType: 'EVENT',
+                        typeLabel: '行为',
+                        label: this._graphEventLabel(item),
+                        subLabel: uncertain || !timeText ? '行为 · 时间不明' : `行为 · ${timeText}`,
+                        status,
+                        breakpoint: inferred || uncertain,
+                        caseId: item.case_id || '',
+                        caseIds,
+                        candidate: null,
+                        candidateId: '',
+                        timeText,
+                        timeUncertain: uncertain,
+                        eventType: String(item.event_type || '').toUpperCase(),
+                        subjectNodeId: pack.subjectId || pack.nodes[0] || '',
+                        citations
+                    });
+                    if (item.case_id && seen.has(`case:${item.case_id}`)) {
+                        pushEdge({
+                            id: `evcase:${eventId}:case:${item.case_id}`,
+                            from: eventId,
+                            to: `case:${item.case_id}`,
+                            label: '记载于',
+                            source: '时间线事件',
+                            status: inferred ? 'inferred' : 'recorded',
+                            strength: 'solid',
+                            directed: false,
+                            kind: 'event-case',
+                            citations
+                        });
+                    }
+                    const primary = pack.subjectId
+                        || pack.nodes.find((id) => {
+                            const n = nodes.find((x) => x.id === id);
+                            return n && n.entityType === 'PERSON' && n.kind === 'entity' && !n.ephemeral;
+                        })
+                        || pack.nodes.find((id) => {
+                            const n = nodes.find((x) => x.id === id);
+                            return n && n.kind === 'entity';
+                        })
+                        || '';
+                    if (primary) {
+                        pushEdge({
+                            id: `act:${primary}:${eventId}`,
+                            from: primary,
+                            to: eventId,
+                            label: inferred ? '推测实施' : '实施',
+                            source: '时间线事件',
+                            status,
+                            strength: 'solid',
+                            directed: true,
+                            kind: 'act',
+                            citations
+                        });
+                    }
+                    pack.nodes.forEach((other) => {
+                        if (!other || other === primary) return;
+                        pushEdge({
+                            id: `involve:${eventId}:${other}`,
+                            from: eventId,
+                            to: other,
+                            label: inferred ? '推测涉及' : '涉及',
+                            source: '时间线事件',
+                            status,
+                            strength: 'solid',
+                            directed: false,
+                            kind: 'involve',
+                            citations
                         });
                     });
-                    (p.linked_candidate_ids || []).forEach((cid) => {
-                        const eid = `ent:${cid}`;
-                        if (seen.has(eid)) {
-                            edges.push({
-                                from: lid,
-                                to: eid,
-                                label: '挂接实体',
-                                source: '线索',
-                                strength: 'solid'
-                            });
+                });
+                const bySubject = {};
+                overlayEvents.forEach((pack) => {
+                    const sid = pack.subjectId || pack.nodes[0] || '';
+                    if (!sid) return;
+                    if (!bySubject[sid]) bySubject[sid] = [];
+                    bySubject[sid].push(pack);
+                });
+                Object.keys(bySubject).forEach((sid) => {
+                    const seq = bySubject[sid].slice().sort((a, b) => {
+                        const ka = this._graphEventTimeKey(a.item);
+                        const kb = this._graphEventTimeKey(b.item);
+                        for (let i = 0; i < ka.length; i += 1) {
+                            if (ka[i] < kb[i]) return -1;
+                            if (ka[i] > kb[i]) return 1;
                         }
+                        return a.idx - b.idx;
                     });
-                }
+                    for (let i = 0; i < seq.length - 1; i += 1) {
+                        const a = seq[i];
+                        const b = seq[i + 1];
+                        const fromId = `evt:${a.item.event_id || a.idx}`;
+                        const toId = `evt:${b.item.event_id || b.idx}`;
+                        const gap = a.inferred || b.inferred
+                            || this._graphEventUncertain(a.item)
+                            || this._graphEventUncertain(b.item);
+                        const citeA = this._graphAsCitation(a.item.source || a.item, { case_id: a.item.case_id });
+                        const citeB = this._graphAsCitation(b.item.source || b.item, { case_id: b.item.case_id });
+                        const citations = [citeA, citeB].filter((c) => c && this._graphLinkable(c));
+                        pushEdge({
+                            id: `seq:${fromId}:${toId}`,
+                            from: fromId,
+                            to: toId,
+                            label: gap ? '先后待核' : '随后',
+                            source: '时间线先后',
+                            status: gap ? 'inferred' : 'recorded',
+                            strength: 'solid',
+                            directed: true,
+                            kind: 'sequence',
+                            citations
+                        });
+                    }
+                });
+            }
+
+            return { nodes, edges };
+        },
+
+
+        _graphNeighborhood(nodeIds, edges, startId, hops) {
+            const adj = {};
+            nodeIds.forEach((id) => { adj[id] = []; });
+            edges.forEach((e) => {
+                if (!adj[e.from] || !adj[e.to]) return;
+                adj[e.from].push(e.to);
+                adj[e.to].push(e.from);
             });
-            // 共享对象的多线索 → 路径相关（合成边，非定罪）
-            for (let i = 0; i < clueNodes.length; i += 1) {
-                for (let j = i + 1; j < clueNodes.length; j += 1) {
-                    const a = clueNodes[i];
-                    const b = clueNodes[j];
-                    const oa = new Set((a.payload.objects || []).map(String));
-                    const ob = (b.payload.objects || []).map(String);
-                    const share = ob.some((x) => oa.has(x));
-                    if (!share) continue;
-                    edges.push({
-                        from: a.id,
-                        to: b.id,
-                        label: '路径相关（待核合成）',
-                        source: '多线索合成',
-                        strength: 'weak'
+            const dist = {};
+            dist[startId] = 0;
+            const q = [startId];
+            for (let i = 0; i < q.length; i += 1) {
+                const u = q[i];
+                if (dist[u] >= hops) continue;
+                (adj[u] || []).forEach((v) => {
+                    if (dist[v] === undefined) {
+                        dist[v] = dist[u] + 1;
+                        q.push(v);
+                    }
+                });
+            }
+            return dist;
+        },
+
+        _graphPickDefault(nodes) {
+            const bridges = nodes.filter((n) => n.kind === 'entity' && n.bridge);
+            const breaks = nodes.filter((n) => n.kind === 'entity' && n.breakpoint);
+            const pool = bridges.length ? bridges : (breaks.length ? breaks : nodes.filter((n) => n.kind === 'entity'));
+            const scored = pool.slice().sort((a, b) => {
+                const cases = (b.caseIds || []).length - (a.caseIds || []).length;
+                if (cases) return cases;
+                const rank = { confirmed: 3, pending: 2, recorded: 1, inferred: 0 };
+                return (rank[b.status] || 0) - (rank[a.status] || 0);
+            });
+            return (scored[0] && scored[0].id)
+                || ((nodes.find((n) => n.kind === 'case') || {}).id)
+                || (nodes[0] && nodes[0].id)
+                || null;
+        },
+
+        _graphFilterModel(model) {
+            let nodes = model.nodes.slice();
+            let edges = model.edges.slice();
+            if (this.graphHideWeak) {
+                edges = edges.filter((e) => e.strength !== 'weak' || e.kind === 'excluded');
+                nodes = nodes.filter((n) => n.status !== 'inferred' || n.kind === 'case' || n.kind === 'event' || n.breakpoint);
+            }
+            if (!this.graphShowEvents) {
+                nodes = nodes.filter((n) => n.kind !== 'event');
+                edges = edges.filter((e) => !['act', 'involve', 'sequence', 'event-case'].includes(e.kind));
+            }
+            const typeFilter = this.graphTypeFilter || 'all';
+            const caseFilter = this.graphCaseFilter || 'all';
+            const statusFilter = this.graphStatusFilter || 'all';
+            if (caseFilter !== 'all') {
+                nodes = nodes.filter((n) =>
+                    n.kind === 'case' ? n.caseId === caseFilter : (n.caseIds || []).includes(caseFilter)
+                );
+            }
+            if (statusFilter !== 'all') {
+                nodes = nodes.filter((n) => n.kind === 'case' || n.status === statusFilter);
+            }
+            if (typeFilter !== 'all') {
+                nodes = nodes.filter((n) => n.kind === 'case' || n.kind === 'event' || n.entityType === typeFilter);
+            }
+            let keep = new Set(nodes.map((n) => n.id));
+            edges = edges.filter((e) => keep.has(e.from) && keep.has(e.to));
+            const hasBridge = nodes.some((n) => n.kind === 'entity' && (n.bridge || n.breakpoint));
+            if (!this.graphShowAll) {
+                const core = new Set();
+                nodes.forEach((n) => {
+                    if (n.kind === 'case') core.add(n.id);
+                    if (n.kind === 'entity' && (n.bridge || n.breakpoint)) core.add(n.id);
+                });
+                if (!this.selectedGraphNodeId || !core.has(this.selectedGraphNodeId)) {
+                    this.selectedGraphNodeId = this._graphPickDefault(nodes.filter((n) => core.has(n.id)));
+                }
+                const start = this.selectedGraphNodeId;
+                edges.forEach((e) => {
+                    if (e.kind !== 'cooccur') return;
+                    if (e.from === start) core.add(e.to);
+                    if (e.to === start) core.add(e.from);
+                });
+                if (this.graphShowEvents) {
+                    nodes.forEach((n) => {
+                        if (n.kind !== 'event') return;
+                        const linked = edges.some((e) =>
+                            (e.from === n.id && core.has(e.to)) || (e.to === n.id && core.has(e.from))
+                        );
+                        if (linked) core.add(n.id);
                     });
                 }
+                keep = core;
+                nodes = nodes.filter((n) => keep.has(n.id));
+                edges = edges.filter((e) => keep.has(e.from) && keep.has(e.to));
+                if (start && keep.has(start) && hasBridge) {
+                    const dist = this._graphNeighborhood([...keep], edges, start, 2);
+                    const vis = new Set(Object.keys(dist));
+                    nodes.forEach((n) => {
+                        if (n.kind === 'case') vis.add(n.id);
+                    });
+                    nodes = nodes.filter((n) => vis.has(n.id));
+                    edges = edges.filter((e) => vis.has(e.from) && vis.has(e.to));
+                }
+            } else if (!this.selectedGraphNodeId || !keep.has(this.selectedGraphNodeId)) {
+                this.selectedGraphNodeId = this._graphPickDefault(nodes);
             }
             return { nodes, edges };
         },
 
-        async _viewGraph(root) {
-            // preload entity/clue caches for graph edges
-            await this._ensureEntitySet();
-            await this._collectClueItems();
-            let { nodes, edges } = this._buildGraphModel();
-            if (this.graphHideWeak) {
-                edges = edges.filter((e) => e.strength !== 'weak');
+        _graphForceLayout(nodes, edges, width, height) {
+            const pos = {};
+            const vx = {};
+            const vy = {};
+            nodes.forEach((n, i) => {
+                const a = (i / Math.max(nodes.length, 1)) * Math.PI * 2;
+                pos[n.id] = {
+                    x: width / 2 + Math.cos(a) * Math.min(160, 40 + nodes.length * 8),
+                    y: height / 2 + Math.sin(a) * Math.min(120, 30 + nodes.length * 6)
+                };
+                vx[n.id] = 0;
+                vy[n.id] = 0;
+            });
+            const ids = nodes.map((n) => n.id);
+            for (let iter = 0; iter < 90; iter += 1) {
+                for (let i = 0; i < ids.length; i += 1) {
+                    for (let j = i + 1; j < ids.length; j += 1) {
+                        const a = pos[ids[i]];
+                        const b = pos[ids[j]];
+                        let dx = a.x - b.x;
+                        let dy = a.y - b.y;
+                        let dist = Math.sqrt(dx * dx + dy * dy) || 0.01;
+                        const force = 2400 / (dist + 24);
+                        dx /= dist;
+                        dy /= dist;
+                        vx[ids[i]] += dx * force;
+                        vy[ids[i]] += dy * force;
+                        vx[ids[j]] -= dx * force;
+                        vy[ids[j]] -= dy * force;
+                    }
+                }
+                edges.forEach((e) => {
+                    const a = pos[e.from];
+                    const b = pos[e.to];
+                    if (!a || !b) return;
+                    let dx = b.x - a.x;
+                    let dy = b.y - a.y;
+                    const dist = Math.sqrt(dx * dx + dy * dy) || 0.01;
+                    const ideal = 150;
+                    const k = (dist - ideal) * 0.06;
+                    dx = (dx / dist) * k;
+                    dy = (dy / dist) * k;
+                    vx[e.from] += dx;
+                    vy[e.from] += dy;
+                    vx[e.to] -= dx;
+                    vy[e.to] -= dy;
+                });
+                ids.forEach((id) => {
+                    vx[id] = (vx[id] + (width / 2 - pos[id].x) * 0.01) * 0.62;
+                    vy[id] = (vy[id] + (height / 2 - pos[id].y) * 0.01) * 0.62;
+                    pos[id].x += vx[id];
+                    pos[id].y += vy[id];
+                });
             }
-            const graphActions = Utils.create('div', { class: 'wb-page-head-actions', style: 'display:flex;gap:8px;flex-wrap:wrap' });
+            const cases = nodes.filter((n) => n.kind === 'case');
+            const others = nodes.filter((n) => n.kind !== 'case');
+            if (cases.length && others.length) {
+                let minX = Infinity;
+                let maxX = -Infinity;
+                let minY = Infinity;
+                others.forEach((n) => {
+                    minX = Math.min(minX, pos[n.id].x);
+                    maxX = Math.max(maxX, pos[n.id].x);
+                    minY = Math.min(minY, pos[n.id].y);
+                });
+                if (maxX - minX < 80) {
+                    minX -= 80;
+                    maxX += 80;
+                }
+                cases.forEach((n, i) => {
+                    pos[n.id] = {
+                        x: cases.length === 1
+                            ? (minX + maxX) / 2
+                            : minX + (i / (cases.length - 1)) * (maxX - minX),
+                        y: minY - 140
+                    };
+                });
+            }
+            return pos;
+        },
+
+        _graphLayout(nodes, edges, width, height) {
+            if (nodes.some((n) => n.kind === 'event')) {
+                return this._graphTimeLayout(nodes, edges, width, height);
+            }
+            return this._graphForceLayout(nodes, edges, width, height);
+        },
+
+        _graphTimeLayout(nodes, edges, width, height) {
+            const pos = {};
+            const events = nodes.filter((n) => n.kind === 'event').slice().sort((a, b) => {
+                const ka = this._graphEventTimeKey(a);
+                const kb = this._graphEventTimeKey(b);
+                for (let i = 0; i < ka.length; i += 1) {
+                    if (ka[i] < kb[i]) return -1;
+                    if (ka[i] > kb[i]) return 1;
+                }
+                return String(a.id).localeCompare(String(b.id));
+            });
+            const buckets = [];
+            events.forEach((n) => {
+                const key = `${n.timeUncertain ? 'u' : 't'}:${n.timeText || ''}`;
+                const last = buckets[buckets.length - 1];
+                if (last && last.key === key) last.events.push(n);
+                else buckets.push({ key, uncertain: !!n.timeUncertain, events: [n] });
+            });
+            const colW = Math.max(190, Math.min(240, Math.floor((width - 80) / Math.max(buckets.length, 1))));
+            const eventY = Math.max(210, Math.min(height * 0.42, 280));
+            let x = 140;
+            buckets.forEach((bucket) => {
+                if (bucket.uncertain) x += 36;
+                bucket.events.forEach((n, i) => {
+                    pos[n.id] = { x, y: eventY + i * 96 };
+                });
+                x += colW;
+            });
+
+            const entityStacks = {};
+            nodes.filter((n) => n.kind === 'entity').forEach((n) => {
+                const linked = [];
+                edges.forEach((e) => {
+                    if (e.from === n.id || e.to === n.id) {
+                        const other = e.from === n.id ? e.to : e.from;
+                        const ev = events.find((x) => x.id === other);
+                        if (ev) linked.push(ev);
+                    }
+                });
+                linked.sort((a, b) => {
+                    const ia = events.indexOf(a);
+                    const ib = events.indexOf(b);
+                    return ia - ib;
+                });
+                const anchor = linked[0];
+                const ax = anchor ? pos[anchor.id].x : (width / 2);
+                const stackKey = String(Math.round(ax));
+                if (!entityStacks[stackKey]) entityStacks[stackKey] = 0;
+                const slot = entityStacks[stackKey];
+                entityStacks[stackKey] += 1;
+                pos[n.id] = {
+                    x: ax + ((slot % 2) ? 18 : -18),
+                    y: eventY + 150 + Math.floor(slot / 1) * 108
+                };
+            });
+
+            const cases = nodes.filter((n) => n.kind === 'case');
+            cases.forEach((n, i) => {
+                const linkedX = [];
+                edges.forEach((e) => {
+                    if (e.from !== n.id && e.to !== n.id) return;
+                    const other = e.from === n.id ? e.to : e.from;
+                    if (pos[other]) linkedX.push(pos[other].x);
+                });
+                const ax = linkedX.length
+                    ? linkedX.reduce((s, v) => s + v, 0) / linkedX.length
+                    : (140 + i * colW);
+                pos[n.id] = { x: ax, y: 88 };
+            });
+
+            nodes.forEach((n) => {
+                if (!pos[n.id]) pos[n.id] = { x: width / 2, y: height / 2 };
+            });
+            return pos;
+        },
+
+        _graphFitPan(viewport, positions) {
+            const ids = Object.keys(positions);
+            if (!ids.length || !viewport) return;
+            let minX = Infinity;
+            let minY = Infinity;
+            let maxX = -Infinity;
+            let maxY = -Infinity;
+            ids.forEach((id) => {
+                const p = positions[id];
+                minX = Math.min(minX, p.x);
+                minY = Math.min(minY, p.y);
+                maxX = Math.max(maxX, p.x);
+                maxY = Math.max(maxY, p.y);
+            });
+            const w = Math.max(maxX - minX + 220, 280);
+            const h = Math.max(maxY - minY + 200, 240);
+            const vw = viewport.clientWidth || 760;
+            const vh = viewport.clientHeight || 480;
+            const k = Math.min(1.2, Math.max(0.48, Math.min(vw / w, vh / h) * 0.88));
+            this.graphPan = {
+                k,
+                x: vw / 2 - ((minX + maxX) / 2) * k,
+                y: vh / 2 - ((minY + maxY) / 2) * k
+            };
+        },
+
+        _graphBindPanZoom(viewport, world) {
+            const apply = () => {
+                const pan = this.graphPan || { x: 0, y: 0, k: 1 };
+                world.style.transform = `translate(${pan.x}px, ${pan.y}px) scale(${pan.k})`;
+            };
+            apply();
+            const listeners = [];
+            const on = (type, fn, opts) => {
+                viewport.addEventListener(type, fn, opts);
+                listeners.push({ type, fn, opts });
+            };
+            on('wheel', (ev) => {
+                ev.preventDefault();
+                const pan = this.graphPan || { x: 0, y: 0, k: 1 };
+                const rect = viewport.getBoundingClientRect();
+                const mx = ev.clientX - rect.left;
+                const my = ev.clientY - rect.top;
+                const old = pan.k;
+                const next = Math.min(2.4, Math.max(0.42, old * (ev.deltaY > 0 ? 0.92 : 1.08)));
+                this.graphPan = {
+                    k: next,
+                    x: mx - (mx - pan.x) * (next / old),
+                    y: my - (my - pan.y) * (next / old)
+                };
+                apply();
+            }, { passive: false });
+            let dragging = false;
+            let sx = 0;
+            let sy = 0;
+            let ox = 0;
+            let oy = 0;
+            on('pointerdown', (ev) => {
+                if (ev.target.closest && ev.target.closest('.wb-graph-node')) return;
+                if (ev.target.classList && ev.target.classList.contains('wb-graph-edge-hit')) return;
+                dragging = true;
+                viewport.setPointerCapture(ev.pointerId);
+                const pan = this.graphPan || { x: 0, y: 0, k: 1 };
+                sx = ev.clientX;
+                sy = ev.clientY;
+                ox = pan.x;
+                oy = pan.y;
+                viewport.classList.add('is-panning');
+            });
+            on('pointermove', (ev) => {
+                if (!dragging) return;
+                this.graphPan = Object.assign({}, this.graphPan || { k: 1 }, {
+                    x: ox + (ev.clientX - sx),
+                    y: oy + (ev.clientY - sy)
+                });
+                apply();
+            });
+            const stopDrag = () => {
+                dragging = false;
+                viewport.classList.remove('is-panning');
+            };
+            on('pointerup', stopDrag);
+            on('pointercancel', stopDrag);
+            this._graphViewportEl = viewport;
+            this._graphViewportListeners = listeners;
+        },
+
+        _graphRelatedClues(node, clueItems) {
+            if (!node) return [];
+            if (node.kind === 'event') return [];
+            return (clueItems || []).filter((d) => {
+                const p = d.payload || {};
+                if (node.candidateId) {
+                    const linked = (p.linked_candidate_ids || []).map(String);
+                    if (linked.includes(String(node.candidateId))) return true;
+                    const fps = [...(p.fingerprints || []), p.fingerprint || ''].map(String);
+                    if (node.candidate && node.candidate.fingerprint && fps.includes(String(node.candidate.fingerprint))) {
+                        return true;
+                    }
+                }
+                const objects = (p.objects || []).map(String);
+                if (node.label && objects.some((o) => {
+                    if (o === node.label) return true;
+                    return o.split(/[、/／|,;；]/).map((s) => s.trim()).includes(node.label);
+                })) {
+                    return true;
+                }
+                if (node.kind === 'case') {
+                    const cases = (p.cases || []).map(String);
+                    return cases.includes(node.caseId) || cases.includes(node.label);
+                }
+                return false;
+            });
+        },
+
+        _graphNodeCitations(node, edges) {
+            if (!node) return [];
+            if (node.citations && node.citations.length) {
+                return node.citations.slice();
+            }
+            if (node.candidate) {
+                const list = this._collectEntityEvidence(node.candidate) || [];
+                if (list.length) return list;
+            }
+            const related = (edges || []).filter((e) => e.from === node.id || e.to === node.id);
+            const out = [];
+            const seen = new Set();
+            related.forEach((e) => {
+                (e.citations || []).forEach((c) => {
+                    const key = `${c.chunk_id || ''}|${c.quote_hash || ''}`;
+                    if (seen.has(key)) return;
+                    seen.add(key);
+                    out.push(c);
+                });
+            });
+            return out;
+        },
+
+        _graphFillSidebar(sideBody, selected, edge, visible, clueItems) {
+            sideBody.innerHTML = '';
+            const focus = edge || selected;
+            if (!focus) {
+                sideBody.appendChild(Utils.create('div', { class: 'wb-empty', text: '点选节点或关系查看依据。' }));
+                return;
+            }
+            sideBody.appendChild(Utils.create('div', { class: 'wb-alert warn' }, [
+                window.Icons ? Icons.el('info') : Utils.create('span', { text: 'ℹ' }),
+                Utils.create('span', {
+                    text: selected.kind === 'event'
+                        ? '需人工判断：行为来自角色时间线，箭头只表示记载时间先后，不代表上下游犯罪地位已经成立。'
+                        : '需人工判断：图谱展示跨案共同对象与同事件共现，不代表主体身份或共同犯罪事实已经成立。'
+                })
+            ]));
+
+            if (edge) {
+                const a = visible.nodes.find((n) => n.id === edge.from);
+                const b = visible.nodes.find((n) => n.id === edge.to);
+                sideBody.appendChild(Utils.create('p', {
+                    class: 'wb-graph-side-kicker',
+                    text: '当前关系'
+                }));
+                sideBody.appendChild(Utils.create('div', {
+                    class: 'wb-list-item-title',
+                    text: `${(a && a.label) || edge.from} · ${edge.label} · ${(b && b.label) || edge.to}`
+                }));
+                sideBody.appendChild(Utils.create('div', {
+                    class: 'wb-file-meta',
+                    text: `${this._graphStatusLabel(edge.status)} · ${edge.source}${edge.kind === 'sequence' ? ' · 仅时间先后' : ''}${edge.kind === 'excluded' ? ' · 不当作跨案通路' : ''}`
+                }));
+                const cites = edge.citations || [];
+                const openBtn = this._iconBtn('wb-btn wb-btn-outline', 'fileCheck2', '查看支持材料');
+                openBtn.style.width = '100%';
+                openBtn.style.marginTop = '12px';
+                openBtn.addEventListener('click', () => {
+                    const linkable = cites.filter((c) => this._graphLinkable(c))
+                        .sort((a, b) => Number(!!b.quote_hash) - Number(!!a.quote_hash));
+                    if (linkable.length) this._openCitation(linkable[0], linkable, 0);
+                    else Toast.info('暂无可用原文定位');
+                });
+                sideBody.appendChild(openBtn);
+                return;
+            }
+
+            if (selected.kind === 'entity') {
+                const caseNames = (selected.caseIds || []).map((id) => this._graphCaseName(id)).filter(Boolean);
+                sideBody.appendChild(Utils.create('p', { class: 'wb-graph-side-kicker', text: '跨案桥' }));
+                if (selected.breakpoint) {
+                    sideBody.appendChild(Utils.create('div', {
+                        class: 'wb-file-meta',
+                        text: `已排除同一。材料中跨 ${caseNames.length || 0} 案出现，但不作为两案之间的实线通路。`
+                    }));
+                } else if (selected.bridge) {
+                    sideBody.appendChild(Utils.create('div', {
+                        class: 'wb-file-meta',
+                        text: `出现于 ${caseNames.length} 案：${caseNames.join(' · ') || '—'}`
+                    }));
+                } else {
+                    sideBody.appendChild(Utils.create('div', {
+                        class: 'wb-file-meta',
+                        text: caseNames.length
+                            ? `单案内对象，出现于 ${caseNames.join(' · ')}。默认图只保留与选中桥同事件共现的单案对象。`
+                            : '尚未对应到案件。'
+                    }));
+                }
+
+                const cooccur = (visible.edges || []).filter((e) =>
+                    e.kind === 'cooccur' && (e.from === selected.id || e.to === selected.id)
+                );
+                sideBody.appendChild(Utils.create('p', { class: 'wb-graph-side-kicker', text: '同事件共现' }));
+                if (!cooccur.length) {
+                    sideBody.appendChild(Utils.create('div', { class: 'wb-file-meta', text: '当前邻域没有与其他对象的同事件记载。' }));
+                }
+                cooccur.forEach((e) => {
+                    const otherId = e.from === selected.id ? e.to : e.from;
+                    const other = visible.nodes.find((n) => n.id === otherId);
+                    const row = Utils.create('button', {
+                        type: 'button',
+                        class: 'wb-graph-rel'
+                    }, [
+                        Utils.create('span', { text: (other && other.label) || otherId }),
+                        Utils.create('span', { class: 'wb-file-meta', text: this._graphStatusLabel(e.status) })
+                    ]);
+                    row.addEventListener('click', () => {
+                        this.selectedGraphEdgeId = null;
+                        this.selectedGraphNodeId = otherId;
+                        this.graphPan = null;
+                        this._renderCurrentView();
+                    });
+                    sideBody.appendChild(row);
+                });
+
+                const paths = this._graphPathsToOtherCases(selected, visible, 2);
+                sideBody.appendChild(Utils.create('p', { class: 'wb-graph-side-kicker', text: '通往其他案件' }));
+                if (!paths.length) {
+                    sideBody.appendChild(Utils.create('div', {
+                        class: 'wb-file-meta',
+                        text: selected.breakpoint
+                            ? '已排除同一，没有通往其他案件的实线通路。'
+                            : '当前 2 跳内没有经「出现于 / 同事件记载」通往其他案件的实线通路。'
+                    }));
+                }
+                paths.forEach((path) => {
+                    const labels = path.steps.map((step) =>
+                        `${step.edge.label} → ${(step.to && step.to.label) || ''}`
+                    );
+                    const row = Utils.create('button', {
+                        type: 'button',
+                        class: 'wb-graph-rel'
+                    }, [
+                        Utils.create('span', { text: path.caseNode.label }),
+                        Utils.create('span', { class: 'wb-file-meta', text: labels.join(' · ') || '直接出现于' })
+                    ]);
+                    row.addEventListener('click', () => {
+                        const last = path.steps[path.steps.length - 1];
+                        if (last && last.edge) this.selectedGraphEdgeId = last.edge.id;
+                        this.selectedGraphNodeId = path.caseNode.id;
+                        this.graphPan = null;
+                        this._renderCurrentView();
+                    });
+                    sideBody.appendChild(row);
+                });
+
+                const breaks = [];
+                if (selected.breakpoint) breaks.push('人工已排除同一，不能再当作跨案同一对象');
+                const appear = (visible.edges || []).filter((e) =>
+                    (e.from === selected.id || e.to === selected.id) && (e.kind === 'appear' || e.kind === 'excluded')
+                );
+                if (appear.length && appear.every((e) => !(e.citations || []).some((c) => this._graphLinkable(c)))) {
+                    breaks.push('出现于案件的边暂无可用原文定位');
+                }
+                if (selected.status === 'inferred') breaks.push('当前节点含系统推测成分');
+                sideBody.appendChild(Utils.create('p', { class: 'wb-graph-side-kicker', text: '断点' }));
+                sideBody.appendChild(Utils.create('div', {
+                    class: 'wb-file-meta',
+                    text: breaks.length ? breaks.join('；') : '当前节点未标记为断点。'
+                }));
+            }
+
+            if (selected.kind === 'case') {
+                const bridges = (visible.nodes || []).filter((n) =>
+                    n.kind === 'entity' && (n.bridge || n.breakpoint) && (n.caseIds || []).includes(selected.caseId)
+                );
+                sideBody.appendChild(Utils.create('p', { class: 'wb-graph-side-kicker', text: '跨案桥' }));
+                sideBody.appendChild(Utils.create('div', {
+                    class: 'wb-file-meta',
+                    text: bridges.length
+                        ? `本案相关跨案对象 ${bridges.length} 个。`
+                        : '本案当前没有跨案共同对象。'
+                }));
+                const paths = this._graphPathsToOtherCases(selected, visible, 2);
+                sideBody.appendChild(Utils.create('p', { class: 'wb-graph-side-kicker', text: '通往其他案件' }));
+                if (!paths.length) {
+                    sideBody.appendChild(Utils.create('div', {
+                        class: 'wb-file-meta',
+                        text: '当前 2 跳内没有经共同对象通往其他案件的实线通路。'
+                    }));
+                }
+                paths.forEach((path) => {
+                    const labels = path.steps.map((step) =>
+                        `${(step.to && step.to.label) || ''} · ${step.edge.label}`
+                    );
+                    const row = Utils.create('button', {
+                        type: 'button',
+                        class: 'wb-graph-rel'
+                    }, [
+                        Utils.create('span', { text: path.caseNode.label }),
+                        Utils.create('span', { class: 'wb-file-meta', text: labels.join(' · ') })
+                    ]);
+                    row.addEventListener('click', () => {
+                        this.selectedGraphNodeId = path.caseNode.id;
+                        this.selectedGraphEdgeId = null;
+                        this.graphPan = null;
+                        this._renderCurrentView();
+                    });
+                    sideBody.appendChild(row);
+                });
+            }
+
+            if (selected.kind === 'event') {
+                sideBody.appendChild(Utils.create('div', {
+                    class: 'wb-file-meta',
+                    text: [
+                        selected.subLabel || '行为',
+                        selected.breakpoint ? '断点/待核' : '',
+                        this._graphStatusLabel(selected.status)
+                    ].filter(Boolean).join(' · ')
+                }));
+            }
+
+            sideBody.appendChild(Utils.create('p', { class: 'wb-graph-side-kicker', text: '直接关联' }));
+            const related = visible.edges.filter((e) => e.from === selected.id || e.to === selected.id);
+            if (!related.length) {
+                sideBody.appendChild(Utils.create('div', { class: 'wb-file-meta', text: '当前邻域内暂无直接关系。' }));
+            }
+            related.forEach((e) => {
+                const otherId = e.from === selected.id ? e.to : e.from;
+                const other = visible.nodes.find((n) => n.id === otherId);
+                const row = Utils.create('button', {
+                    type: 'button',
+                    class: 'wb-graph-rel'
+                }, [
+                    Utils.create('span', {
+                        text: `${(other && other.label) || otherId} · ${e.label}`
+                    }),
+                    Utils.create('span', {
+                        class: 'wb-file-meta',
+                        text: this._graphStatusLabel(e.status)
+                    })
+                ]);
+                row.addEventListener('click', () => {
+                    this.selectedGraphEdgeId = null;
+                    this.selectedGraphNodeId = otherId;
+                    this.graphPan = null;
+                    this._renderCurrentView();
+                });
+                sideBody.appendChild(row);
+            });
+
+            const cites = this._graphNodeCitations(selected, visible.edges);
+            const materialsBtn = this._iconBtn('wb-btn wb-btn-outline', 'fileCheck2', '查看支持材料');
+            materialsBtn.style.width = '100%';
+            materialsBtn.style.marginTop = '12px';
+            materialsBtn.addEventListener('click', () => {
+                const linkable = cites.filter((c) => this._graphLinkable(c))
+                    .sort((a, b) => Number(!!b.quote_hash) - Number(!!a.quote_hash));
+                if (linkable.length) {
+                    this._openCitation(linkable[0], linkable, 0);
+                    return;
+                }
+                if (selected.candidate) {
+                    this.selectedEntityId = selected.candidateId;
+                    this.setView('entities');
+                    return;
+                }
+                Toast.info('暂无可用原文定位');
+            });
+            sideBody.appendChild(materialsBtn);
+
+            const relatedClues = this._graphRelatedClues(selected, clueItems);
+            const clueBtn = this._iconBtn(
+                'wb-btn wb-btn-outline',
+                'link2',
+                `打开相关线索（${relatedClues.length}）`
+            );
+            clueBtn.style.width = '100%';
+            clueBtn.style.marginTop = '8px';
+            clueBtn.addEventListener('click', () => {
+                if (selected.candidate) {
+                    this._openLeadsForEntity(selected.candidate);
+                    return;
+                }
+                this.leadsEntityFilter = null;
+                this.leadsQuery = selected.label || '';
+                this.setView('leads');
+            });
+            sideBody.appendChild(clueBtn);
+        },
+
+        async _viewGraph(root) {
+            const entityData = await this._ensureEntitySet();
+            const clueItems = await this._collectClueItems();
+            const timelineData = await this._peekTimelinePayload();
+            const model = this._buildGraphModel(entityData, timelineData);
+            if (this.graphTypeFilter == null) this.graphTypeFilter = 'all';
+            if (this.graphHideWeak == null) this.graphHideWeak = true;
+            if (this.graphShowEvents == null) this.graphShowEvents = false;
+
+            const graphActions = Utils.create('div', { class: 'wb-page-head-actions' });
             const weakBtn = this._iconBtn(
                 'wb-btn wb-btn-outline',
                 'filter',
-                this.graphHideWeak ? '显示路径合成边' : '收起路径合成边'
+                this.graphHideWeak ? '显示弱关系' : '收起弱关系'
             );
             weakBtn.addEventListener('click', () => {
                 this.graphHideWeak = !this.graphHideWeak;
+                this.graphPan = null;
+                this._renderCurrentView();
+            });
+            const scopeBtn = this._iconBtn(
+                'wb-btn wb-btn-outline',
+                this.graphShowAll ? 'gitBranch' : 'waypoints',
+                this.graphShowAll ? '回到跨案桥' : '查看全图'
+            );
+            scopeBtn.addEventListener('click', () => {
+                this.graphShowAll = !this.graphShowAll;
+                this.graphPan = null;
+                this._renderCurrentView();
+            });
+            const eventBtn = this._iconBtn(
+                this.graphShowEvents ? 'wb-btn wb-btn-primary' : 'wb-btn wb-btn-outline',
+                'calendar',
+                this.graphShowEvents ? '收起行为' : '叠加行为'
+            );
+            eventBtn.addEventListener('click', () => {
+                this.graphShowEvents = !this.graphShowEvents;
+                this.graphPan = null;
                 this._renderCurrentView();
             });
             graphActions.appendChild(weakBtn);
+            graphActions.appendChild(scopeBtn);
+            graphActions.appendChild(eventBtn);
             root.appendChild(this._pageHead(
                 '链条图谱',
-                '实体、案件与已挂接线索的关系视图；共享对象的线索以「路径相关」弱边合成，不表示已认定同一犯罪链条。',
+                '默认只画跨案共同对象：案件之间靠哪些对象连上、哪些已排除同一、哪些在同一记载里共现。单案内行为请看角色时间线。',
                 graphActions,
-                '关系视图'
+                this.graphShowAll ? '全图' : '跨案桥'
             ));
-            if (!nodes.length) {
-                root.appendChild(Utils.create('div', { class: 'wb-empty', text: '暂无关系可展示。请先完成标识比对或形成关联线索。' }));
+
+            if (!model.nodes.some((n) => n.kind === 'entity')) {
+                root.appendChild(Utils.create('div', {
+                    class: 'wb-empty',
+                    text: '暂无对象可展示。请先完成标识比对。'
+                }));
                 return;
             }
-            if (!this.selectedGraphNodeId || !nodes.some((n) => n.id === this.selectedGraphNodeId)) {
-                this.selectedGraphNodeId = nodes[0].id;
+
+            const hasBridge = model.nodes.some((n) => n.kind === 'entity' && (n.bridge || n.breakpoint));
+            if (!hasBridge) {
+                root.appendChild(Utils.create('div', { class: 'wb-alert info' }, [
+                    window.Icons ? Icons.el('info') : Utils.create('span', { text: 'ℹ' }),
+                    Utils.create('span', {
+                        text: '当前没有跨案共同对象。图谱看的是案件之间靠哪些对象连上；单案内行为请看角色时间线。'
+                    })
+                ]));
             }
+
+            const toolbar = Utils.create('div', { class: 'wb-graph-toolbar' });
+            const typeSel = Utils.create('select');
+            const typeOpts = [['all', '全部类型']];
+            const present = new Set(model.nodes.filter((n) => n.kind === 'entity').map((n) => n.entityType));
+            if (model.nodes.some((n) => n.kind === 'event')) present.add('EVENT');
+            ['PERSON', 'BANK_ACCOUNT', 'PHONE', 'DEVICE', 'ORGANIZATION', 'MERCHANT', 'ID_CARD', 'IP', 'EVENT'].forEach((t) => {
+                if (present.has(t)) typeOpts.push([t, this._graphTypeLabel(t)]);
+            });
+            typeOpts.forEach(([v, t]) => typeSel.appendChild(Utils.create('option', { value: v, text: t })));
+            typeSel.value = present.has(this.graphTypeFilter) || this.graphTypeFilter === 'all'
+                ? this.graphTypeFilter
+                : 'all';
+            typeSel.addEventListener('change', () => {
+                this.graphTypeFilter = typeSel.value;
+                this.graphPan = null;
+                this._renderCurrentView();
+            });
+            const caseSel = Utils.create('select');
+            caseSel.appendChild(Utils.create('option', { value: 'all', text: '全部案件' }));
+            (this.task.cases || []).forEach((c) => {
+                caseSel.appendChild(Utils.create('option', {
+                    value: c.case_id,
+                    text: c.display_name || c.name || c.case_id
+                }));
+            });
+            caseSel.value = this.graphCaseFilter || 'all';
+            caseSel.addEventListener('change', () => {
+                this.graphCaseFilter = caseSel.value;
+                this.graphPan = null;
+                this._renderCurrentView();
+            });
+            const statusSel = Utils.create('select');
+            [
+                ['all', '全部状态'],
+                ['recorded', '材料记载'],
+                ['pending', '待确认'],
+                ['confirmed', '人工确认'],
+                ['inferred', '系统推测']
+            ].forEach(([v, t]) => statusSel.appendChild(Utils.create('option', { value: v, text: t })));
+            statusSel.value = this.graphStatusFilter || 'all';
+            statusSel.addEventListener('change', () => {
+                this.graphStatusFilter = statusSel.value;
+                this.graphPan = null;
+                this._renderCurrentView();
+            });
+            toolbar.appendChild(typeSel);
+            toolbar.appendChild(caseSel);
+            toolbar.appendChild(statusSel);
+            toolbar.appendChild(Utils.create('span', {
+                class: 'wb-file-meta',
+                text: '滚轮缩放 · 拖动画布平移'
+            }));
+            root.appendChild(toolbar);
+
+            const visible = this._graphFilterModel(model);
+            const { nodes, edges } = visible;
+            if (!nodes.length) {
+                root.appendChild(Utils.create('div', { class: 'wb-empty', text: '当前筛选下没有可展示的对象。' }));
+                return;
+            }
+
             const selected = nodes.find((n) => n.id === this.selectedGraphNodeId) || nodes[0];
+            this.selectedGraphNodeId = selected.id;
+            const selectedEdge = this.selectedGraphEdgeId
+                ? edges.find((e) => e.id === this.selectedGraphEdgeId)
+                : null;
 
             root.appendChild(Utils.create('div', { class: 'ref-graph-legend' }, [
                 Utils.create('span', {}, [
-                    Utils.create('i', { class: 'ref-graph-dot' }),
-                    Utils.create('span', { text: '材料记载' })
+                    Utils.create('i', { class: 'ref-graph-dot ok' }),
+                    Utils.create('span', { text: '跨案桥 / 材料记载' })
                 ]),
                 Utils.create('span', {}, [
                     Utils.create('i', { class: 'ref-graph-dot warn' }),
                     Utils.create('span', { text: '待确认' })
+                ]),
+                Utils.create('span', {}, [
+                    Utils.create('i', { class: 'ref-graph-line dash' }),
+                    Utils.create('span', { text: '已排除同一 / 系统推测' })
+                ]),
+                Utils.create('span', {}, [
+                    Utils.create('i', { class: 'ref-graph-line' }),
+                    Utils.create('span', { text: '同事件共现' })
                 ])
-            ]));
+            ].concat(this.graphShowEvents ? [
+                Utils.create('span', {}, [
+                    Utils.create('i', { class: 'ref-graph-arrow' }),
+                    Utils.create('span', { text: '箭头表示记载时间先后' })
+                ])
+            ] : [])));
 
             const layout = Utils.create('div', { class: 'wb-graph-layout' });
-            const canvas = Utils.create('div', { class: 'wb-graph-canvas' });
+            const canvasCard = Utils.create('div', { class: 'wb-graph-canvas-card' });
+            canvasCard.appendChild(Utils.create('div', { class: 'wb-graph-canvas-head' }, [
+                Utils.create('div', {}, [
+                    Utils.create('div', { class: 'wb-entity-title', text: '关系网络' }),
+                    Utils.create('div', {
+                        class: 'wb-file-meta',
+                        text: this.graphShowAll
+                            ? `全图 ${nodes.length} 个节点 · ${edges.length} 条关系${this.graphShowEvents ? ' · 已叠加行为' : ''}`
+                            : `跨案桥邻域 · ${nodes.length} 个节点 · ${edges.length} 条关系`
+                    })
+                ])
+            ]));
+            const viewport = Utils.create('div', { class: 'wb-graph-viewport' });
+            const world = Utils.create('div', { class: 'wb-graph-world' });
             const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-            svg.style.position = 'absolute';
-            svg.style.top = '0';
-            svg.style.left = '0';
-            canvas.appendChild(svg);
-            layout.appendChild(canvas);
-            // 先挂到文档，便于用实际可用宽度做自适应网格布局
+            svg.setAttribute('class', 'wb-graph-edges');
+            world.appendChild(svg);
+            viewport.appendChild(world);
+            canvasCard.appendChild(viewport);
+            layout.appendChild(canvasCard);
+
+            const side = Utils.create('div', { class: 'wb-detail-card wb-graph-side' });
+            side.appendChild(Utils.create('div', { class: 'wb-detail-card-head' }, [
+                Utils.create('div', { class: 'wb-entity-title', text: '节点详情' }),
+                Utils.create('div', {
+                    class: 'wb-file-meta',
+                    text: selectedEdge
+                        ? `${selectedEdge.label} · ${this._graphStatusLabel(selectedEdge.status)}`
+                        : `${selected.typeLabel} · ${selected.label}`
+                })
+            ]));
+            const sideBody = Utils.create('div', { class: 'wb-detail-card-body' });
+            side.appendChild(sideBody);
+            layout.appendChild(side);
             root.appendChild(layout);
 
-            // —— 双带排布（贴近原始观感）：案件在顶部一行，其余在下方网格；
-            //    放不下时加高画布并允许滚动，不再把画布外的节点裁掉 ——
-            const caseNodes = nodes.filter((n) => n.type === '案件');
-            const other = nodes.filter((n) => n.type !== '案件');
-            const positions = {};
-            const baseW = canvas.clientWidth || 760;
-            const totalW = baseW;
-            const CASE_Y = 72;         // 顶部案件带
-            const OTHER_TOP = 172;     // 其余节点起始 y
-            const ROW_STEP = 118;      // 行距
-            const otherCols = 3;   // 固定三列（用户偏好）
-            // 三列下按列中心间距收缩卡宽，窄画布里也不会左右重叠；宽时保持 160
-            const nodeW = Math.min(160, Math.max(120, Math.floor((totalW / (otherCols + 1)) * 0.86)));
-            const otherRows = Math.max(1, Math.ceil(other.length / otherCols));
-            const canvasH = Math.max(380, OTHER_TOP + otherRows * ROW_STEP + 30);
-            const pad = 0.2; // 左右各留 3% 的空白（可调小至 0.01 或 0）
-            const fracAt = (i, n) => {
-                if (n <= 1) return 0.5;
-                return pad + (i / (n - 1)) * (1 - 2 * pad);
-            };
+            const vw = Math.max(viewport.clientWidth || 760, 480);
+            const vh = Math.max(viewport.clientHeight || 520, 420);
+            const positions = this._graphLayout(nodes, edges, vw, vh);
+            if (!this.graphPan) this._graphFitPan(viewport, positions);
 
-            caseNodes.forEach((n, i) => {
-                positions[n.id] = { x: totalW * fracAt(i, caseNodes.length), y: CASE_Y };
+            let minX = Infinity;
+            let minY = Infinity;
+            let maxX = -Infinity;
+            let maxY = -Infinity;
+            nodes.forEach((n) => {
+                const p = positions[n.id];
+                minX = Math.min(minX, p.x);
+                minY = Math.min(minY, p.y);
+                maxX = Math.max(maxX, p.x);
+                maxY = Math.max(maxY, p.y);
             });
-            other.forEach((n, i) => {
-                const col = i % otherCols;
-                const row = Math.floor(i / otherCols);
-                positions[n.id] = {
-                    x: totalW * fracAt(col, otherCols),
-                    y: OTHER_TOP + row * ROW_STEP
+            const svgW = Math.max(maxX - minX + 400, vw);
+            const svgH = Math.max(maxY - minY + 400, vh);
+            svg.setAttribute('width', String(svgW));
+            svg.setAttribute('height', String(svgH));
+            svg.style.width = `${svgW}px`;
+            svg.style.height = `${svgH}px`;
+
+            const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
+            const marker = document.createElementNS('http://www.w3.org/2000/svg', 'marker');
+            marker.setAttribute('id', 'wb-graph-arrow');
+            marker.setAttribute('viewBox', '0 0 10 10');
+            marker.setAttribute('refX', '9');
+            marker.setAttribute('refY', '5');
+            marker.setAttribute('markerWidth', '7');
+            marker.setAttribute('markerHeight', '7');
+            marker.setAttribute('orient', 'auto');
+            const markerPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+            markerPath.setAttribute('d', 'M 0 0 L 10 5 L 0 10 z');
+            markerPath.setAttribute('class', 'wb-graph-edge-arrow');
+            marker.appendChild(markerPath);
+            defs.appendChild(marker);
+            svg.appendChild(defs);
+
+            const offsetEnds = (a, b, padA, padB) => {
+                const dx = b.x - a.x;
+                const dy = b.y - a.y;
+                const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+                return {
+                    x1: a.x + (dx / dist) * padA,
+                    y1: a.y + (dy / dist) * padA,
+                    x2: b.x - (dx / dist) * padB,
+                    y2: b.y - (dy / dist) * padB
                 };
-            });
-
-            canvas.style.overflow = 'auto';
-            canvas.style.height = `${canvasH}px`;
-            svg.setAttribute('width', String(totalW));
-            svg.setAttribute('height', String(canvasH));
-            svg.style.width = `${totalW}px`;
-            svg.style.height = `${canvasH}px`;
+            };
 
             edges.forEach((e) => {
                 const a = positions[e.from];
                 const b = positions[e.to];
                 if (!a || !b) return;
+                const fromNode = nodes.find((n) => n.id === e.from);
+                const toNode = nodes.find((n) => n.id === e.to);
+                const padA = fromNode && fromNode.kind === 'event' ? 78 : 70;
+                const padB = toNode && toNode.kind === 'event' ? 78 : 70;
+                const pts = offsetEnds(a, b, padA, padB);
                 const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-                line.setAttribute('x1', String(a.x));
-                line.setAttribute('y1', String(a.y));
-                line.setAttribute('x2', String(b.x));
-                line.setAttribute('y2', String(b.y));
-                line.setAttribute('stroke', 'currentColor');
-                line.setAttribute('stroke-opacity', e.strength === 'weak' ? '0.35' : '0.25');
-                line.setAttribute('stroke-width', e.strength === 'weak' ? '1.5' : '2');
-                if (e.strength === 'weak') {
-                    line.setAttribute('stroke-dasharray', '4 4');
+                line.setAttribute('x1', String(pts.x1));
+                line.setAttribute('y1', String(pts.y1));
+                line.setAttribute('x2', String(pts.x2));
+                line.setAttribute('y2', String(pts.y2));
+                line.setAttribute('class', `wb-graph-edge is-${e.status || 'recorded'}${e.kind === 'sequence' ? ' is-sequence' : ''}${e.kind === 'excluded' ? ' is-excluded' : ''}`);
+                if (e.strength === 'weak' || e.status === 'inferred' || e.kind === 'excluded' || (e.kind === 'sequence' && e.label === '先后待核')) {
+                    line.setAttribute('stroke-dasharray', '6 6');
                 }
+                if (e.directed) line.setAttribute('marker-end', 'url(#wb-graph-arrow)');
+                const hit = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                hit.setAttribute('x1', String(pts.x1));
+                hit.setAttribute('y1', String(pts.y1));
+                hit.setAttribute('x2', String(pts.x2));
+                hit.setAttribute('y2', String(pts.y2));
+                hit.setAttribute('class', 'wb-graph-edge-hit');
+                hit.addEventListener('click', (ev) => {
+                    ev.stopPropagation();
+                    this.selectedGraphEdgeId = e.id;
+                    this._renderCurrentView();
+                });
                 svg.appendChild(line);
+                svg.appendChild(hit);
+                if (e.kind === 'sequence' || e.kind === 'act' || e.kind === 'cooccur' || e.kind === 'excluded') {
+                    const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                    label.setAttribute('x', String((pts.x1 + pts.x2) / 2));
+                    label.setAttribute('y', String((pts.y1 + pts.y2) / 2 - 6));
+                    label.setAttribute('class', 'wb-graph-edge-label');
+                    label.setAttribute('text-anchor', 'middle');
+                    label.textContent = e.label;
+                    svg.appendChild(label);
+                }
             });
 
             nodes.forEach((n) => {
-                const pos = positions[n.id] || { x: totalW / 2, y: canvasH / 2 };
-                const typeIcon = n.type === '案件'
-                    ? 'fileText'
-                    : (window.Icons ? Icons.forEntityType(n.type || n.label) : 'users');
-                const titleRow = Utils.create('div', { class: 't', style: 'display:flex;align-items:center;gap:6px' });
+                const pos = positions[n.id];
+                const icoWrap = Utils.create('span', {
+                    class: `wb-graph-node-ico is-${n.status}${n.kind === 'case' ? ' is-case' : ''}${n.kind === 'event' ? ' is-event' : ''}`
+                });
                 if (window.Icons) {
-                    titleRow.appendChild(Icons.el(typeIcon, 'wb-list-type-ico'));
+                    const icoName = n.kind === 'case'
+                        ? 'fileText'
+                        : (n.kind === 'event' ? 'calendar' : Icons.forEntityType(n.entityType || n.typeLabel));
+                    icoWrap.appendChild(Icons.el(icoName, 'wb-graph-node-svg'));
                 }
-                const textEl = Utils.create('span', { class: 'cl', text: n.label });
-                titleRow.appendChild(textEl);
                 const node = Utils.create('div', {
-                    class: `wb-graph-node${n.id === selected.id ? ' active' : ''}`,
-                    style: `left:${pos.x}px;top:${pos.y}px;width:${nodeW}px`
+                    class: [
+                        'wb-graph-node',
+                        n.id === selected.id ? 'active' : '',
+                        `is-${n.status}`,
+                        n.kind === 'case' ? 'is-case' : '',
+                        n.kind === 'event' ? 'is-event' : '',
+                        n.breakpoint || n.status === 'inferred' ? 'is-inferred' : '',
+                        n.bridge ? 'is-bridge' : ''
+                    ].filter(Boolean).join(' ')
                 }, [
-                    titleRow,
-                    Utils.create('div', { class: 's', style: 'text-align:center; padding-right: 40px;',text: n.type })
+                    icoWrap,
+                    Utils.create('span', { class: 'cl', text: n.label }),
+                    Utils.create('span', { class: 's', text: n.subLabel || n.typeLabel })
                 ]);
-                node.setAttribute('title', `${n.label}（${n.type}）`);
-                node.addEventListener('click', () => {
+                node.style.left = `${pos.x}px`;
+                node.style.top = `${pos.y}px`;
+                node.setAttribute(
+                    'title',
+                    `${n.label}（${n.subLabel || n.typeLabel} · ${this._graphStatusLabel(n.status)}）`
+                );
+                node.addEventListener('click', (ev) => {
+                    ev.stopPropagation();
+                    const hopChange = !this.graphShowAll && this.selectedGraphNodeId !== n.id;
                     this.selectedGraphNodeId = n.id;
+                    this.selectedGraphEdgeId = null;
+                    if (hopChange) this.graphPan = null;
                     this._renderCurrentView();
                 });
-                canvas.appendChild(node);
+                world.appendChild(node);
             });
 
-            const side = Utils.create('div', { class: 'wb-detail-card' });
-            side.appendChild(Utils.create('div', { class: 'wb-detail-card-head' }, [
-                Utils.create('div', { class: 'wb-entity-title', text: '节点详情' }),
-                Utils.create('div', { class: 'wb-file-meta', text: `${selected.type} · ${selected.label}` })
-            ]));
-            const sideBody = Utils.create('div', { class: 'wb-detail-card-body' });
-            sideBody.appendChild(Utils.create('div', { class: 'wb-alert warn' }, [
-                window.Icons ? Icons.el('info') : Utils.create('span', { text: 'ℹ' }),
-                Utils.create('span', { text: '需人工判断：图谱关系来自字段碰撞与线索，不代表主体身份或共同犯罪事实已经成立。' })
-            ]));
-            const related = edges.filter((e) => e.from === selected.id || e.to === selected.id);
-            related.forEach((e) => {
-                const otherId = e.from === selected.id ? e.to : e.from;
-                const other = nodes.find((n) => n.id === otherId);
-                const row = Utils.create('button', {
-                    type: 'button',
-                    class: 'wb-list-item',
-                    style: 'width:100%;margin-bottom:6px'
-                }, [
-                    Utils.create('div', {
-                        class: 'wb-list-item-title',
-                        text: `${(other && other.label) || otherId} · ${e.label}`
-                    }),
-                    Utils.create('div', { class: 'wb-list-item-meta', text: e.source })
-                ]);
-                row.addEventListener('click', () => {
-                    this.selectedGraphNodeId = otherId;
-                    this._renderCurrentView();
-                });
-                sideBody.appendChild(row);
-            });
-            const toEntities = this._iconBtn('wb-btn wb-btn-outline', 'fileStack', '查看支持材料 / 实体复核');
-            toEntities.style.width = '100%';
-            toEntities.style.marginTop = '12px';
-            toEntities.addEventListener('click', () => this.setView('entities'));
-            const toLeads = this._iconBtn('wb-btn wb-btn-outline', 'link2', '查看生成线索');
-            toLeads.style.width = '100%';
-            toLeads.style.marginTop = '8px';
-            toLeads.addEventListener('click', () => this.setView('leads'));
-            sideBody.appendChild(toEntities);
-            sideBody.appendChild(toLeads);
-            side.appendChild(sideBody);
-            layout.appendChild(side);
-            root.appendChild(layout);
+            this._graphBindPanZoom(viewport, world);
+            this._graphFillSidebar(sideBody, selected, selectedEdge, visible, clueItems);
 
-            // relation table
             const tableCard = Utils.create('div', { class: 'wb-panel-card', style: 'margin-top:14px' });
             tableCard.appendChild(Utils.create('div', { class: 'wb-panel-card-head' }, [
-                Utils.create('div', { class: 'wb-entity-title', text: '关系列表' })
+                Utils.create('div', { class: 'wb-entity-title', text: '当前可见关系' })
             ]));
             const wrap = Utils.create('div', { class: 'wb-table-wrap' });
             const table = Utils.create('table', { class: 'wb-table' });
             table.appendChild(Utils.create('thead', {}, [
                 Utils.create('tr', {}, [
-                    Utils.create('th', { text: '节点 A' }),
+                    Utils.create('th', { text: '对象 A' }),
                     Utils.create('th', { text: '关系' }),
-                    Utils.create('th', { text: '节点 B' }),
+                    Utils.create('th', { text: '对象 B' }),
+                    Utils.create('th', { text: '状态' }),
                     Utils.create('th', { text: '来源' })
                 ])
             ]));
@@ -5114,13 +6661,24 @@
             edges.forEach((e) => {
                 const a = nodes.find((n) => n.id === e.from);
                 const b = nodes.find((n) => n.id === e.to);
-                tbody.appendChild(Utils.create('tr', {}, [
+                const tr = Utils.create('tr', { class: 'wb-graph-row' }, [
                     Utils.create('td', { text: (a && a.label) || e.from }),
                     Utils.create('td', { text: e.label }),
                     Utils.create('td', { text: (b && b.label) || e.to }),
+                    Utils.create('td', { text: this._graphStatusLabel(e.status) }),
                     Utils.create('td', { text: e.source })
-                ]));
+                ]);
+                tr.addEventListener('click', () => {
+                    this.selectedGraphEdgeId = e.id;
+                    this._renderCurrentView();
+                });
+                tbody.appendChild(tr);
             });
+            if (!edges.length) {
+                tbody.appendChild(Utils.create('tr', {}, [
+                    Utils.create('td', { text: '当前邻域没有可展示的关系。', colspan: '5' })
+                ]));
+            }
             table.appendChild(tbody);
             wrap.appendChild(table);
             tableCard.appendChild(wrap);

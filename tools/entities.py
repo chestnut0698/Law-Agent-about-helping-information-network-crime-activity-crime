@@ -1621,6 +1621,10 @@ def remember_rejection(task_id: str, fingerprint: str, decision: str, reason: st
             (task_id, fingerprint),
         )
         if existing:
+            conn.execute(
+                "UPDATE rejected_candidates SET decision = ?, reason = ? WHERE id = ?",
+                (decision, reason or "", existing["id"]),
+            )
             return
         _insert(
             conn,
@@ -1633,6 +1637,18 @@ def remember_rejection(task_id: str, fingerprint: str, decision: str, reason: st
                 "reason": reason or "",
                 "created_at": utc_now(),
             },
+        )
+
+
+def forget_rejection(task_id: str, fingerprint: str, db_path=None) -> None:
+    """人工改判不再「保留独立」时，允许该指纹重新进入比对。"""
+    if not fingerprint:
+        return
+    init_entity_db(db_path)
+    with db_session(db_path) as conn:
+        conn.execute(
+            "DELETE FROM rejected_candidates WHERE task_id = ? AND fingerprint = ?",
+            (task_id, fingerprint),
         )
 
 
