@@ -1,13 +1,94 @@
 /* ========================================
-   thinking.js — 分析步骤 / 思考过程（默认折叠）
+   thinking.js — 分析步骤 / 思考过程（> 折叠，点开右转朝下）
+   只展示法律人能看懂的中文，不展示英文思维链与技术细节
    ======================================== */
 (function (global) {
     'use strict';
 
+    const FALLBACK = '正在梳理本步核验思路。';
+
     const Thinking = {
+        _caret() {
+            return Utils.create('span', { class: 'thinking-caret', 'aria-hidden': 'true' });
+        },
+
+        _bindToggle(header, block) {
+            header.addEventListener('click', () => {
+                const open = block.classList.contains('expanded');
+                this.setExpanded(block, !open);
+            });
+        },
+
+        _latinCount(text) {
+            return (String(text).match(/[A-Za-z]/g) || []).length;
+        },
+
+        _cjkCount(text) {
+            return (String(text).match(/[\u4e00-\u9fff]/g) || []).length;
+        },
+
+        isMostlyEnglish(text) {
+            const s = String(text || '').trim();
+            if (!s) return false;
+            const latin = this._latinCount(s);
+            const cjk = this._cjkCount(s);
+            if (cjk >= 8 && cjk >= latin) return false;
+            if (cjk === 0 && latin >= 8) return true;
+            if (latin >= 8 && latin > cjk * 2) return true;
+            return false;
+        },
+
+        isTechnical(text) {
+            const s = String(text || '').trim();
+            if (!s) return true;
+            if (/^[{[\s]*["']?[a-z_][a-z0-9_]*["']?\s*[:=]/i.test(s)) return true;
+            return /\bhttps?:\/\/|```|\bfunction\s|\btool_call\b|\barguments\b|\berror_code\b|\btraceback\b|\bquote_hash\b|\bchunk_id\b|\bartifact_id\b|\btask_id\b|\bcandidate_id\b|\banalysis_gate\b|\bTrue\b|\bFalse\b|\bNone\b|\bnull\b|\bundefined\b/i.test(s);
+        },
+
         /**
-         * 兼容旧接口：单块思考面板
+         * 只留下法律人能看懂的中文；英文、JSON、代码与工程字段一律丢掉。
          */
+        legalize(text) {
+            if (!text) return '';
+            let t = String(text);
+            t = t.replace(/```[\s\S]*?```/g, '\n');
+            t = t.replace(/\{[^{}]*\}/g, '\n');
+            t = t.replace(/\[[^[\]]*\]/g, '\n');
+            t = t.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '');
+            const names = (global.ToolCall && ToolCall.TOOL_LABELS) || {};
+            Object.keys(names).sort((a, b) => b.length - a.length).forEach((name) => {
+                t = t.replace(new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), names[name]);
+            });
+            const pairs = [
+                [/analysis_gate/gi, ''],
+                [/ENTITY_REVIEW/g, '实体复核'],
+                [/ENTITY_CANDIDATE_SET/g, '跨案对象待核清单'],
+                [/ROLE_TIMELINE/g, '事件时间线'],
+                [/CLUE_SET|CLUE_ITEM/g, '疑似关联线索'],
+                [/REPORT_DRAFT|REPORT_EXPORT/g, '核验单'],
+                [/MATERIAL_BATCH/g, '材料批次'],
+                [/KEEP_SEPARATE/g, '保留独立'],
+                [/PENDING_REVIEW/g, '待人工核验'],
+                [/\bMERGE\b/g, '视为同一'],
+                [/\bPENDING\b/g, '待确认'],
+                [/\bDEFER\b/g, '暂缓']
+            ];
+            pairs.forEach(([re, label]) => {
+                t = t.replace(re, label);
+            });
+            t = t.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n');
+
+            const kept = [];
+            t.split(/\n+/).forEach((line) => {
+                const s = line.replace(/\s+/g, ' ').trim();
+                if (!s) return;
+                if (this.isTechnical(s) || this.isMostlyEnglish(s)) return;
+                if (this._cjkCount(s) < 4) return;
+                kept.push(s);
+            });
+            return kept.join('\n');
+        },
+
         create(data) {
             const expanded = data.defaultExpanded === true;
             const block = Utils.create('div', {
@@ -15,10 +96,9 @@
             });
 
             const header = Utils.create('div', { class: 'thinking-header' }, [
-                Utils.create('div', { class: 'thinking-icon', html: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>' }),
-                Utils.create('div', { class: 'thinking-title', text: data.title || '分析中…' }),
-                Utils.create('div', { class: 'thinking-meta', text: `${data.steps ? data.steps.length : 0} 项` }),
-                Utils.create('svg', { class: 'thinking-chevron', viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '2', html: '<path d="M6 9l6 6 6-6"/>' })
+                this._caret(),
+                Utils.create('div', { class: 'thinking-title', text: data.title || '分析思路' }),
+                Utils.create('div', { class: 'thinking-meta', text: expanded ? '进行中' : '已完成' })
             ]);
 
             const body = Utils.create('div', { class: 'thinking-body' });
@@ -26,21 +106,20 @@
             (data.steps || []).forEach((step) => {
                 const cls = step.status === 'active' ? 'thinking-step active' :
                             step.status === 'done'   ? 'thinking-step done' : 'thinking-step';
-                content.appendChild(Utils.create('div', { class: cls, text: step.text }));
+                const text = this.legalize(step.text || '');
+                if (!text) return;
+                content.appendChild(Utils.create('div', { class: cls, text }));
             });
+            if (!content.childElementCount) {
+                content.appendChild(Utils.create('div', { class: 'thinking-step done', text: '已按办案步骤梳理核验思路。' }));
+            }
             body.appendChild(content);
             block.appendChild(header);
             block.appendChild(body);
-            header.addEventListener('click', () => {
-                block.classList.toggle('expanded');
-                block.classList.toggle('compact');
-            });
+            this._bindToggle(header, block);
             return block;
         },
 
-        /**
-         * 分步卡片：思考 + 执行同卡；进行中默认展开，完成后折叠
-         */
         createStep(data) {
             const index = data.index || 1;
             const title = data.title || `第 ${index} 步`;
@@ -50,26 +129,22 @@
                 'data-step-index': String(index)
             });
             const header = Utils.create('div', { class: 'analysis-step-header' }, [
-                Utils.create('div', { class: 'thinking-icon', html: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>' }),
+                this._caret(),
                 Utils.create('div', { class: 'thinking-title', text: title }),
-                Utils.create('div', { class: 'thinking-meta analysis-step-meta', text: expanded ? '进行中' : '已完成' }),
-                Utils.create('svg', { class: 'thinking-chevron', viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '2', html: '<path d="M6 9l6 6 6-6"/>' })
+                Utils.create('div', { class: 'thinking-meta analysis-step-meta', text: expanded ? '进行中' : '已完成' })
             ]);
             const body = Utils.create('div', { class: 'analysis-step-body' });
-            const thinkLabel = Utils.create('div', { class: 'analysis-step-label', text: '分析思路' });
             const thinkContent = Utils.create('div', { class: 'thinking-content analysis-step-think' });
-            const toolsLabel = Utils.create('div', { class: 'analysis-step-label', text: '执行动作' });
             const toolsHost = Utils.create('div', { class: 'analysis-step-tools' });
-            body.appendChild(thinkLabel);
+            thinkContent.appendChild(Utils.create('div', {
+                class: 'thinking-step active',
+                text: FALLBACK
+            }));
             body.appendChild(thinkContent);
-            body.appendChild(toolsLabel);
             body.appendChild(toolsHost);
             block.appendChild(header);
             block.appendChild(body);
-            header.addEventListener('click', () => {
-                block.classList.toggle('expanded');
-                block.classList.toggle('compact');
-            });
+            this._bindToggle(header, block);
             return block;
         },
 
@@ -86,24 +161,45 @@
         },
 
         _scrollBottom(el) {
-            // 仅在接近底部时保持跟随，避免打断用户上翻阅读
             if (!el || el.scrollHeight <= el.clientHeight) return;
             const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
             if (nearBottom) el.scrollTop = el.scrollHeight;
         },
 
-        appendStepThinking(stepEl, text) {
-            if (!stepEl || !text) return;
-            const host = Utils.$('.analysis-step-think', stepEl);
-            if (!host) return;
+        _thinkNode(stepEl) {
+            const host = stepEl && Utils.$('.analysis-step-think', stepEl);
+            if (!host) return null;
             let last = host.lastElementChild;
             if (!last || !last.classList.contains('thinking-step')) {
                 last = Utils.create('div', { class: 'thinking-step active', text: '' });
                 host.appendChild(last);
             }
-            last.textContent += text;
+            return last;
+        },
+
+        appendStepThinking(stepEl, text) {
+            if (!stepEl) return;
+            if (text) stepEl._rawThink = (stepEl._rawThink || '') + text;
+            const cleaned = this.legalize(stepEl._rawThink || '');
+            const node = this._thinkNode(stepEl);
+            if (!node) return;
+            if (cleaned) {
+                node.textContent = cleaned;
+                node.setAttribute('data-from-model', '1');
+            } else if (node.getAttribute('data-from-model') !== '1') {
+                node.textContent = stepEl._hint || FALLBACK;
+            }
             this.setExpanded(stepEl, true);
-            this._scrollBottom(host);
+            this._scrollBottom(Utils.$('.analysis-step-think', stepEl));
+        },
+
+        ensureHint(stepEl, hint) {
+            if (!stepEl || !hint) return;
+            stepEl._hint = hint;
+            const node = this._thinkNode(stepEl);
+            if (node && node.getAttribute('data-from-model') !== '1') {
+                node.textContent = hint;
+            }
         },
 
         addToolToStep(stepEl, toolCard) {
@@ -133,7 +229,8 @@
             }
             const steps = Utils.$$('.thinking-step', thinkingEl);
             if (steps.length > 0) {
-                steps[steps.length - 1].textContent += text;
+                const cleaned = this.legalize(steps[steps.length - 1].textContent + text);
+                if (cleaned) steps[steps.length - 1].textContent = cleaned;
             }
         },
 
@@ -149,7 +246,8 @@
             const content = Utils.$('.thinking-content', thinkingEl);
             if (content) {
                 const cls = status ? `thinking-step ${status}` : 'thinking-step';
-                content.appendChild(Utils.create('div', { class: cls, text }));
+                const cleaned = this.legalize(text) || (this.isMostlyEnglish(text) ? '' : text);
+                if (cleaned) content.appendChild(Utils.create('div', { class: cls, text: cleaned }));
             }
         },
 

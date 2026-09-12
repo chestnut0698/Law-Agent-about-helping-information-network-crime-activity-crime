@@ -350,7 +350,7 @@ def read_artifact(task_id: str, artifact_id: str, user_id: str | None = None) ->
 
 
 def read_report(task_id: str, user_id: str | None = None) -> str:
-    """读取撰写《跨案关联线索核验单》所需的素材：任务范围、实体复核结论、存活线索、既有草稿与写作规范。"""
+    """读取撰写《跨案关联线索核验单》所需的素材：任务范围、实体复核结论（含视为同一/保留独立名单）、存活线索与来源编号、既有草稿与写作规范。"""
     try:
         return _tool_json(get_task_service().report_write_context(task_id))
     except TaskError as exc:
@@ -363,7 +363,7 @@ def write_report(
     note: str = "",
     user_id: str | None = None,
 ) -> str:
-    """提交你撰写完成的《跨案关联线索核验单》整篇正文；系统自动套固定边界并重算核对清单。"""
+    """提交你撰写完成的《跨案关联线索核验单》整篇正文；系统自动套固定边界，并按当前产物重算实体名单与来源编号清单。每次提交新增一版，不覆盖旧版。"""
     try:
         result = get_task_service().write_report_draft(
             task_id, body=body, note=note, user_id=user_id or "system"

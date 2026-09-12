@@ -162,7 +162,9 @@ class ReactAgent(BaseAgent):
                 tool_calls_msg = []
                 messages_tool_return = []
 
-                for idx, data in sorted(tool_calls_buffer.items()):
+                ordered = [item for _, item in sorted(tool_calls_buffer.items())]
+                names = [item["function_name"] for item in ordered]
+                for i, data in enumerate(ordered):
                     tool_calls_msg.append(
                         {
                             "id": data["id"],
@@ -173,7 +175,16 @@ class ReactAgent(BaseAgent):
                             },
                         }
                     )
-                    yield ("tool_calls", tool_calls_msg[-1]["function"])
+                    name = data["function_name"]
+                    yield (
+                        "tool_calls",
+                        {
+                            "name": name,
+                            "arguments": data["arguments"],
+                            "batch_index": names[: i + 1].count(name),
+                            "batch_total": names.count(name),
+                        },
+                    )
                     result = self.execute_tool(data)
                     messages_tool_return.append(
                         {

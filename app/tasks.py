@@ -1598,11 +1598,11 @@ class TaskService:
             parent_ids=parent_ids,
             payload={
                 "events": events[-200:],
-                "boundary": "留痕仅记录人工核验与回链操作，不构成法律结论。",
+                "boundary": "留痕仅记录人工核验、回链、报告撰写与导出操作，不构成法律结论。",
             },
         )
 
-    # ----- 报告：模型读素材 → 写整篇正文 → 单份迭代 -----
+    # ----- 报告：模型写正文 → 每写一版新产物，不覆盖旧版 -----
 
     @staticmethod
     def _report_aspect_label(aspect: Any) -> str:
@@ -1661,12 +1661,78 @@ class TaskService:
             "clues": self._active_clue_items(task_id),  # [(artifact, payload)]
         }
 
+    _REPORT_ENTITY_TYPE_LABELS = {
+        "PERSON": "人员",
+        "NAME": "人员",
+        "BANK_ACCOUNT": "银行账户",
+        "ACCOUNT": "银行账户",
+        "PHONE": "手机号码",
+        "DEVICE": "电子设备",
+        "ORGANIZATION": "组织主体",
+        "ORG": "组织主体",
+        "MERCHANT": "商户",
+        "ID_CARD": "身份证件",
+        "IP": "网络地址",
+    }
+
+    @classmethod
+    def _report_entity_type_label(cls, entity_type: Any) -> str:
+        key = str(entity_type or "").upper()
+        return cls._REPORT_ENTITY_TYPE_LABELS.get(key, "对象")
+
+    @staticmethod
+    def _report_clip_quote(quote: Any, max_len: int = 40) -> str:
+        text = re.sub(r"\s+", " ", str(quote or "").strip())
+        if not text:
+            return ""
+        if len(text) <= max_len:
+            return text
+        return text[: max_len - 1] + "…"
+
+    @staticmethod
+    def _report_clip_named(items: list[str], limit: int = 30) -> list[str]:
+        if len(items) <= limit:
+            return items
+        rest = len(items) - limit
+        return items[:limit] + [f"其余 {rest} 条见实体复核页，此处不逐条列出。"]
+
+    def _report_entity_name_line(self, candidate: dict[str, Any]) -> str:
+        type_label = self._report_entity_type_label(
+            candidate.get("entity_type") or candidate.get("object_type")
+        )
+        name = str(
+            candidate.get("display_name") or candidate.get("title") or ""
+        ).strip() or "未标注对象"
+        case_names: list[str] = []
+        for row in list(candidate.get("cases") or []) + list(candidate.get("records") or []):
+            if not isinstance(row, dict):
+                continue
+            label = str(
+                row.get("display_name") or row.get("name") or row.get("case_name") or ""
+            ).strip()
+            if label and label not in case_names:
+                case_names.append(label)
+        case_part = f"（{'、'.join(case_names)}）" if case_names else ""
+        return f"{type_label} {name}{case_part}"
+
     def _report_entity_stats(self, entity_payload: dict[str, Any]) -> dict[str, Any]:
         candidates = entity_payload.get("candidates") or []
         counts: dict[str, int] = {}
+        merge_items: list[str] = []
+        keep_items: list[str] = []
+        other_items: list[str] = []
         for cand in candidates:
-            key = str(cand.get("decision") or "PENDING")
+            if not isinstance(cand, dict):
+                continue
+            key = str(cand.get("decision") or "PENDING").upper()
             counts[key] = counts.get(key, 0) + 1
+            line = self._report_entity_name_line(cand)
+            if key == "MERGE":
+                merge_items.append(line)
+            elif key == "KEEP_SEPARATE":
+                keep_items.append(line)
+            elif key not in {"PENDING", "DEFER"}:
+                other_items.append(f"{line} · {key}")
         return {
             "total": len(candidates),
             "merge": counts.get("MERGE", 0),
@@ -1674,7 +1740,129 @@ class TaskService:
             "correct": counts.get("CORRECT", 0),
             "defer": counts.get("DEFER", 0),
             "pending": self._report_entity_pending(entity_payload),
+            "merge_items": self._report_clip_named(merge_items),
+            "keep_separate_items": self._report_clip_named(keep_items),
+            "other_items": self._report_clip_named(other_items),
         }
+
+    def _report_source_cite(self, ev: dict[str, Any], source_no: int) -> dict[str, Any]:
+        """办案可读的来源编号：案名 · 文件 · 页 · 短摘录，不含内部 ID。"""
+        case_name = str(ev.get("case_name") or "").strip()
+        filename = Path(str(ev.get("filename") or ev.get("document_name") or "")).name
+        page_start = ev.get("page_start") or ev.get("page_no")
+        page_end = ev.get("page_end")
+        page_text = "页码待核"
+        try:
+            start_n = int(page_start) if page_start not in (None, "") else 0
+            end_n = int(page_end) if page_end not in (None, "") else start_n
+            if start_n:
+                page_text = f"第{start_n}–{end_n}页" if end_n and end_n != start_n else f"第{start_n}页"
+        except (TypeError, ValueError):
+            pass
+        quote = self._report_clip_quote(ev.get("quote_display") or ev.get("quote"))
+        loc = " · ".join(part for part in (case_name, filename, page_text) if part) or "出处待核"
+        quote_part = f" · 「{quote}」" if quote else " · 原文摘录待核"
+        return {
+            "no": source_no,
+            "line": f"来源{source_no}：{loc}{quote_part}",
+            "case_name": case_name,
+            "filename": filename,
+            "page": page_text,
+            "quote": quote,
+        }
+
+    def _report_pack_clues(
+        self, alive: list[tuple[dict[str, Any], dict[str, Any]]]
+    ) -> tuple[list[dict[str, Any]], int]:
+        """线索清单 + 连续来源编号；invalid_refs 为缺少支持材料的条数。"""
+        packs: list[dict[str, Any]] = []
+        source_no = 0
+        invalid_refs = 0
+        for idx, (_art, payload) in enumerate(alive, start=1):
+            evidence = [ev for ev in (payload.get("evidence") or []) if isinstance(ev, dict)]
+            counter = [
+                ev for ev in (payload.get("counter_evidence") or []) if isinstance(ev, dict)
+            ]
+            if not evidence:
+                invalid_refs += 1
+            sources: list[dict[str, Any]] = []
+            for ev in evidence[:6]:
+                source_no += 1
+                sources.append(self._report_source_cite(ev, source_no))
+            counter_sources: list[dict[str, Any]] = []
+            for ev in counter[:4]:
+                source_no += 1
+                cite = self._report_source_cite(ev, source_no)
+                cite["stance"] = "counter"
+                counter_sources.append(cite)
+            case_names = {
+                str(ev.get("case_name") or "").strip()
+                for ev in evidence
+                if str(ev.get("case_name") or "").strip()
+            }
+            packs.append(
+                {
+                    "idx": idx,
+                    "title": payload.get("title") or "未命名待核事项",
+                    "aspect": self._report_aspect_label(payload.get("aspect")) or "未标注",
+                    "disposition": clue_state_label(payload),
+                    "evidence_count": len(evidence),
+                    "counter_count": len(counter),
+                    "case_count": len(case_names),
+                    "uncertainty": str(
+                        payload.get("uncertainty") or payload.get("boundary") or ""
+                    ).strip()[:40],
+                    "sources": sources,
+                    "counter_sources": counter_sources,
+                }
+            )
+        return packs, invalid_refs
+
+    @staticmethod
+    def _report_entity_checklist_lines(entity: dict[str, Any]) -> list[str]:
+        lines = [
+            "### 实体复核结论",
+            (
+                f"- 计数：候选 {entity['total']} · 视为同一 {entity['merge']} · "
+                f"保留独立 {entity['keep_separate']} · 待核 {entity['pending']}"
+            ),
+        ]
+        if entity.get("merge_items"):
+            lines.append("- 视为同一：")
+            lines.extend(f"  - {item}" for item in entity["merge_items"])
+        else:
+            lines.append("- 视为同一：无")
+        if entity.get("keep_separate_items"):
+            lines.append("- 保留独立：")
+            lines.extend(f"  - {item}" for item in entity["keep_separate_items"])
+        else:
+            lines.append("- 保留独立：无")
+        if entity.get("other_items"):
+            lines.append("- 其他处置：")
+            lines.extend(f"  - {item}" for item in entity["other_items"])
+        return lines
+
+    @staticmethod
+    def _report_clue_checklist_lines(packs: list[dict[str, Any]]) -> list[str]:
+        lines = ["### 待核验线索"]
+        if not packs:
+            lines.append("- 暂无待核线索。")
+            return lines
+        for pack in packs:
+            lines.append(
+                f"- {pack['idx']}) {pack['title']} "
+                f"（{pack['aspect']} · 处置 {pack['disposition']} · "
+                f"支持材料 {pack['evidence_count']} 处）"
+            )
+            for src in pack.get("sources") or []:
+                lines.append(f"  - {src['line']}")
+            for src in pack.get("counter_sources") or []:
+                lines.append(f"  - 反向 {src['line']}")
+            if pack.get("uncertainty"):
+                lines.append(f"  - 不确定性：{pack['uncertainty']}")
+            if not (pack.get("sources") or pack.get("counter_sources")):
+                lines.append("  - 来源：缺原文依据，导出前需补证或排除")
+        return lines
 
     def report_write_context(self, task_id: str) -> dict[str, Any]:
         """报告读工具：把任务范围、实体复核结论、存活线索与既有草稿压缩给模型写作用。"""
@@ -1683,37 +1871,20 @@ class TaskService:
         state = self._report_state(task_id)
         task = state["task"]
         scope_payload = state["scope_payload"] or {}
-
-        clues: list[dict[str, Any]] = []
-        for idx, (_art, payload) in enumerate(state["clues"], start=1):
-            evidence = payload.get("evidence") or []
-            case_names = {
-                str(ev.get("case_name") or "").strip()
-                for ev in evidence
-                if str(ev.get("case_name") or "").strip()
-            }
-            clues.append(
-                {
-                    "idx": idx,
-                    "title": payload.get("title") or "",
-                    "aspect": self._report_aspect_label(payload.get("aspect")) or "未标注",
-                    "disposition": clue_state_label(payload),
-                    "evidence_count": len(evidence),
-                    "case_count": len(case_names),
-                }
-            )
+        clue_packs, _invalid = self._report_pack_clues(state["clues"])
 
         draft: dict[str, Any] = {"exists": False}
-        report = self.find_artifact(task_id, "REPORT_DRAFT", "report-draft")
+        report = self._latest_report_draft(task_id)
         if report:
             art, payload = self._read_artifact_payload_raw(task_id, report["id"])
             draft = {
                 "exists": True,
-                "version": int(art["current_version"]),
+                "version": self._report_seq_of(art, payload),
                 "valid": bool((payload or {}).get("valid")),
                 "note": (payload or {}).get("note") or "",
                 "body": (payload or {}).get("body") or "",
                 "updated_at": art.get("updated_at"),
+                "overwrite": False,
             }
 
         return {
@@ -1729,7 +1900,7 @@ class TaskService:
                 if c
             ],
             "entity": self._report_entity_stats(state["entity_payload"]),
-            "clues": clues,
+            "clues": clue_packs,
             "blocked": self._report_state_blocked(state) or None,
             "draft": draft,
             "contract": REPORT_WRITING_CONTRACT,
@@ -1738,7 +1909,7 @@ class TaskService:
     def write_report_draft(
         self, task_id: str, body: str, note: str = "", user_id: str | None = None
     ) -> dict[str, Any]:
-        """写报告：严格门禁 → 收口校验 → 固定边界 + 模型整篇正文 + 系统自动核对清单；单份迭代。"""
+        """写报告：严格门禁 → 收口校验 → 固定边界 + 模型整篇正文 + 系统自动核对清单；每写一版新产物。"""
         from agents.prompts.report_writing import REPORT_BODY_MIN_CHARS
 
         state = self._report_state(task_id)
@@ -1761,39 +1932,26 @@ class TaskService:
         task = state["task"]
         scope_payload = state["scope_payload"] or {}
         alive = state["clues"]
-        invalid_refs = sum(
-            1 for _art, payload in alive if not (payload.get("evidence") or [])
-        )
+        clue_packs, invalid_refs = self._report_pack_clues(alive)
         boundary = (
             "本文件仅汇集跨案关联候选、待核验事项及材料原文依据，"
             "不构成对犯罪事实、人员责任、证据能力、证明力或证明标准的认定。"
         )
 
-        clue_lines: list[str] = []
-        for idx, (_art, payload) in enumerate(alive, start=1):
-            evidence = payload.get("evidence") or []
-            clue_lines.append(
-                f"- {idx}) {payload.get('title') or '未命名待核事项'} "
-                f"（{self._report_aspect_label(payload.get('aspect')) or '未标注'} · "
-                f"处置 {clue_state_label(payload)} · "
-                f"支持材料 {len(evidence)} 处）"
-            )
-
-        entity_stats = self._report_entity_stats(state["entity_payload"])
+        entity = self._report_entity_stats(state["entity_payload"])
         path_lines = self._compose_path_synthesis([{"payload": p} for _art, p in alive])
         case_names = "、".join(
             str(c.get("display_name") or c.get("name") or "")
             for c in (scope_payload.get("cases") or task.get("cases") or [])
         ) or "—"
-        report = self.find_artifact(task_id, "REPORT_DRAFT", "report-draft")
-        next_version = int(report["current_version"]) + 1 if report else 1
+        next_version = self._next_report_seq(task_id)
 
         markdown = "\n".join(
             [
                 "# 跨案关联线索核验单",
                 "",
                 f"**任务**：{task.get('title') or '—'}",
-                f"**版本 v{next_version}** · **生成/更新时间**：{utc_now()}",
+                f"**版本 v{next_version}** · **生成时间**：{utc_now()}",
                 "",
                 "## 边界声明",
                 boundary,
@@ -1803,15 +1961,16 @@ class TaskService:
                 text,
                 "",
                 "## 系统自动核对清单（依据当前已确认产物，写作时刻快照，系统生成）",
+                "本清单为事实源。正文只作可读总述，不得改写下列范围、实体结论、来源编号与原文摘录。",
                 f"- 监督目的：{task.get('purpose') or scope_payload.get('purpose') or '—'}",
                 f"- 授权有效期：{task.get('authorized_until') or scope_payload.get('authorized_until') or '—'}",
                 f"- 案件范围：{case_names}",
-                f"- 实体：候选 {entity_stats['total']} · 视为同一 {entity_stats['merge']} · "
-                f"保留独立 {entity_stats['keep_separate']} · 待核 {entity_stats['pending']}",
                 "",
-                *(clue_lines or ["- 暂无待核线索。"]),
+                *self._report_entity_checklist_lines(entity),
                 "",
-                "### 材料路径合成（由多张处置为「继续核查」的线索排列，非法律结论）",
+                *self._report_clue_checklist_lines(clue_packs),
+                "",
+                "### 材料路径合成（由多张处置为「已确认关联」的线索排列，非法律结论）",
                 *(path_lines or ["- 尚无两条以上可合成路径的已确认线索。"]),
                 "",
                 "### 有效性",
@@ -1831,12 +1990,14 @@ class TaskService:
         if state["entity_id"]:
             parent_ids.append(state["entity_id"])
         parent_ids.extend(a["id"] for a, _p in alive)
+        generated_at = utc_now()
+        actor = "智能体"
 
         artifact = self.write_artifact(
             task_id=task_id,
             type="REPORT_DRAFT",
-            title="跨案关联线索核验单",
-            ref_key="report-draft",
+            title=f"跨案关联线索核验单 · v{next_version}",
+            ref_key=f"report-{next_version}",
             status="VALID" if valid else "PENDING_REVIEW",
             parent_ids=parent_ids,
             payload={
@@ -1849,7 +2010,10 @@ class TaskService:
                 "invalid_refs": invalid_refs,
                 "clue_count": len(alive),
                 "boundary": boundary,
-                "generated_at": utc_now(),
+                "generated_at": generated_at,
+                "generated_by": actor,
+                "report_seq": next_version,
+                "download_count": 0,
             },
         )
         self.append_source_verify(
@@ -1857,14 +2021,14 @@ class TaskService:
             {
                 "action": "报告撰写",
                 "type": "report_ai_write",
-                "actor": "智能体",
+                "actor": actor,
                 "target": artifact["id"],
                 "summary": (
                     f"v{next_version} · 线索 {len(alive)} 条 · "
                     f"{'有效' if valid else '含待补原文依据'}"
                 ),
                 "result": "ok" if valid else "warn",
-                "at": utc_now(),
+                "at": generated_at,
             },
         )
         return {
@@ -1876,25 +2040,235 @@ class TaskService:
             "version": next_version,
         }
 
-    def report_export_document(self, task_id: str) -> dict[str, Any]:
-        """导出用：只读返回报告当前版本的 markdown 与版本号（不落库、不转换）。"""
-        art = self.find_artifact(task_id, "REPORT_DRAFT", "report-draft")
-        if not art or art.get("status") in {"STALE", "INVALID"}:
-            raise TaskError(TASK_ERROR_CODES["ARTIFACT_NOT_FOUND"], "尚未撰写报告或报告已失效")
-        row, payload = self._read_artifact_payload_raw(task_id, art["id"])
+    def _list_report_drafts(self, task_id: str) -> list[dict[str, Any]]:
+        with db_session(self.db_path) as conn:
+            return _rows(
+                conn,
+                "SELECT * FROM artifacts WHERE task_id = ? AND type = 'REPORT_DRAFT' "
+                "AND status NOT IN ('STALE', 'INVALID') ORDER BY created_at DESC",
+                (task_id,),
+            )
+
+    def _latest_report_draft(self, task_id: str) -> dict[str, Any] | None:
+        rows = self._list_report_drafts(task_id)
+        return rows[0] if rows else None
+
+    @staticmethod
+    def _report_seq_of(art: dict[str, Any], payload: dict[str, Any] | None = None) -> int:
         payload = payload or {}
+        if payload.get("report_seq"):
+            try:
+                return int(payload["report_seq"])
+            except (TypeError, ValueError):
+                pass
+        matched = re.match(r"report-(\d+)$", str(art.get("ref_key") or ""))
+        if matched:
+            return int(matched.group(1))
+        try:
+            return int(art.get("current_version") or 1)
+        except (TypeError, ValueError):
+            return 1
+
+    def _next_report_seq(self, task_id: str) -> int:
+        seq = 0
+        with db_session(self.db_path) as conn:
+            rows = _rows(
+                conn,
+                "SELECT ref_key, current_version FROM artifacts "
+                "WHERE task_id = ? AND type = 'REPORT_DRAFT'",
+                (task_id,),
+            )
+        for row in rows or []:
+            matched = re.match(r"report-(\d+)$", str(row.get("ref_key") or ""))
+            if matched:
+                seq = max(seq, int(matched.group(1)))
+            elif str(row.get("ref_key") or "") == "report-draft":
+                try:
+                    seq = max(seq, int(row.get("current_version") or 1))
+                except (TypeError, ValueError):
+                    seq = max(seq, 1)
+        return seq + 1
+
+    def _report_download_counts(self, task_id: str) -> dict[tuple[str, int], int]:
+        counts: dict[tuple[str, int], int] = {}
+        log = self.find_artifact(task_id, "SOURCE_VERIFY", "source-verify-log")
+        if not log:
+            return counts
+        _art, payload = self._read_artifact_payload_raw(task_id, log["id"])
+        for ev in (payload or {}).get("events") or []:
+            if not isinstance(ev, dict) or ev.get("type") != "report_export":
+                continue
+            target = str(ev.get("target") or "").strip()
+            if not target:
+                continue
+            ver = ev.get("report_version")
+            if ver is None:
+                matched = re.search(r"v(\d+)", str(ev.get("summary") or ""))
+                ver = int(matched.group(1)) if matched else 0
+            try:
+                ver_n = int(ver)
+            except (TypeError, ValueError):
+                ver_n = 0
+            key = (target, ver_n)
+            counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    @staticmethod
+    def _report_version_is_download_bump(
+        previous: dict[str, Any] | None, current: dict[str, Any]
+    ) -> bool:
+        if not previous:
+            return False
+        return (
+            (previous.get("body") or "") == (current.get("body") or "")
+            and (previous.get("markdown") or previous.get("text") or "")
+            == (current.get("markdown") or current.get("text") or "")
+            and int(current.get("download_count") or 0) >= int(previous.get("download_count") or 0)
+            and int(current.get("download_count") or 0) != int(previous.get("download_count") or 0)
+        )
+
+    def list_report_editions(self, task_id: str) -> dict[str, Any]:
+        """列出每一次撰写的核验单（含旧「单产物多版本」），下载次数另计，不把下载当成新版。"""
+        self.get_task(task_id)
+        download_counts = self._report_download_counts(task_id)
+        editions: list[dict[str, Any]] = []
+        with db_session(self.db_path) as conn:
+            arts = _rows(
+                conn,
+                "SELECT * FROM artifacts WHERE task_id = ? AND type = 'REPORT_DRAFT' "
+                "AND status != 'INVALID' ORDER BY created_at ASC",
+                (task_id,),
+            )
+            for art in arts:
+                versions = _rows(
+                    conn,
+                    "SELECT version, status, created_at, payload_json FROM artifact_versions "
+                    "WHERE artifact_id = ? ORDER BY version ASC",
+                    (art["id"],),
+                )
+                previous: dict[str, Any] | None = None
+                for ver in versions:
+                    payload = json.loads(ver.get("payload_json") or "{}")
+                    if self._report_version_is_download_bump(previous, payload):
+                        previous = payload
+                        continue
+                    previous = payload
+                    version_no = int(ver["version"])
+                    if payload.get("report_seq"):
+                        seq = self._report_seq_of(art, payload)
+                    elif str(art.get("ref_key") or "") == "report-draft":
+                        seq = version_no
+                    else:
+                        seq = self._report_seq_of(art, payload)
+                    valid = (
+                        art.get("status") not in {"STALE", "INVALID"}
+                        and ver.get("status") not in {"STALE", "INVALID", "PENDING_REVIEW"}
+                        and payload.get("valid") is not False
+                    )
+                    dl = download_counts.get((art["id"], version_no), 0)
+                    if not dl:
+                        dl = download_counts.get((art["id"], seq), 0)
+                    if not dl:
+                        dl = int(payload.get("download_count") or 0)
+                    editions.append(
+                        {
+                            "artifact_id": art["id"],
+                            "version": version_no,
+                            "report_seq": seq,
+                            "title": f"跨案关联线索核验单 · v{seq}",
+                            "valid": valid,
+                            "status": art.get("status") or "",
+                            "clue_count": payload.get("clue_count"),
+                            "generated_at": payload.get("generated_at") or ver.get("created_at") or "",
+                            "generated_by": payload.get("generated_by") or "智能体",
+                            "download_count": dl,
+                        }
+                    )
+        editions.sort(key=lambda item: str(item.get("generated_at") or ""), reverse=True)
+        return {"ok": True, "reports": editions}
+
+    def report_export_document(
+        self,
+        task_id: str,
+        report_id: str | None = None,
+        export_id: str | None = None,
+        version: int | None = None,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """下载指定核验单的某一撰写版本；只记下载次数，不覆盖、不另开新版。"""
+        target_id = report_id or export_id
+        if not target_id:
+            latest = self._latest_report_draft(task_id)
+            if not latest:
+                raise TaskError(TASK_ERROR_CODES["ARTIFACT_NOT_FOUND"], "尚未撰写报告或报告已失效")
+            target_id = latest["id"]
+
+        with db_session(self.db_path) as conn:
+            row = _row(
+                conn,
+                "SELECT * FROM artifacts WHERE id = ? AND task_id = ?",
+                (target_id, task_id),
+            )
+            if not row:
+                raise TaskError(TASK_ERROR_CODES["ARTIFACT_NOT_FOUND"], "尚未撰写报告或报告已失效")
+            target_version = int(version or row.get("current_version") or 1)
+            ver = _row(
+                conn,
+                "SELECT payload_json, status FROM artifact_versions "
+                "WHERE artifact_id = ? AND version = ?",
+                (target_id, target_version),
+            )
+        if not ver:
+            raise TaskError(TASK_ERROR_CODES["ARTIFACT_NOT_FOUND"], "该版报告不存在")
+        payload = json.loads(ver.get("payload_json") or "{}")
         markdown = payload.get("markdown") or payload.get("text") or ""
-        if not markdown.strip():
+        if not str(markdown).strip():
             raise TaskError(TASK_ERROR_CODES["ARTIFACT_NOT_FOUND"], "报告内容为空")
+
+        art_type = row.get("type")
+        if art_type == "REPORT_EXPORT":
+            return {
+                "markdown": markdown,
+                "title": row.get("title") or payload.get("title") or "跨案关联线索核验单",
+                "version": int(payload.get("export_seq") or row.get("current_version") or 1),
+                "report_id": row["id"],
+                "download_count": int(payload.get("download_count") or 0),
+            }
+        if art_type != "REPORT_DRAFT":
+            raise TaskError(TASK_ERROR_CODES["ARTIFACT_NOT_FOUND"], "不是可下载的核验单")
+        if row.get("status") in {"STALE", "INVALID"}:
+            raise TaskError(TASK_ERROR_CODES["ARTIFACT_NOT_FOUND"], "该版报告已失效")
         if payload.get("valid") is False:
             raise TaskError(
                 TASK_ERROR_CODES["STATE_CONFLICT"],
-                "报告存在待补原文依据，补证或排除后方可导出",
+                "该版存在待补原文依据，补证或排除后方可下载",
             )
+
+        if payload.get("report_seq"):
+            seq = self._report_seq_of(row, payload)
+        elif str(row.get("ref_key") or "") == "report-draft":
+            seq = target_version
+        else:
+            seq = self._report_seq_of(row, payload)
+        self.append_source_verify(
+            task_id,
+            {
+                "action": "报告导出",
+                "type": "report_export",
+                "actor": user_id or "检察官",
+                "target": row["id"],
+                "report_version": target_version,
+                "summary": f"v{seq} · 下载",
+                "result": "ok",
+                "at": utc_now(),
+            },
+        )
         return {
             "markdown": markdown,
-            "title": art.get("title") or "跨案关联线索核验单",
-            "version": int(row["current_version"]),
+            "title": payload.get("title") or row.get("title") or "跨案关联线索核验单",
+            "version": seq,
+            "report_id": row["id"],
+            "download_count": 0,
         }
 
     # ----- 产物 -----

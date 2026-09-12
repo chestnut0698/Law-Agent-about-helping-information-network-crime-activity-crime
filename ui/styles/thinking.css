@@ -1,199 +1,113 @@
 /* ========================================
-   thinking.css — 思考过程面板
+   thinking.css — 思考过程：> 折叠，点开后同一符号右转朝下
    ======================================== */
 
-.thinking-block {
-    max-width: 800px; margin: 12px 0;
+.thinking-block,
+.analysis-step {
     max-width: 800px;
-    margin: 12px auto;
-    border: 1px solid var(--border-color);
-    border-radius: var(--radius-md);
-    background: var(--bg-secondary);
-    overflow: hidden;
-    animation: fadeIn 0.3s ease;
+    margin: 8px 0;
+    background: transparent;
+    border: none;
+    box-shadow: none;
 }
 
-.thinking-header {
+.thinking-header,
+.analysis-step-header {
     display: flex;
     align-items: center;
-    gap: 10px;
-    padding: 10px 14px;
+    gap: 8px;
+    padding: 4px 0;
     cursor: pointer;
     user-select: none;
-    transition: background var(--transition-fast);
 }
 
-.thinking-header:hover {
-    background: var(--bg-hover);
+.thinking-header:hover .thinking-title,
+.analysis-step-header:hover .thinking-title {
+    color: var(--text-primary);
 }
 
-.thinking-icon {
-    width: 24px;
-    height: 24px;
-    border-radius: 50%;
-    background: linear-gradient(135deg, var(--accent-orange), var(--accent-red));
-    display: flex;
+.thinking-caret {
+    flex-shrink: 0;
+    width: 1em;
+    font-size: 13px;
+    line-height: 1;
+    color: var(--text-muted);
+    font-family: inherit;
+    display: inline-flex;
     align-items: center;
     justify-content: center;
-    flex-shrink: 0;
 }
 
-.thinking-icon svg {
-    width: 14px;
-    height: 14px;
-    color: white;
-    animation: spin 3s linear infinite;
+.thinking-caret::before {
+    content: '>';
+    display: inline-block;
+    transform-origin: center;
+    transition: transform 0.15s ease;
+}
+
+.thinking-block.expanded .thinking-caret::before,
+.analysis-step.expanded .thinking-caret::before {
+    transform: rotate(90deg);
 }
 
 .thinking-title {
     font-size: 13px;
-    font-weight: 600;
-    color: var(--text-primary);
+    font-weight: 500;
+    color: var(--text-secondary);
     flex: 1;
+    min-width: 0;
 }
 
 .thinking-meta {
     font-size: 11px;
     color: var(--text-muted);
+    flex-shrink: 0;
 }
 
-.thinking-chevron {
-    width: 16px;
-    height: 16px;
-    color: var(--text-muted);
-    transition: transform var(--transition-fast);
-}
-
-.thinking-block.expanded .thinking-chevron {
-    transform: rotate(180deg);
-}
-
-.thinking-body {
+.thinking-body,
+.analysis-step-body {
     max-height: 0;
     overflow: hidden;
-    transition: max-height var(--transition-normal);
 }
 
-.thinking-block.expanded .thinking-body {
-    max-height: 1000px;
+.thinking-block.expanded .thinking-body,
+.analysis-step.expanded .analysis-step-body {
+    max-height: 2400px;
+}
+
+.thinking-block.compact .thinking-body,
+.analysis-step.compact .analysis-step-body {
+    max-height: 0;
+    overflow: hidden;
 }
 
 .thinking-content {
-    padding: 4px 14px 14px 48px;
+    padding: 2px 0 8px 1.4em;
     font-size: 13px;
     color: var(--text-secondary);
     line-height: 1.7;
 }
 
 .thinking-step {
-    position: relative;
-    padding: 6px 0;
-    padding-left: 20px;
-}
-
-.thinking-step::before {
-    content: '';
-    position: absolute;
-    left: 0;
-    top: 14px;
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: var(--accent-orange);
-    opacity: 0.6;
-}
-
-.thinking-step::after {
-    content: '';
-    position: absolute;
-    left: 3px;
-    top: 22px;
-    bottom: -6px;
-    width: 2px;
-    background: var(--border-color);
-}
-
-.thinking-step:last-child::after {
-    display: none;
-}
-
-.thinking-step.active::before {
-    background: var(--accent-blue);
-    opacity: 1;
-    animation: pulse 1.5s infinite;
-}
-
-.thinking-step.done::before {
-    background: var(--accent-green);
-    opacity: 1;
-}
-
-.thinking-block.compact .thinking-body {
-    max-height: 0;
-    overflow: hidden;
-    transition: max-height var(--transition-normal);
-}
-
-/* 分步分析卡：思考 + 执行同卡，默认折叠 */
-.analysis-step {
-    max-width: 800px;
-    margin: 10px auto;
-    border: 1px solid var(--border-color);
-    border-radius: var(--radius-md);
-    background: var(--bg-secondary);
-    overflow: hidden;
-}
-
-.analysis-step-header {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 10px 14px;
-    cursor: pointer;
-    user-select: none;
-}
-
-.analysis-step-header:hover {
-    background: var(--bg-hover);
-}
-
-.analysis-step.expanded .thinking-chevron {
-    transform: rotate(180deg);
-}
-
-.analysis-step-body {
-    max-height: 0;
-    overflow: hidden;
-    transition: max-height 0.25s ease;
-}
-
-.analysis-step.expanded .analysis-step-body {
-    max-height: 2400px;
-}
-
-.analysis-step-label {
-    padding: 8px 14px 0 48px;
-    font-size: 11px;
-    color: var(--text-muted);
-    font-weight: 600;
+    padding: 2px 0;
+    white-space: pre-wrap;
 }
 
 .analysis-step-think {
-    padding: 4px 14px 8px 48px;
+    padding: 2px 0 6px 1.4em;
     max-height: 300px;
     overflow-y: auto;
     overscroll-behavior: contain;
 }
 
 .analysis-step-tools {
-    padding: 4px 14px 14px 48px;
+    padding: 2px 0 8px 1.4em;
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 4px;
 }
 
-.analysis-step-tools .tool-call-card {
+.analysis-step-tools .tool-call-line {
     max-width: none;
     margin: 0;
 }
-

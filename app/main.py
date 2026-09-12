@@ -566,15 +566,35 @@ async def task_report_draft(task_id: str):
     )
 
 
+@app.get("/api/tasks/{task_id}/reports")
+async def list_task_reports(task_id: str):
+    """列出每一次撰写的核验单，旧的单产物多版本也会拆成多行。"""
+    try:
+        return get_task_service().list_report_editions(task_id)
+    except TaskError as exc:
+        return task_error_response(exc)
+
+
 @app.get("/api/tasks/{task_id}/report.docx")
-async def export_report_docx(task_id: str):
-    """下载报告：读取当前版本 markdown 即时转 docx。服务端只存储管理 markdown。"""
+async def export_report_docx(
+    task_id: str,
+    report_id: Optional[str] = None,
+    export_id: Optional[str] = None,
+    version: Optional[int] = None,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    """下载指定核验单的某一撰写版本；只记下载次数。"""
     from urllib.parse import quote
 
     from app.report_export import markdown_to_docx
 
     try:
-        document = get_task_service().report_export_document(task_id)
+        document = get_task_service().report_export_document(
+            task_id,
+            report_id=report_id or export_id,
+            version=version,
+            user_id=x_user_id,
+        )
     except TaskError as exc:
         status = 409 if exc.code == TASK_ERROR_CODES["STATE_CONFLICT"] else 404
         return JSONResponse(status_code=status, content=exc.to_dict())
@@ -839,6 +859,8 @@ async def chat(request: Request, task_id):
                             "name": name,
                             "params": chunk_data.get("arguments", {}),
                             "status": "running",
+                            "batch_index": chunk_data.get("batch_index"),
+                            "batch_total": chunk_data.get("batch_total"),
                         },
                     }
                     yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"

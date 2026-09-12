@@ -11,3 +11,4 @@ data/conversations/*.json
 .cursor/
 .claude/
 notes/
+docs/test_templates/

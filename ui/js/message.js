@@ -9,6 +9,12 @@
          * 渲染用户消息
          */
         renderUser(text) {
+            if (String(text || '').startsWith('【系统续跑】')) {
+                return Utils.create('div', {
+                    class: 'agent-continue-note',
+                    text: '核验已完成，助手继续分析…'
+                });
+            }
             const wrap = Utils.create('div', { class: 'message' }, [
                 Utils.create('div', { class: 'message-role' }, [
                     Utils.create('div', { class: 'message-avatar user', text: 'U' }),
@@ -19,6 +25,33 @@
                 ])
             ]);
             return wrap;
+        },
+
+        attachJumps(wrap, jumps) {
+            if (!wrap) return;
+            Utils.$$('.agent-jump-row', wrap).forEach((el) => el.remove());
+            const list = Array.isArray(jumps) ? jumps.filter((item) => item && item.view && item.label) : [];
+            if (!list.length) return;
+            const seen = new Set();
+            const row = Utils.create('div', { class: 'agent-jump-row' });
+            list.forEach((item) => {
+                if (seen.has(item.view)) return;
+                seen.add(item.view);
+                const btn = Utils.create('button', {
+                    type: 'button',
+                    class: 'agent-jump-btn',
+                    text: item.label
+                });
+                btn.addEventListener('click', () => {
+                    if (global.Workbench && typeof global.Workbench.setView === 'function') {
+                        global.Workbench.setView(item.view);
+                    }
+                });
+                row.appendChild(btn);
+            });
+            const actions = Utils.$('.message-actions', wrap);
+            if (actions) wrap.insertBefore(row, actions);
+            else wrap.appendChild(row);
         },
 
         /**

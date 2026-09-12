@@ -628,6 +628,27 @@
             }
         },
 
+        _entityUnconfirmedCount() {
+            if (!this.task) return null;
+            const art = (this.task.artifacts || []).find((item) =>
+                item.type === 'ENTITY_CANDIDATE_SET'
+                && item.status !== 'INVALID'
+                && item.status !== 'STALE'
+            );
+            if (!art) return 0;
+            const data = this.artifactCache[art.id];
+            const payload = data && data.payload;
+            if (!payload) return null;
+            const candidates = payload.candidates || [];
+            if (candidates.length) {
+                return candidates.filter((item) => {
+                    const decision = item.decision;
+                    return !decision || decision === 'PENDING' || decision === 'DEFER';
+                }).length;
+            }
+            return Number((payload.summary || {}).pending || 0);
+        },
+
         async refreshTask() {
             if (!this.task || !this.task.id) return this.task;
             const resp = await fetch(`/api/tasks/${this.task.id}`);
@@ -667,15 +688,23 @@
 
         /** 每个任务绑定自己的智能体会话：还原计划式折叠步骤 + 最终回复 */
         async _bindConversation(task) {
+            if (window.Agent && typeof Agent.stopReviewWait === 'function') {
+                Agent.stopReviewWait({ silent: true, keepFlag: true });
+            }
             const messages = Utils.$('#chat-messages');
             if (messages) messages.innerHTML = '';
 
+            let rows = [];
             try {
                 const response = await fetch(`/chat/${task.id}/messages`);
                 const data = await response.json();
-                this._renderChatHistory(messages, data.messages || []);
+                rows = data.messages || [];
+                this._renderChatHistory(messages, rows);
             } catch (_) {
                 // 新任务还没有聊天消息时保持空白
+            }
+            if (window.Agent && typeof Agent.syncReviewWait === 'function') {
+                Agent.syncReviewWait(task, rows).catch(() => {});
             }
         },
 
@@ -683,6 +712,11 @@
             if (!container || !rows.length) return;
             let stepIndex = 0;
             let i = 0;
+            let turnTools = [];
+            let entityReview = false;
+            let lastHistName = '';
+            let lastHistCard = null;
+            let lastHistCount = 0;
             while (i < rows.length) {
                 const msg = rows[i];
                 const role = msg.role;
@@ -691,26 +725,22 @@
                     continue;
                 }
                 if (role === 'user') {
+                    turnTools = [];
+                    entityReview = false;
+                    lastHistName = '';
+                    lastHistCard = null;
+                    lastHistCount = 0;
                     container.appendChild(Message.renderUser(msg.content || ''));
                     i += 1;
                     continue;
                 }
                 if (role === 'assistant' && Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
-                    stepIndex += 1;
-                    const firstName = (msg.tool_calls[0].function || {}).name
-                        || msg.tool_calls[0].name
-                        || '';
-                    const label = window.ToolCall
-                        ? ToolCall.displayName(firstName)
-                        : '分析动作';
-                    const step = Thinking.createStep({
-                        index: stepIndex,
-                        title: `第 ${stepIndex} 步 · ${label}`,
-                        expanded: false
+                    const names = msg.tool_calls.map((tc) =>
+                        (tc.function || {}).name || tc.name || ''
+                    );
+                    names.forEach((name) => {
+                        if (name) turnTools.push(name);
                     });
-                    const thinkText = (msg.reasoning_content || '').trim() || (msg.content || '').trim();
-                    if (thinkText) Thinking.appendStepThinking(step, thinkText);
-
                     const results = {};
                     let j = i + 1;
                     while (j < rows.length && rows[j].role === 'tool') {
@@ -719,47 +749,101 @@
                         }
                         j += 1;
                     }
-
                     msg.tool_calls.forEach((tc) => {
-                        const fn = tc.function || {};
-                        const name = fn.name || tc.name || '';
-                        let params = {};
-                        const rawArgs = fn.arguments != null ? fn.arguments : tc.arguments;
-                        if (typeof rawArgs === 'string') {
-                            try { params = JSON.parse(rawArgs); } catch { params = { raw: rawArgs }; }
-                        } else if (rawArgs && typeof rawArgs === 'object') {
-                            params = rawArgs;
-                        }
                         const result = results[tc.id] || '';
-                        const ok = !String(result).includes('工具调用出错');
-                        const card = ToolCall.create({
-                            type: 'db',
-                            name,
-                            label: ToolCall.displayName(name),
-                            description: ToolCall.summarizeResult(result),
-                            params,
-                            result,
-                            status: ok ? 'success' : 'error',
+                        if (typeof result === 'string' && /ENTITY_REVIEW|pending_entity_reviews/.test(result)) {
+                            entityReview = true;
+                        }
+                    });
+                    const unique = [];
+                    names.forEach((name) => {
+                        if (name && unique.indexOf(name) < 0) unique.push(name);
+                    });
+                    if (unique.length === 1) {
+                        const name = unique[0];
+                        const n = names.length;
+                        if (name === lastHistName && lastHistCard) {
+                            lastHistCount += n;
+                            ToolCall.setCount(lastHistCard, lastHistCount, lastHistCount, 'success');
+                            i = j;
+                            continue;
+                        }
+                        stepIndex += 1;
+                        const label = window.ToolCall ? ToolCall.displayName(name) : '核验动作';
+                        const step = Thinking.createStep({
+                            index: stepIndex,
+                            title: `第 ${stepIndex} 步 · ${label}`,
                             expanded: false
                         });
+                        const thinkText = (msg.reasoning_content || '').trim();
+                        if (thinkText) Thinking.appendStepThinking(step, thinkText);
+                        Thinking.ensureHint(step, window.ToolCall ? ToolCall.hintFor(name) : '');
+                        const card = ToolCall.create({
+                            name,
+                            label,
+                            current: n,
+                            total: n > 1 ? n : 0,
+                            status: 'success'
+                        });
                         Thinking.addToolToStep(step, card);
+                        Thinking.finishStep(step, `第 ${stepIndex} 步 · ${label}`);
+                        lastHistName = name;
+                        lastHistCard = card;
+                        lastHistCount = n;
+                        container.appendChild(step);
+                        i = j;
+                        continue;
+                    }
+                    lastHistName = '';
+                    lastHistCard = null;
+                    lastHistCount = 0;
+                    stepIndex += 1;
+                    const firstLabel = window.ToolCall
+                        ? ToolCall.displayName(unique[0] || '')
+                        : '核验动作';
+                    const step = Thinking.createStep({
+                        index: stepIndex,
+                        title: `第 ${stepIndex} 步 · ${firstLabel}`,
+                        expanded: false
                     });
-                    Thinking.finishStep(step, `第 ${stepIndex} 步 · 已完成`);
+                    const thinkText = (msg.reasoning_content || '').trim();
+                    if (thinkText) Thinking.appendStepThinking(step, thinkText);
+                    unique.forEach((name) => {
+                        const n = names.filter((item) => item === name).length;
+                        const label = ToolCall.displayName(name);
+                        Thinking.ensureHint(step, ToolCall.hintFor(name));
+                        Thinking.addToolToStep(step, ToolCall.create({
+                            name,
+                            label,
+                            current: n,
+                            total: n > 1 ? n : 0,
+                            status: 'success'
+                        }));
+                    });
+                    Thinking.finishStep(step, `第 ${stepIndex} 步 · ${firstLabel}`);
                     container.appendChild(step);
                     i = j;
                     continue;
                 }
                 if (role === 'assistant' && (msg.content || '').trim()) {
-                    if ((msg.reasoning_content || '').trim() && window.Thinking) {
+                    const cleanedThink = window.Thinking
+                        ? Thinking.legalize(msg.reasoning_content || '')
+                        : '';
+                    if (cleanedThink) {
                         const block = Thinking.create({
                             title: '分析思路',
                             defaultExpanded: false,
-                            steps: [{ text: msg.reasoning_content, status: 'done' }]
+                            steps: [{ text: cleanedThink, status: 'done' }]
                         });
                         container.appendChild(block);
                     }
                     const { wrap, content } = Message.renderAssistantContainer();
                     content.innerHTML = Markdown.parse(msg.content);
+                    if (window.Agent && Agent.collectJumps) {
+                        Message.attachJumps(wrap, Agent.collectJumps(turnTools, msg.content, { entityReview }));
+                    }
+                    turnTools = [];
+                    entityReview = false;
                     container.appendChild(wrap);
                     i += 1;
                     continue;
@@ -1297,6 +1381,9 @@
                     Toast.info(`仍有 ${data.pending} 条待核，确认后方可继续后续分析`);
                 } else if (!data.analysis_gate && data.pending === 0) {
                     Toast.info('实体复核已完成，可继续整理线索与报告');
+                }
+                if (window.Agent && typeof Agent.notifyReviewState === 'function') {
+                    Agent.notifyReviewState({ pending: this._entityUnconfirmedCount() });
                 }
             } catch (e) {
                 Toast.error('判断未能保存：' + e.message);
@@ -3093,7 +3180,9 @@
             try {
                 if (!window.Agent) throw new Error('智能体未就绪');
                 await Agent.process(prompt);
-                Toast.success('本轮跨案分析已结束');
+                if (!(window.Agent && Agent._wait)) {
+                    Toast.success('本轮跨案分析已结束');
+                }
             } catch (e) {
                 Toast.error(e.message || '分析未能完成');
             } finally {
@@ -4816,13 +4905,8 @@
                 page.appendChild(bar);
             }
 
-            page.appendChild(Utils.create('div', { class: 'ref-tl-alert' }, [
-                window.Icons
-                    ? Icons.el('info', 'ref-tl-alert-ico')
-                    : Utils.create('span', {
-                        class: 'ref-tl-alert-ico',
-                        html: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>'
-                    }),
+            page.appendChild(Utils.create('div', { class: 'wb-alert warn' }, [
+                window.Icons ? Icons.el('info') : Utils.create('span', { text: 'ℹ' }),
                 Utils.create('span', {
                     text: '材料明确记载与标注的系统推测分开展示；时间不明仅标「时间不确定」。点「时间范围 / 筛选」可过滤，不重抽；「重新整理」才会重抽。虚线连接不代表事实上的连续行为。'
                 })
@@ -5067,6 +5151,25 @@
             return 'recorded';
         },
 
+        _graphAppearMeta(candidate, caseCount) {
+            const decision = String((candidate && candidate.decision) || 'PENDING').toUpperCase();
+            const cross = Number(caseCount || 0) >= 2;
+            if (cross && decision === 'KEEP_SEPARATE') {
+                return { skip: true };
+            }
+            if (cross && decision === 'MERGE') {
+                return { label: '跨案出现（已确认同一）', kind: 'appear', status: 'confirmed' };
+            }
+            if (cross) {
+                return { label: '跨案出现（待核）', kind: 'appear', status: 'pending' };
+            }
+            return {
+                label: '出现于',
+                kind: 'appear',
+                status: this._graphStatusOfCandidate(candidate)
+            };
+        },
+
         _graphStatusLabel(status) {
             return {
                 recorded: '材料记载',
@@ -5261,9 +5364,12 @@
                 const excluded = decision === 'KEEP_SEPARATE' && caseIds.length >= 2;
                 const bridge = caseIds.length >= 2 && !excluded;
                 const typeLabel = this._graphTypeLabel(entityType);
-                const subLabel = bridge
-                    ? `${typeLabel} · 跨案桥`
-                    : (excluded ? `${typeLabel} · 已排除同一` : typeLabel);
+                const subLabel = excluded
+                    ? `${typeLabel} · 已排除同一`
+                    : (bridge
+                        ? (decision === 'MERGE' ? `${typeLabel} · 跨案桥` : `${typeLabel} · 跨案桥待核`)
+                        : typeLabel);
+                const appearMeta = this._graphAppearMeta(raw, caseIds.length);
                 const id = `ent:${raw.candidate_id}`;
                 addNode({
                     id,
@@ -5290,8 +5396,6 @@
                 (raw.aliases || []).forEach((alias) => {
                     rememberKeys(id, this._graphIndexKeys(entityType, alias, alias));
                 });
-                const appearLabel = excluded ? '已排除同一' : '出现于';
-                const appearKind = excluded ? 'excluded' : 'appear';
                 (raw.records || []).forEach((rec) => {
                     rememberKeys(id, this._graphIndexKeys(entityType, rec.value, rec.normalized_value));
                     const cite = this._graphAsCitation(rec, {
@@ -5299,32 +5403,34 @@
                         case_name: rec.case_name,
                         highlight_terms: [rec.value, label].filter(Boolean)
                     });
-                    if (!rec.case_id) return;
+                    if (!rec.case_id || appearMeta.skip) return;
                     pushEdge({
                         id: `appear:${id}:case:${rec.case_id}`,
                         from: id,
                         to: `case:${rec.case_id}`,
-                        label: appearLabel,
+                        label: appearMeta.label,
                         source: '实体候选',
-                        status: 'recorded',
+                        status: appearMeta.status,
                         strength: 'solid',
-                        kind: appearKind,
+                        kind: appearMeta.kind,
                         citations: cite ? [cite] : []
                     });
                 });
-                caseIds.forEach((cid) => {
-                    pushEdge({
-                        id: `appear:${id}:case:${cid}`,
-                        from: id,
-                        to: `case:${cid}`,
-                        label: appearLabel,
-                        source: '实体候选',
-                        status: 'recorded',
-                        strength: 'solid',
-                        kind: appearKind,
-                        citations: []
+                if (!appearMeta.skip) {
+                    caseIds.forEach((cid) => {
+                        pushEdge({
+                            id: `appear:${id}:case:${cid}`,
+                            from: id,
+                            to: `case:${cid}`,
+                            label: appearMeta.label,
+                            source: '实体候选',
+                            status: appearMeta.status,
+                            strength: 'solid',
+                            kind: appearMeta.kind,
+                            citations: []
+                        });
                     });
-                });
+                }
             });
 
             const resolveParty = (party) => {
@@ -5660,8 +5766,7 @@
 
         _graphPickDefault(nodes) {
             const bridges = nodes.filter((n) => n.kind === 'entity' && n.bridge);
-            const breaks = nodes.filter((n) => n.kind === 'entity' && n.breakpoint);
-            const pool = bridges.length ? bridges : (breaks.length ? breaks : nodes.filter((n) => n.kind === 'entity'));
+            const pool = bridges.length ? bridges : nodes.filter((n) => n.kind === 'entity' && !n.breakpoint);
             const scored = pool.slice().sort((a, b) => {
                 const cases = (b.caseIds || []).length - (a.caseIds || []).length;
                 if (cases) return cases;
@@ -5678,8 +5783,8 @@
             let nodes = model.nodes.slice();
             let edges = model.edges.slice();
             if (this.graphHideWeak) {
-                edges = edges.filter((e) => e.strength !== 'weak' || e.kind === 'excluded');
-                nodes = nodes.filter((n) => n.status !== 'inferred' || n.kind === 'case' || n.kind === 'event' || n.breakpoint);
+                edges = edges.filter((e) => e.strength !== 'weak');
+                nodes = nodes.filter((n) => n.status !== 'inferred' || n.kind === 'case' || n.kind === 'event');
             }
             if (!this.graphShowEvents) {
                 nodes = nodes.filter((n) => n.kind !== 'event');
@@ -5701,12 +5806,12 @@
             }
             let keep = new Set(nodes.map((n) => n.id));
             edges = edges.filter((e) => keep.has(e.from) && keep.has(e.to));
-            const hasBridge = nodes.some((n) => n.kind === 'entity' && (n.bridge || n.breakpoint));
+            const hasBridge = nodes.some((n) => n.kind === 'entity' && n.bridge);
             if (!this.graphShowAll) {
                 const core = new Set();
                 nodes.forEach((n) => {
                     if (n.kind === 'case') core.add(n.id);
-                    if (n.kind === 'entity' && (n.bridge || n.breakpoint)) core.add(n.id);
+                    if (n.kind === 'entity' && n.bridge) core.add(n.id);
                 });
                 if (!this.selectedGraphNodeId || !core.has(this.selectedGraphNodeId)) {
                     this.selectedGraphNodeId = this._graphPickDefault(nodes.filter((n) => core.has(n.id)));
@@ -5739,6 +5844,17 @@
                     edges = edges.filter((e) => vis.has(e.from) && vis.has(e.to));
                 }
             } else if (!this.selectedGraphNodeId || !keep.has(this.selectedGraphNodeId)) {
+                this.selectedGraphNodeId = this._graphPickDefault(nodes);
+            }
+            const linked = new Set();
+            edges.forEach((e) => {
+                linked.add(e.from);
+                linked.add(e.to);
+            });
+            nodes = nodes.filter((n) => !(n.kind === 'entity' && n.breakpoint) || linked.has(n.id));
+            keep = new Set(nodes.map((n) => n.id));
+            edges = edges.filter((e) => keep.has(e.from) && keep.has(e.to));
+            if (this.selectedGraphNodeId && !keep.has(this.selectedGraphNodeId)) {
                 this.selectedGraphNodeId = this._graphPickDefault(nodes);
             }
             return { nodes, edges };
@@ -6046,7 +6162,7 @@
             return out;
         },
 
-        _graphFillSidebar(sideBody, selected, edge, visible, clueItems) {
+        _graphFillSidebar(sideBody, selected, edge, visible, clueItems, model) {
             sideBody.innerHTML = '';
             const focus = edge || selected;
             if (!focus) {
@@ -6075,7 +6191,7 @@
                 }));
                 sideBody.appendChild(Utils.create('div', {
                     class: 'wb-file-meta',
-                    text: `${this._graphStatusLabel(edge.status)} · ${edge.source}${edge.kind === 'sequence' ? ' · 仅时间先后' : ''}${edge.kind === 'excluded' ? ' · 不当作跨案通路' : ''}`
+                    text: `${this._graphStatusLabel(edge.status)} · ${edge.source}${edge.kind === 'sequence' ? ' · 仅时间先后' : ''}${edge.status === 'pending' ? ' · 待核，尚未确认同一' : ''}`
                 }));
                 const cites = edge.citations || [];
                 const openBtn = this._iconBtn('wb-btn wb-btn-outline', 'fileCheck2', '查看支持材料');
@@ -6097,7 +6213,7 @@
                 if (selected.breakpoint) {
                     sideBody.appendChild(Utils.create('div', {
                         class: 'wb-file-meta',
-                        text: `已排除同一。材料中跨 ${caseNames.length || 0} 案出现，但不作为两案之间的实线通路。`
+                        text: `已排除同一。材料中跨 ${caseNames.length || 0} 案出现，已判定不是同一对象，图上不连线。`
                     }));
                 } else if (selected.bridge) {
                     sideBody.appendChild(Utils.create('div', {
@@ -6145,7 +6261,7 @@
                     sideBody.appendChild(Utils.create('div', {
                         class: 'wb-file-meta',
                         text: selected.breakpoint
-                            ? '已排除同一，没有通往其他案件的实线通路。'
+                            ? '已排除同一，图上不连线，没有通往其他案件的通路。'
                             : '当前 2 跳内没有经「出现于 / 同事件记载」通往其他案件的实线通路。'
                     }));
                 }
@@ -6188,7 +6304,7 @@
 
             if (selected.kind === 'case') {
                 const bridges = (visible.nodes || []).filter((n) =>
-                    n.kind === 'entity' && (n.bridge || n.breakpoint) && (n.caseIds || []).includes(selected.caseId)
+                    n.kind === 'entity' && n.bridge && (n.caseIds || []).includes(selected.caseId)
                 );
                 sideBody.appendChild(Utils.create('p', { class: 'wb-graph-side-kicker', text: '跨案桥' }));
                 sideBody.appendChild(Utils.create('div', {
@@ -6304,6 +6420,36 @@
                 this.setView('leads');
             });
             sideBody.appendChild(clueBtn);
+
+            const excluded = ((model && model.nodes) || []).filter((n) => n.kind === 'entity' && n.breakpoint);
+            sideBody.appendChild(Utils.create('p', { class: 'wb-graph-side-kicker', text: '已排除同一' }));
+            if (!excluded.length) {
+                sideBody.appendChild(Utils.create('div', {
+                    class: 'wb-file-meta',
+                    text: '没有已排除的跨案对象。'
+                }));
+            } else {
+                sideBody.appendChild(Utils.create('div', {
+                    class: 'wb-file-meta',
+                    text: '人工已判定不是同一对象，图上不连线。点名称可去实体复核查看。'
+                }));
+                excluded.forEach((n) => {
+                    const cases = (n.caseIds || []).map((id) => this._graphCaseName(id)).filter(Boolean);
+                    const row = Utils.create('button', {
+                        type: 'button',
+                        class: 'wb-graph-rel'
+                    }, [
+                        Utils.create('span', { text: n.label }),
+                        Utils.create('span', { class: 'wb-file-meta', text: cases.join(' · ') || '跨案' })
+                    ]);
+                    row.addEventListener('click', () => {
+                        if (!n.candidateId) return;
+                        this.selectedEntityId = n.candidateId;
+                        this.setView('entities');
+                    });
+                    sideBody.appendChild(row);
+                });
+            }
         },
 
         async _viewGraph(root) {
@@ -6351,7 +6497,7 @@
             graphActions.appendChild(eventBtn);
             root.appendChild(this._pageHead(
                 '链条图谱',
-                '默认只画跨案共同对象：案件之间靠哪些对象连上、哪些已排除同一、哪些在同一记载里共现。单案内行为请看角色时间线。',
+                '默认只画跨案共同对象。实线是已确认同一，虚线是待核；已排除同一不连线，名单在侧栏。单案内行为请看角色时间线。',
                 graphActions,
                 this.graphShowAll ? '全图' : '跨案桥'
             ));
@@ -6364,12 +6510,15 @@
                 return;
             }
 
-            const hasBridge = model.nodes.some((n) => n.kind === 'entity' && (n.bridge || n.breakpoint));
+            const hasBridge = model.nodes.some((n) => n.kind === 'entity' && n.bridge);
+            const excludedCount = model.nodes.filter((n) => n.kind === 'entity' && n.breakpoint).length;
             if (!hasBridge) {
                 root.appendChild(Utils.create('div', { class: 'wb-alert info' }, [
                     window.Icons ? Icons.el('info') : Utils.create('span', { text: 'ℹ' }),
                     Utils.create('span', {
-                        text: '当前没有跨案共同对象。图谱看的是案件之间靠哪些对象连上；单案内行为请看角色时间线。'
+                        text: excludedCount
+                            ? `当前没有跨案桥。${excludedCount} 个对象已排除同一，图上不连线，名单见右侧。单案内行为请看角色时间线。`
+                            : '当前没有跨案共同对象。图谱看的是案件之间靠哪些对象连上；单案内行为请看角色时间线。'
                     })
                 ]));
             }
@@ -6444,15 +6593,15 @@
             root.appendChild(Utils.create('div', { class: 'ref-graph-legend' }, [
                 Utils.create('span', {}, [
                     Utils.create('i', { class: 'ref-graph-dot ok' }),
-                    Utils.create('span', { text: '跨案桥 / 材料记载' })
-                ]),
-                Utils.create('span', {}, [
-                    Utils.create('i', { class: 'ref-graph-dot warn' }),
-                    Utils.create('span', { text: '待确认' })
+                    Utils.create('span', { text: '已确认同一 / 跨案桥' })
                 ]),
                 Utils.create('span', {}, [
                     Utils.create('i', { class: 'ref-graph-line dash' }),
-                    Utils.create('span', { text: '已排除同一 / 系统推测' })
+                    Utils.create('span', { text: '跨案出现（待核）' })
+                ]),
+                Utils.create('span', {}, [
+                    Utils.create('i', { class: 'ref-graph-line inferred' }),
+                    Utils.create('span', { text: '系统推测' })
                 ]),
                 Utils.create('span', {}, [
                     Utils.create('i', { class: 'ref-graph-line' }),
@@ -6567,9 +6716,9 @@
                 line.setAttribute('y1', String(pts.y1));
                 line.setAttribute('x2', String(pts.x2));
                 line.setAttribute('y2', String(pts.y2));
-                line.setAttribute('class', `wb-graph-edge is-${e.status || 'recorded'}${e.kind === 'sequence' ? ' is-sequence' : ''}${e.kind === 'excluded' ? ' is-excluded' : ''}`);
-                if (e.strength === 'weak' || e.status === 'inferred' || e.kind === 'excluded' || (e.kind === 'sequence' && e.label === '先后待核')) {
-                    line.setAttribute('stroke-dasharray', '6 6');
+                line.setAttribute('class', `wb-graph-edge is-${e.status || 'recorded'}${e.kind === 'sequence' ? ' is-sequence' : ''}${e.status === 'inferred' ? ' is-inferred' : ''}`);
+                if (e.status === 'pending' || e.strength === 'weak' || e.status === 'inferred' || (e.kind === 'sequence' && e.label === '先后待核')) {
+                    line.setAttribute('stroke-dasharray', '3 4');
                 }
                 if (e.directed) line.setAttribute('marker-end', 'url(#wb-graph-arrow)');
                 const hit = document.createElementNS('http://www.w3.org/2000/svg', 'line');
@@ -6585,7 +6734,7 @@
                 });
                 svg.appendChild(line);
                 svg.appendChild(hit);
-                if (e.kind === 'sequence' || e.kind === 'act' || e.kind === 'cooccur' || e.kind === 'excluded') {
+                if (e.kind === 'sequence' || e.kind === 'act' || e.kind === 'cooccur') {
                     const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
                     label.setAttribute('x', String((pts.x1 + pts.x2) / 2));
                     label.setAttribute('y', String((pts.y1 + pts.y2) / 2 - 6));
@@ -6640,7 +6789,7 @@
             });
 
             this._graphBindPanZoom(viewport, world);
-            this._graphFillSidebar(sideBody, selected, selectedEdge, visible, clueItems);
+            this._graphFillSidebar(sideBody, selected, selectedEdge, visible, clueItems, model);
 
             const tableCard = Utils.create('div', { class: 'wb-panel-card', style: 'margin-top:14px' });
             tableCard.appendChild(Utils.create('div', { class: 'wb-panel-card-head' }, [
@@ -6687,56 +6836,88 @@
 
         async _viewReports(root) {
             const verifyArt = (this.task.artifacts || []).find((a) => a.type === 'SOURCE_VERIFY');
-            const reportArts = (this.task.artifacts || []).filter((a) =>
-                a.type === 'REPORT_DRAFT' || a.type === 'REPORT_EXPORT'
-            );
+            let reportArts = [];
+            try {
+                const resp = await fetch(`/api/tasks/${this.task.id}/reports?_=${Date.now()}`);
+                const data = await resp.json();
+                if (!data.error_code) reportArts = data.reports || [];
+            } catch (_) {
+                reportArts = [];
+            }
             const draftBtn = this._iconBtn('wb-btn wb-btn-primary', 'plus', '新建报告');
             draftBtn.addEventListener('click', () => this._askAssistantToWriteReport(draftBtn));
             root.appendChild(this._pageHead(
                 '报告与审计',
-                '由右侧智能体起草可追溯的跨案关联线索核验单（单份持续迭代），并查看核验留痕。',
+                '每次撰写生成一版核验单，互不覆盖。下载只给该行加上次数标签。',
                 draftBtn,
-                reportArts.length ? '单份核验单 · 可反复迭代' : '尚未撰写'
+                reportArts.length ? `${reportArts.length} 份报告` : '尚未撰写'
             ));
 
             const grid = Utils.create('div', { class: 'wb-report-grid' });
 
             const reportCard = Utils.create('div', { class: 'wb-panel-card' });
             reportCard.appendChild(Utils.create('div', { class: 'wb-panel-card-head' }, [
-                Utils.create('div', { class: 'wb-entity-title', text: '报告列表' })
+                Utils.create('div', {}, [
+                    Utils.create('div', { class: 'wb-entity-title', text: '报告列表' }),
+                    Utils.create('div', {
+                        class: 'wb-file-meta',
+                        text: `当前任务：${this.task.title || '未命名任务'}`
+                    })
+                ])
             ]));
             const reportBody = Utils.create('div', { class: 'wb-panel-card-body' });
             let validReportCount = 0;
             if (!reportArts.length) {
                 reportBody.appendChild(Utils.create('div', {
                     class: 'wb-file-meta',
-                    text: '尚未撰写报告。完成实体复核与线索整理后，点右上「新建报告」，由右侧智能体起草；报告为单份，可反复迭代。'
+                    text: '尚未撰写。完成实体复核与线索整理后，点右上「新建报告」；每生成一次占一行。'
                 }));
             } else {
                 for (const art of reportArts) {
-                    const data = await this._fetchArtifact(art.id);
-                    const p = (data && data.payload) || {};
-                    const valid = p.valid !== false;
-                    if (p.valid === true) validReportCount += 1;
-                    const row = Utils.create('div', {
-                        style: 'display:flex;justify-content:space-between;gap:12px;align-items:center;padding:12px 0;border-bottom:1px solid var(--border-color)'
-                    }, [
-                        Utils.create('div', {}, [
-                            Utils.create('div', {
-                                style: 'display:flex;align-items:center;gap:8px;flex-wrap:wrap'
-                            }, [
-                                Utils.create('div', { class: 'wb-list-item-title', text: art.title || '核验单' }),
-                                this._statusTag(valid ? '有效版本' : '含待补原文依据', valid ? 'ok' : 'danger')
-                            ]),
-                            Utils.create('div', {
-                                class: 'wb-file-meta',
-                                text: `v${art.current_version || (data && data.version) || 1} · ${(art.updated_at || '').toString().slice(0, 10) || '—'}`
-                            })
+                    const valid = art.valid !== false;
+                    if (valid) validReportCount += 1;
+                    const seq = art.report_seq || art.version || 1;
+                    const downloads = Number(art.download_count || 0);
+                    const when = (art.generated_at || '').toString().slice(0, 16).replace('T', ' ');
+                    const actor = art.generated_by || '智能体';
+                    const ico = Utils.create('div', { class: 'wb-report-row-ico' });
+                    if (window.Icons) ico.appendChild(Icons.el('fileText', 'wb-ico'));
+                    const tags = Utils.create('div', { class: 'wb-report-row-tags' }, [
+                        this._statusTag(valid ? '有效版本' : '存在失效引用', valid ? 'ok' : 'danger')
+                    ]);
+                    if (downloads > 0) {
+                        tags.appendChild(this._statusTag(`已下载 ${downloads} 次`, 'neutral'));
+                    }
+                    const row = Utils.create('div', { class: 'wb-report-row' }, [
+                        Utils.create('div', { class: 'wb-report-row-main' }, [
+                            ico,
+                            Utils.create('div', {}, [
+                                Utils.create('div', {
+                                    class: 'wb-list-item-title',
+                                    text: art.title || `跨案关联线索核验单 · v${seq}`
+                                }),
+                                Utils.create('div', {
+                                    class: 'wb-file-meta',
+                                    text: [
+                                        art.clue_count != null ? `线索 ${art.clue_count} 条` : '',
+                                        when ? `生成于 ${when}` : '',
+                                        actor
+                                    ].filter(Boolean).join(' · ')
+                                }),
+                                tags
+                            ])
                         ])
                     ]);
                     const dl = this._iconBtn('wb-btn wb-btn-outline', 'download', '下载');
                     if (!valid) dl.disabled = true;
-                    dl.addEventListener('click', () => this._downloadReport());
+                    dl.addEventListener('click', async () => {
+                        dl.disabled = true;
+                        try {
+                            await this._downloadReport(art.artifact_id, art.version);
+                        } finally {
+                            dl.disabled = false;
+                        }
+                    });
                     row.appendChild(dl);
                     reportBody.appendChild(row);
                 }
@@ -6746,26 +6927,41 @@
 
             const summaryCard = Utils.create('div', { class: 'wb-panel-card' });
             summaryCard.appendChild(Utils.create('div', { class: 'wb-panel-card-head' }, [
-                Utils.create('div', { class: 'wb-entity-title', text: '审计摘要' })
+                Utils.create('div', {}, [
+                    Utils.create('div', { class: 'wb-entity-title', text: '审计摘要' }),
+                    Utils.create('div', { class: 'wb-file-meta', text: '当前任务的可追溯性检查' })
+                ])
             ]));
             const sumBody = Utils.create('div', { class: 'wb-panel-card-body' });
             let eventCount = 0;
+            let verifyEvents = [];
             if (verifyArt) {
                 const data = await this._fetchArtifact(verifyArt.id);
-                eventCount = (((data && data.payload) || {}).events || []).length;
+                verifyEvents = ((data && data.payload) || {}).events || [];
+                eventCount = verifyEvents.length;
             }
             sumBody.appendChild(Utils.create('div', { class: 'wb-alert' }, [
                 window.Icons ? Icons.el('shieldCheck') : null,
                 Utils.create('span', {
                     text: eventCount
-                        ? `审计链路：已记录 ${eventCount} 条操作${validReportCount ? `；有效报告 ${validReportCount} 份` : ''}。`
-                        : '完成实体决策、线索处置后会自动留痕；报告每撰写或迭代一版也会留痕。'
+                        ? '审计链路完整。报告绑定撰写时刻的范围、实体结论与来源清单。'
+                        : '完成实体决策、线索处置后会自动留痕；报告撰写与下载也会写入本页。'
                 })
             ].filter(Boolean)));
+            sumBody.appendChild(Utils.create('div', { class: 'wb-report-stats' }, [
+                Utils.create('div', { class: 'wb-report-stat' }, [
+                    Utils.create('span', { text: '操作记录' }),
+                    Utils.create('b', { text: String(eventCount) })
+                ]),
+                Utils.create('div', { class: 'wb-report-stat' }, [
+                    Utils.create('span', { text: '有效报告' }),
+                    Utils.create('b', { text: String(validReportCount) })
+                ])
+            ]));
             sumBody.appendChild(Utils.create('div', {
                 class: 'wb-file-meta',
-                text: '导出内容将保持脱敏，不得回填原始敏感标识。',
-                style: 'margin-top:10px'
+                text: '导出内容保持脱敏，不得回填原始敏感标识。',
+                style: 'margin-top:12px'
             }));
             summaryCard.appendChild(sumBody);
             grid.appendChild(summaryCard);
@@ -6773,7 +6969,7 @@
 
             const auditCard = Utils.create('div', { class: 'wb-panel-card', style: 'margin-top:14px' });
             auditCard.appendChild(Utils.create('div', { class: 'wb-panel-card-head' }, [
-                Utils.create('div', { class: 'wb-entity-title', text: '近期操作记录' })
+                Utils.create('div', { class: 'wb-entity-title', text: '最近操作记录' })
             ]));
             const wrap = Utils.create('div', { class: 'wb-table-wrap', style: 'border:0;border-radius:0' });
             const table = Utils.create('table', { class: 'wb-table' });
@@ -6786,19 +6982,12 @@
                 ])
             ]));
             const tbody = Utils.create('tbody');
-            if (!verifyArt) {
+            if (!verifyEvents.length) {
                 tbody.appendChild(Utils.create('tr', {}, [
                     Utils.create('td', { text: '暂无操作记录', colspan: '4' })
                 ]));
             } else {
-                const data = await this._fetchArtifact(verifyArt.id);
-                const events = ((data && data.payload) || {}).events || [];
-                if (!events.length) {
-                    tbody.appendChild(Utils.create('tr', {}, [
-                        Utils.create('td', { text: '暂无操作记录', colspan: '4' })
-                    ]));
-                }
-                events.slice().reverse().forEach((ev) => {
+                verifyEvents.slice().reverse().forEach((ev) => {
                     const ok = ev.result !== 'fail' && ev.result !== 'interrupted';
                     tbody.appendChild(Utils.create('tr', {}, [
                         Utils.create('td', { text: (ev.at || '').toString().slice(0, 19) || '—' }),
@@ -6822,17 +7011,15 @@
                 button.disabled = true;
                 button.textContent = '撰写中…';
             }
-            const hasDraft = (this.task.artifacts || []).some((a) =>
-                a.type === 'REPORT_DRAFT' || a.type === 'REPORT_EXPORT'
-            );
+            const hasDraft = (this.task.artifacts || []).some((a) => a.type === 'REPORT_DRAFT');
             const prompt = [
-                `请为当前监督分析任务${hasDraft ? '更新' : '撰写'}《跨案关联线索核验单》：`,
-                '先读取任务范围、实体复核结论、已形成线索与既有草稿；',
+                `请为当前监督分析任务撰写一版新的《跨案关联线索核验单》：`,
+                '先读取任务范围、实体复核结论（含视为同一/保留独立名单）、已形成线索与来源编号；',
+                hasDraft ? '若有上一版正文可参考，但必须提交整篇新正文，系统会新增一版，不覆盖旧报告；' : '',
                 '若实体复核尚未完成或尚无待核线索，请先请用户到中间工作区完成确认或整理线索后再出报告；',
-                '随后撰写整篇正文并保存到报告中心（报告为单份，可反复迭代）。',
-                '禁止定罪、并案、主从犯或量刑等法律结论；',
-                '回复不必复述全文，简要说明要点或本次改动即可。'
-            ].join('');
+                '正文用「见来源N」指向系统清单，不要抄写全量来源表；禁止定罪、并案、主从犯或量刑等法律结论；',
+                '回复不必复述全文，简要说明本版要点即可。'
+            ].filter(Boolean).join('');
             try {
                 if (!window.Agent) throw new Error('智能体未就绪');
                 await Agent.process(prompt);
@@ -6849,9 +7036,11 @@
             }
         },
 
-        async _downloadReport() {
-            // 始终向服务端取当前版本并即时转 docx：既避免拿到渲染时缓存的旧版，也无需前端做格式转换。
-            const url = `/api/tasks/${this.task.id}/report.docx?_=${Date.now()}`;
+        async _downloadReport(reportId, version) {
+            const params = [`_=${Date.now()}`];
+            if (reportId) params.push(`report_id=${encodeURIComponent(reportId)}`);
+            if (version) params.push(`version=${encodeURIComponent(version)}`);
+            const url = `/api/tasks/${this.task.id}/report.docx?${params.join('&')}`;
             try {
                 const resp = await fetch(url);
                 if (!resp.ok) {
@@ -6873,6 +7062,8 @@
                 a.download = filename;
                 a.click();
                 URL.revokeObjectURL(objectUrl);
+                await this.refreshTask();
+                await this.setView('reports');
             } catch (e) {
                 Toast.error('报告下载失败：' + e.message);
             }
