@@ -1813,20 +1813,6 @@
             push(source && source.value, 2);
             push(source && source.extracted_value, 2);
             (source && source.highlight_terms || []).forEach((t) => push(t, 2));
-            const primary = this._compactHighlightText(
-                this._normalizeHighlightNeedle((source && (source.quote_display || source.quote)) || display)
-            );
-            if (primary.length >= 10) {
-                const win = Math.min(16, primary.length);
-                push(primary.slice(0, win), 6);
-                push(primary.slice(-win), 6);
-                if (primary.length >= 24) {
-                    const mid = Math.floor(primary.length / 2) - Math.floor(win / 2);
-                    push(primary.slice(mid, mid + win), 6);
-                }
-            }
-            const runs = String(display || '').match(/[\u4e00-\u9fff]{4,}/g) || [];
-            runs.sort((a, b) => b.length - a.length).slice(0, 4).forEach((r) => push(r, 4));
             return out.sort((a, b) => (
                 this._compactHighlightText(b).length - this._compactHighlightText(a).length
             ));
@@ -1860,75 +1846,9 @@
             container.innerHTML = html;
         },
 
-        _highlightMarkdownPreview(container, source) {
-            if (!container) return;
-            const needles = this._citationNeedles(source || {});
-            if (!needles.length) return;
-            const skip = { MARK: 1, SCRIPT: 1, STYLE: 1 };
-            const nodes = [];
-            const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
-                acceptNode(node) {
-                    const text = node.nodeValue || '';
-                    if (!text) return NodeFilter.FILTER_REJECT;
-                    const tag = node.parentElement && node.parentElement.tagName;
-                    if (tag && skip[tag]) return NodeFilter.FILTER_REJECT;
-                    return NodeFilter.FILTER_ACCEPT;
-                }
-            });
-            while (walker.nextNode()) nodes.push(walker.currentNode);
-            if (!nodes.length) return;
-            const compactChars = [];
-            const map = [];
-            nodes.forEach((node) => {
-                const text = node.nodeValue || '';
-                for (let i = 0; i < text.length; i += 1) {
-                    if (/[\s\u00a0\u3000]/.test(text[i])) continue;
-                    compactChars.push(text[i]);
-                    map.push({ node, offset: i });
-                }
-            });
-            const compact = compactChars.join('');
-            if (!compact) return;
-            let hit = null;
-            for (let i = 0; i < needles.length; i += 1) {
-                const needle = this._compactHighlightText(this._normalizeHighlightNeedle(needles[i]));
-                if (!needle) continue;
-                const at = compact.indexOf(needle);
-                if (at >= 0) {
-                    hit = { at, length: needle.length };
-                    break;
-                }
-            }
-            if (!hit) return;
-            const groups = [];
-            let current = null;
-            for (let i = hit.at; i < hit.at + hit.length; i += 1) {
-                const loc = map[i];
-                if (!loc) break;
-                if (!current || current.node !== loc.node) {
-                    current = { node: loc.node, min: loc.offset, max: loc.offset };
-                    groups.push(current);
-                } else {
-                    current.max = loc.offset;
-                }
-            }
-            for (let g = groups.length - 1; g >= 0; g -= 1) {
-                const { node, min, max } = groups[g];
-                if (!node || !node.parentNode) continue;
-                const text = node.nodeValue || '';
-                const before = text.slice(0, min);
-                const match = text.slice(min, max + 1);
-                const after = text.slice(max + 1);
-                const frag = document.createDocumentFragment();
-                if (before) frag.appendChild(document.createTextNode(before));
-                const mark = document.createElement('mark');
-                mark.className = 'wb-cite-mark';
-                const strong = document.createElement('strong');
-                strong.textContent = match;
-                mark.appendChild(strong);
-                frag.appendChild(mark);
-                if (after) frag.appendChild(document.createTextNode(after));
-                node.parentNode.replaceChild(frag, node);
+        _highlightMarkdownPreview(container) {
+            if (container && window.Markdown && typeof Markdown.applyHighlights === 'function') {
+                Markdown.applyHighlights(container);
             }
         },
 
@@ -1982,12 +1902,9 @@
             } else {
                 textBox = this._renderMarkdownBody(
                     data.text || this._displayQuote(source) || '',
-                    'wb-cite-body wb-doc-preview md-content'
+                    'wb-cite-body wb-doc-preview md-content',
+                    { ...source, quote_display: data.quote || source.quote_display }
                 );
-                this._highlightMarkdownPreview(textBox, {
-                    ...source,
-                    quote_display: data.quote || source.quote_display
-                });
             }
             panel.appendChild(textBox);
             if (conf != null && conf < 0.85) {
@@ -2087,13 +2004,9 @@
                 } else {
                     const body = this._renderMarkdownBody(
                         view.text || displayQuote || '',
-                        'wb-cite-body wb-doc-preview md-content'
+                        'wb-cite-body wb-doc-preview md-content',
+                        { ...source, quote_display: displayQuote, quote: displayQuote }
                     );
-                    this._highlightMarkdownPreview(body, {
-                        ...source,
-                        quote_display: displayQuote,
-                        quote: displayQuote
-                    });
                     bodyEl.appendChild(body);
                 }
             }
@@ -2776,10 +2689,14 @@
             footer.appendChild(closeBtn);
             content.appendChild(footer);
         },
-        _renderMarkdownBody(text, className = 'wb-doc-preview md-content') {
+        _renderMarkdownBody(text, className = 'wb-doc-preview md-content', source) {
             const el = Utils.create('div', { class: className });
             if (window.Markdown && typeof Markdown.parse === 'function') {
-                el.innerHTML = Markdown.parse(text || '');
+                const needles = source ? this._citationNeedles(source) : [];
+                el.innerHTML = Markdown.parse(text || '', { highlightNeedles: needles });
+                if (needles.length && typeof Markdown.applyHighlights === 'function') {
+                    Markdown.applyHighlights(el);
+                }
             } else {
                 el.classList.add('wb-doc-preview');
                 el.textContent = text || '';

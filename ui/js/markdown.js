@@ -4,6 +4,10 @@
 (function (global) {
     'use strict';
 
+    const MARK_START = '\uE000';
+    const MARK_END = '\uE001';
+    const WS = /[\s\u00a0\u3000]/;
+
     function pipeLine(s) {
         return String(s || '').replace(/\uFF5C/g, '|');
     }
@@ -61,14 +65,288 @@
         return table;
     }
 
+    function compactNeedle(s) {
+        return String(s || '')
+            .replace(/……+/g, '')
+            .replace(/\.{3,}/g, '')
+            .replace(/^#{1,6}\s+/gm, '')
+            .replace(/^\s*[-*•]\s+/gm, '')
+            .replace(/^\s*\d+[\.．、)]\s+/gm, '')
+            .replace(/\|/g, '')
+            .replace(/\*\*/g, '')
+            .replace(/[\s\u00a0\u3000]+/g, '');
+    }
+
+    function emitInlineVisible(lineStart, line, emit) {
+        const s = String(line || '');
+        let i = 0;
+        while (i < s.length) {
+            const ch = s[i];
+            if (ch === MARK_START || ch === MARK_END) {
+                i += 1;
+                continue;
+            }
+            if (s.startsWith('**', i)) {
+                i += 2;
+                continue;
+            }
+            if (ch === '`' || ch === '*') {
+                i += 1;
+                continue;
+            }
+            if (ch === '[') {
+                const close = s.indexOf('](', i);
+                const end = close >= 0 ? s.indexOf(')', close + 2) : -1;
+                if (close > i && end > close) {
+                    emitInlineVisible(lineStart + i + 1, s.slice(i + 1, close), emit);
+                    i = end + 1;
+                    continue;
+                }
+            }
+            if (!WS.test(ch)) emit(ch, lineStart + i);
+            i += 1;
+        }
+    }
+
+    function emitTableRowVisible(lineStart, line, emit) {
+        const raw = String(line || '');
+        let i = 0;
+        while (i < raw.length && WS.test(raw[i])) i += 1;
+        if (raw[i] === '|' || raw[i] === '\uFF5C') i += 1;
+        let cellStart = i;
+        while (i <= raw.length) {
+            const atEnd = i === raw.length;
+            const isPipe = !atEnd && (raw[i] === '|' || raw[i] === '\uFF5C');
+            if (atEnd || isPipe) {
+                emitInlineVisible(lineStart + cellStart, raw.slice(cellStart, i), emit);
+                if (atEnd) break;
+                i += 1;
+                cellStart = i;
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    function splitSourceLines(text) {
+        const lines = [];
+        let offset = 0;
+        const rawLines = String(text || '').split('\n');
+        rawLines.forEach((line, idx) => {
+            lines.push({ line, start: offset });
+            offset += line.length + (idx < rawLines.length - 1 ? 1 : 0);
+        });
+        return lines;
+    }
+
+    /** 与预览渲染同一套可见字，并记下每个字在未预览原文中的位置 */
+    function buildVisibleMap(md) {
+        const text = String(md || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+        const compactChars = [];
+        const map = [];
+        const emit = (ch, src) => {
+            compactChars.push(ch);
+            map.push(src);
+        };
+        const lines = splitSourceLines(text);
+        const isUl = (s) => /^[\s\u3000]{0,7}[-*•]\s+\S/.test(s || '');
+        const isOl = (s) => /^[\s\u3000]{0,7}\d+[\.．、)]\s+\S/.test(s || '');
+
+        for (let i = 0; i < lines.length; i += 1) {
+            const { line, start } = lines[i];
+            if (!line.trim()) continue;
+            if (/^---+\s*$/.test(line.trim())) continue;
+
+            if (isTableRow(line)) {
+                const block = [];
+                let k = i;
+                while (k < lines.length) {
+                    if (!lines[k].line.trim()) {
+                        let j = k + 1;
+                        while (j < lines.length && !lines[j].line.trim()) j += 1;
+                        if (j < lines.length && isTableRow(lines[j].line)) {
+                            k = j;
+                            continue;
+                        }
+                        break;
+                    }
+                    if (!isTableRow(lines[k].line)) break;
+                    block.push(lines[k]);
+                    k += 1;
+                }
+                if (block.length >= 2) {
+                    block.forEach((row) => {
+                        if (isSeparatorRow(row.line)) return;
+                        emitTableRowVisible(row.start, row.line, emit);
+                    });
+                    i = k - 1;
+                    continue;
+                }
+            }
+
+            const heading = line.match(/^(#{1,4})\s+(.+)$/);
+            if (heading) {
+                emitInlineVisible(start + heading[0].length - heading[2].length, heading[2], emit);
+                continue;
+            }
+            if (line.startsWith('> ')) {
+                emitInlineVisible(start + 2, line.slice(2), emit);
+                continue;
+            }
+            if (isUl(line)) {
+                const m = line.match(/^([\s\u3000]{0,7}[-*•]\s+)(.+)$/);
+                if (m) emitInlineVisible(start + m[1].length, m[2], emit);
+                continue;
+            }
+            if (isOl(line)) {
+                const m = line.match(/^([\s\u3000]{0,7}\d+[\.．、)]\s+)(.+)$/);
+                if (m) emitInlineVisible(start + m[1].length, m[2], emit);
+                continue;
+            }
+            emitInlineVisible(start, line, emit);
+        }
+        return { text, compact: compactChars.join(''), map };
+    }
+
+    function locateNeedle(compact, needles) {
+        const unique = [];
+        const seen = new Set();
+        (needles || []).forEach((raw) => {
+            const n = compactNeedle(raw);
+            if (n.length < 2 || seen.has(n)) return;
+            seen.add(n);
+            unique.push(n);
+        });
+        unique.sort((a, b) => b.length - a.length);
+        const find = (needle, requireUnique) => {
+            if (!needle) return null;
+            const at = compact.indexOf(needle);
+            if (at < 0) return null;
+            if (requireUnique && compact.indexOf(needle, at + 1) >= 0) return null;
+            return { at, length: needle.length };
+        };
+        for (let i = 0; i < unique.length; i += 1) {
+            if (unique[i].length < 16) continue;
+            const hit = find(unique[i], false);
+            if (hit) return hit;
+        }
+        for (let i = 0; i < unique.length; i += 1) {
+            const hit = find(unique[i], true);
+            if (hit) return hit;
+        }
+        const primary = unique[0];
+        if (primary && primary.length >= 8) {
+            for (let len = primary.length - 1; len >= 8; len -= 1) {
+                const hit = find(primary.slice(0, len), true);
+                if (hit) return hit;
+            }
+            for (let len = primary.length - 1; len >= 8; len -= 1) {
+                const hit = find(primary.slice(primary.length - len), true);
+                if (hit) return hit;
+            }
+        }
+        for (let i = 0; i < unique.length; i += 1) {
+            const hit = find(unique[i], false);
+            if (hit && unique[i].length >= 8) return hit;
+        }
+        return null;
+    }
+
+    function injectHighlightMarks(md, needles) {
+        const { text, compact, map } = buildVisibleMap(md);
+        const hit = locateNeedle(compact, needles);
+        if (!hit || !map.length) return text;
+        const from = map[hit.at];
+        const last = map[hit.at + hit.length - 1];
+        if (from == null || last == null) return text;
+        const to = last + 1;
+        if (from >= to) return text;
+        return text.slice(0, from) + MARK_START + text.slice(from, to) + MARK_END + text.slice(to);
+    }
+
+    function wrapMarkedSlice(node, from, to) {
+        if (!node || !node.parentNode) return;
+        const text = node.nodeValue || '';
+        const safeFrom = Math.max(0, Math.min(from, text.length));
+        const safeTo = Math.max(safeFrom, Math.min(to, text.length));
+        const strip = (s) => String(s || '').replace(/\uE000|\uE001/g, '');
+        const before = strip(text.slice(0, safeFrom));
+        const match = strip(text.slice(safeFrom, safeTo));
+        const after = strip(text.slice(safeTo));
+        const frag = document.createDocumentFragment();
+        if (before) frag.appendChild(document.createTextNode(before));
+        if (match) {
+            const mark = document.createElement('mark');
+            mark.className = 'wb-cite-mark';
+            const strong = document.createElement('strong');
+            strong.textContent = match;
+            mark.appendChild(strong);
+            frag.appendChild(mark);
+        }
+        if (after) frag.appendChild(document.createTextNode(after));
+        node.parentNode.replaceChild(frag, node);
+    }
+
+    function applyHighlights(container) {
+        if (!container) return;
+        const skip = { SCRIPT: 1, STYLE: 1 };
+        const nodes = [];
+        const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
+            acceptNode(node) {
+                const tag = node.parentElement && node.parentElement.tagName;
+                if (tag && skip[tag]) return NodeFilter.FILTER_REJECT;
+                return NodeFilter.FILTER_ACCEPT;
+            }
+        });
+        while (walker.nextNode()) nodes.push(walker.currentNode);
+        let start = null;
+        let end = null;
+        nodes.forEach((node) => {
+            const t = node.nodeValue || '';
+            const a = t.indexOf(MARK_START);
+            const b = t.indexOf(MARK_END);
+            if (a >= 0) start = { node, offset: a };
+            if (b >= 0) end = { node, offset: b };
+        });
+        if (!start || !end) {
+            nodes.forEach((node) => {
+                const t = node.nodeValue || '';
+                if (t.indexOf(MARK_START) >= 0 || t.indexOf(MARK_END) >= 0) {
+                    node.nodeValue = t.replace(/\uE000|\uE001/g, '');
+                }
+            });
+            return;
+        }
+        if (start.node === end.node) {
+            wrapMarkedSlice(start.node, start.offset + 1, end.offset);
+            return;
+        }
+        const startIdx = nodes.indexOf(start.node);
+        const endIdx = nodes.indexOf(end.node);
+        wrapMarkedSlice(end.node, 0, end.offset);
+        for (let i = endIdx - 1; i > startIdx; i -= 1) {
+            const node = nodes[i];
+            if (!node || !node.parentNode) continue;
+            wrapMarkedSlice(node, 0, (node.nodeValue || '').length);
+        }
+        wrapMarkedSlice(start.node, start.offset + 1, (start.node.nodeValue || '').length);
+    }
+
     /**
      * 轻量级 Markdown → HTML 转换器
      * 支持：标题、加粗、斜体、行内代码、代码块、链接、列表、引用、表格、分割线
+     * options.highlightNeedles：在未预览原文上定位后再渲染，避免预览错位
      */
-    function parse(md) {
+    function parse(md, options) {
         if (!md) return '';
 
-        let html = Utils.escapeHtml(String(md).replace(/\r\n/g, '\n').replace(/\r/g, '\n'));
+        let source = String(md).replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+        const needles = options && options.highlightNeedles;
+        if (needles && needles.length) {
+            source = injectHighlightMarks(source, needles);
+        }
+
+        let html = Utils.escapeHtml(source);
 
         // 代码块（```...```）
         html = html.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code class="language-$1">$2</code></pre>');
@@ -243,5 +521,5 @@
         return text;
     }
 
-    global.Markdown = { parse, parseInline };
+    global.Markdown = { parse, parseInline, applyHighlights, compactNeedle };
 })(window);
