@@ -211,7 +211,7 @@ def _entity_review_gate(task_id: str) -> dict[str, Any] | None:
         "message": (
             f"跨案对象仍有 {pending} 条待人工确认。"
             "请先提示用户在中间工作区完成「视为同一 / 保留独立」，"
-            "确认完成后再整理线索或报告。"
+            "确认完成后再整理时间线、线索或报告。"
         ),
     }
 
@@ -225,8 +225,9 @@ def run_task_collision(task_id: str, user_id: str | None = None) -> str:
         message = "跨案标识比对完成，已生成对象待核清单"
         if gate == "ENTITY_REVIEW":
             message = (
-                "跨案标识比对完成。请提示用户到中间工作区打开「实体复核」，"
-                "对每条候选作出「视为同一」或「保留独立」；确认完成前不要继续写线索或报告。"
+                "跨案标识比对完成。请先根据材料补写系统未列出的疑似同一对象"
+                "（不同称呼共用证卡号、外号、商户名、证件人像），写入待核后再请用户到实体复核确认；"
+                "确认完成前不要写线索或报告。"
             )
         brief = _artifact_brief(
             art,
@@ -236,6 +237,32 @@ def run_task_collision(task_id: str, user_id: str | None = None) -> str:
         )
         brief["analysis_gate"] = gate or None
         return _tool_json(brief)
+    except TaskError as exc:
+        return _tool_json(exc.to_dict())
+
+
+def put_task_entity_candidate(
+    task_id: str,
+    candidate: dict[str, Any],
+    user_id: str | None = None,
+) -> str:
+    """写入一条疑似同一对象到实体待核清单（不代替人工确认）。"""
+    try:
+        result = get_task_service().put_entity_candidate(
+            task_id, candidate, user_id=user_id or "system"
+        )
+        pending = result.get("pending")
+        return _tool_json(
+            {
+                "ok": True,
+                "pending": pending,
+                "replaced": result.get("replaced"),
+                "message": (
+                    "已写入实体待核对象，请继续补写其他疑似同一项；"
+                    f"全部写完后请用户到中间工作区实体复核确认（当前待核 {pending} 条）"
+                ),
+            }
+        )
     except TaskError as exc:
         return _tool_json(exc.to_dict())
 
@@ -294,15 +321,24 @@ def put_task_clue(
             task_id, clue, replace_all=bool(replace_all), user_id=user_id or "system"
         )
         replaced = result.get("retired_count") or 0
+        pending = int(result.get("pending") or 0)
+        gate = result.get("analysis_gate") or ("CLUE_REVIEW" if pending > 0 else "")
         return _tool_json(
             {
                 "ok": True,
                 "clue_count": result.get("clue_count"),
                 "replaced_count": replaced,
+                "pending_clue_reviews": pending,
+                "analysis_gate": gate or None,
                 "message": (
                     f"已写入待核线索 {result.get('clue_count')} 条"
                     + (f"（顶替旧条 {replaced} 条）" if replaced else "")
-                    + "，请到中间工作区「线索中心」核验"
+                    + "，请到中间工作区「线索中心」逐条核验。"
+                    + (
+                        f"尚有 {pending} 条待处置，全部核验完成前不要撰写报告。"
+                        if pending > 0
+                        else ""
+                    )
                 ),
             }
         )
@@ -357,6 +393,25 @@ def read_report(task_id: str, user_id: str | None = None) -> str:
         return _tool_json(exc.to_dict())
 
 
+def _clue_review_gate(task_id: str) -> dict[str, Any] | None:
+    """若仍有未处置线索，阻止撰写报告。"""
+    service = get_task_service()
+    stats = service.clue_review_stats(task_id)
+    pending = int(stats.get("pending") or 0)
+    if pending <= 0:
+        return None
+    return {
+        "ok": False,
+        "blocked_by_gate": "CLUE_REVIEW",
+        "pending_clue_reviews": pending,
+        "message": (
+            f"线索中心仍有 {pending} 条待核验。"
+            "请先提示用户在中间工作区对每条作出确认关联、排除或待补证，"
+            "全部处置后再撰写报告。"
+        ),
+    }
+
+
 def write_report(
     task_id: str,
     body: str,
@@ -364,6 +419,9 @@ def write_report(
     user_id: str | None = None,
 ) -> str:
     """提交你撰写完成的《跨案关联线索核验单》整篇正文；系统自动套固定边界，并按当前产物重算实体名单与来源编号清单。每次提交新增一版，不覆盖旧版。"""
+    blocked = _entity_review_gate(task_id) or _clue_review_gate(task_id)
+    if blocked:
+        return _tool_json(blocked)
     try:
         result = get_task_service().write_report_draft(
             task_id, body=body, note=note, user_id=user_id or "system"

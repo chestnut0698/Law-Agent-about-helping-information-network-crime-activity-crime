@@ -45,9 +45,58 @@ def _report_engineering_tokens(text: str) -> bool:
     return bool(_ENGINEERING_TOKEN_RE.search(text or ""))
 
 
-# 线索确认状态的唯一判据：人工在线索中心处置写入 disposition；实体复核确认同一会把
-# 关联线索升格（promotion=confirmed）。历史数据常只有后者、没有 disposition，两者
-# 必须统一解析，否则模型会一直把已确认线索当作待核。
+_PERSON_TOKEN_RE = re.compile(r"[\u4e00-\u9fff]{2,4}")
+_PERSON_TOKEN_STOP = frozenset(
+    {
+        "两案",
+        "被告人",
+        "同一人",
+        "是否",
+        "人物",
+        "上线",
+        "证据",
+        "目录",
+        "聊天",
+        "记录",
+        "材料",
+        "本案",
+        "另案",
+        "嫌疑人",
+        "被害人",
+        "犯罪嫌疑人",
+        "疑似",
+        "核验",
+        "指向",
+        "对象",
+        "称呼",
+        "化名",
+        "外号",
+    }
+)
+
+
+def _person_keys_from_candidate(item: dict[str, Any]) -> set[str]:
+    """从人物待核条抽出可对齐的称呼，供重叠并入，避免同一人多开条。"""
+    ot = str(item.get("object_type") or item.get("entity_type") or "").upper()
+    if ot not in {"NAME", "PERSON"}:
+        return set()
+    keys: set[str] = set()
+    blobs = [str(a).strip() for a in (item.get("aliases") or []) if str(a).strip()]
+    if not blobs:
+        blobs = [str(item.get("display_name") or "")]
+    for blob in blobs:
+        for match in _PERSON_TOKEN_RE.finditer(str(blob)):
+            tok = match.group(0)
+            if tok in _PERSON_TOKEN_STOP:
+                continue
+            keys.add(tok)
+    return keys
+
+
+# 线索确认状态只认线索中心写入的 disposition。
+# 实体「视为同一 / 保留独立」只结束该张对象卡本身，不得把其它称呼、其它核验问题
+# 的线索标成已确认关联。历史 promotion=confirmed 只表示草稿曾随实体流水线改为 VALID，
+# 不视为人工已确认。
 CLUE_DISPOSITION_LABELS = {
     "PENDING": "待确认",
     "CONTINUE": "已确认关联",
@@ -58,21 +107,32 @@ CLUE_DISPOSITION_LABELS = {
 }
 
 
+def clue_entity_merge_may_follow(payload: dict[str, Any] | None) -> bool:
+    """实体视为同一后，是否把该条草稿从待实体跟进改为 VALID（内部标记，不是人工确认）。"""
+    aspect = str((payload or {}).get("aspect") or "").strip().upper()
+    return aspect in {"", "ID"}
+
+
 def clue_disposition_code(payload: dict[str, Any]) -> str:
     disp = str(payload.get("disposition") or "").upper()
     if disp:
         return disp
-    return "CONFIRMED" if payload.get("promotion") == "confirmed" else "PENDING"
+    return "PENDING"
 
 
 def clue_is_confirmed(payload: dict[str, Any]) -> bool:
-    """线索是否已被人工确认关联（含实体复核升格）。"""
+    """线索是否已在线索中心被人工确认关联。"""
     return clue_disposition_code(payload) in {"CONTINUE", "CONFIRMED"}
 
 
 def clue_is_human_set(payload: dict[str, Any]) -> bool:
-    """线索是否已带人工判断（任何处置，或实体升格）——用于锁定模型改写。"""
-    return bool(payload.get("disposition")) or payload.get("promotion") == "confirmed"
+    """线索是否已带线索中心人工判断——用于锁定模型改写。"""
+    return bool(payload.get("disposition"))
+
+
+def clue_awaiting_review(payload: dict[str, Any] | None) -> bool:
+    """尚无线索中心处置，停等核验。"""
+    return not bool((payload or {}).get("disposition"))
 
 
 def clue_state_label(payload: dict[str, Any]) -> str:
@@ -531,6 +591,7 @@ class TaskService:
         live_doc_ids = self._live_document_ids(task_id)
         task["artifacts"] = artifacts
         task["directory"] = self._build_directory(artifacts, live_doc_ids=live_doc_ids)
+        task["pending_counts"] = self._nav_pending_counts(task_id)
         return task
 
     def confirm_plan(self, task_id: str, user_id: str | None = None) -> dict[str, Any]:
@@ -620,23 +681,29 @@ class TaskService:
         return {"task": self.get_task(task_id), "plan": self.plan_preview(task_id)}
 
     def plan_preview(self, task_id: str) -> dict[str, Any]:
-        """计划确认卡：展示范围与受控步骤，标明自动执行与人工确认点。"""
+        """计划确认卡：步骤与真实执行顺序一致，只把真正停等人的环节标成人工。"""
         task = self.get_task(task_id)
+        totals = {"documents": 0, "ready": 0, "attention": 0}
+        try:
+            totals = (self.material_overview(task_id) or {}).get("totals") or totals
+        except Exception:
+            pass
         return {
             "task_id": task_id,
             "title": task["title"],
             "purpose": task["purpose"],
             "authorized_until": task["authorized_until"],
             "cases": task["cases"],
+            "material_totals": totals,
             "steps": [
-                {"key": "AUTH_CHECK", "label": "逐案授权校验", "mode": "auto"},
-                {"key": "PARSE", "label": "材料解析与 OCR", "mode": "auto"},
-                {"key": "QUALITY", "label": "识别质量检查", "mode": "review"},
-                {"key": "EXTRACT", "label": "对象与行为抽取", "mode": "auto"},
-                    {"key": "ENTITY_REVIEW", "label": "跨案对象判断", "mode": "review"},
-                {"key": "CLUE", "label": "关联线索生成", "mode": "auto"},
-                {"key": "SOURCE_VERIFY", "label": "回原文核验", "mode": "review"},
-                {"key": "REPORT", "label": "线索报告", "mode": "review"},
+                {"key": "PARSE", "label": "材料解析与识字", "mode": "auto"},
+                {"key": "COLLIDE", "label": "跨案标识比对", "mode": "auto"},
+                {"key": "ENTITY_WRITE", "label": "补写疑似同一对象", "mode": "auto"},
+                {"key": "ENTITY_REVIEW", "label": "判断对象是否同一", "mode": "review"},
+                {"key": "TIMELINE", "label": "整理事件时间线", "mode": "auto"},
+                {"key": "CLUE", "label": "形成疑似关联线索", "mode": "auto"},
+                {"key": "CLUE_REVIEW", "label": "核验关联线索", "mode": "review"},
+                {"key": "REPORT", "label": "撰写线索报告", "mode": "review"},
             ],
         }
 
@@ -670,7 +737,10 @@ class TaskService:
         self,
         clue_payload: dict[str, Any] | None,
         candidate: dict[str, Any] | None,
+        *,
+        strict: bool = False,
     ) -> bool:
+        """线索是否挂到该实体。strict 只认 candidate_id 显式挂钩；弱匹配仅供对照列表。"""
         clue_payload = clue_payload or {}
         candidate = candidate or {}
         candidate_id = str(candidate.get("candidate_id") or "").strip()
@@ -681,11 +751,13 @@ class TaskService:
         }
         if candidate_id and candidate_id in linked:
             return True
+        if strict:
+            return False
         fp = str(candidate.get("fingerprint") or "").strip()
         if fp and fp in self.clue_fingerprint_set(clue_payload):
             return True
 
-        # 历史线索常把候选写进正文却未填 linked/fingerprint；用正文弱匹配兜底
+        # 对照列表兜底：正文/对象芯片出现该实体表面。不得用于自动确认关联。
         blob = " ".join(
             [
                 str(clue_payload.get("title") or ""),
@@ -968,6 +1040,311 @@ class TaskService:
         )
         return {"artifact": artifact, "task": self.get_task(task_id)}
 
+    def put_entity_candidate(
+        self,
+        task_id: str,
+        candidate: dict[str, Any],
+        *,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """助手写入一条疑似同一对象。不代替人工决定，不覆盖已核验条。"""
+        from tools.entities import (
+            _clamp_person_span,
+            canonicalize_evidence_citation,
+            candidate_fingerprint,
+            quote_hash as _quote_hash,
+        )
+
+        task = self.get_task(task_id)
+        if task["status"] == "SCOPE_DRAFT":
+            raise TaskError(TASK_ERROR_CODES["STATE_CONFLICT"], "计划尚未确认")
+        current = self.find_artifact(task_id, "ENTITY_CANDIDATE_SET", "entity-candidates")
+        if not current:
+            raise TaskError(
+                TASK_ERROR_CODES["ARTIFACT_NOT_FOUND"],
+                "请先开展跨案标识比对，再补写疑似同一对象",
+            )
+
+        type_aliases = {
+            "PERSON": "NAME",
+            "NAME": "NAME",
+            "人": "NAME",
+            "人物": "NAME",
+            "BANK_ACCOUNT": "ACCOUNT",
+            "ACCOUNT": "ACCOUNT",
+            "账户": "ACCOUNT",
+            "银行卡": "ACCOUNT",
+            "PHONE": "PHONE",
+            "手机": "PHONE",
+            "手机号": "PHONE",
+            "ID_CARD": "ID_CARD",
+            "证件": "ID_CARD",
+            "身份证": "ID_CARD",
+            "DEVICE": "DEVICE",
+            "设备": "DEVICE",
+            "ORGANIZATION": "ORGANIZATION",
+            "组织": "ORGANIZATION",
+            "公司": "ORGANIZATION",
+            "企业": "ORGANIZATION",
+            "MERCHANT": "MERCHANT",
+            "商户": "MERCHANT",
+            "IP": "IP",
+        }
+        raw_type = str(candidate.get("entity_type") or candidate.get("object_type") or "PERSON").strip()
+        object_type = type_aliases.get(raw_type, type_aliases.get(raw_type.upper(), "NAME"))
+        display_name = str(candidate.get("display_name") or candidate.get("question") or "").strip()[:80]
+        if not display_name:
+            raise TaskError(TASK_ERROR_CODES["INVALID_SCOPE"], "待核对象须写清显示名称或待核问题")
+        question = str(candidate.get("question") or f"请核验：{display_name}是否指向同一对象？").strip()[:120]
+        aliases = []
+        for item in candidate.get("aliases") or []:
+            text = str(item or "").strip()
+            if object_type == "NAME" and text:
+                ns, ne = _clamp_person_span(text, 0, len(text))
+                text = text[ns:ne] if ne > ns else text
+            text = text.strip()[:24]
+            if text and text not in aliases:
+                aliases.append(text)
+            if len(aliases) >= 8:
+                break
+
+        case_by_id = {c["case_id"]: c for c in (task.get("cases") or [])}
+        case_by_name = {
+            str(c.get("display_name") or c.get("name") or "").strip(): c
+            for c in (task.get("cases") or [])
+            if str(c.get("display_name") or c.get("name") or "").strip()
+        }
+
+        records: list[dict[str, Any]] = []
+        for ev in candidate.get("records") or candidate.get("evidence") or []:
+            if not isinstance(ev, dict):
+                continue
+            chunk_id = str(ev.get("chunk_id") or "").strip()
+            version_id = str(ev.get("document_version_id") or "").strip()
+            quote = str(ev.get("quote") or "").strip()
+            if not chunk_id or not version_id or not quote:
+                raise TaskError(
+                    TASK_ERROR_CODES["INVALID_SCOPE"],
+                    "每条支持材料须含原文摘录及材料定位，请从查阅材料的返回中逐字抄写",
+                )
+            try:
+                canon = canonicalize_evidence_citation(
+                    document_version_id=version_id,
+                    chunk_id=chunk_id,
+                    quote=quote,
+                    anchor_terms=[ev.get("surface") or ev.get("value") or display_name],
+                    db_path=self.db_path,
+                    max_len=40,
+                )
+            except ValueError as exc:
+                raise TaskError(
+                    TASK_ERROR_CODES["INVALID_SCOPE"],
+                    f"支持材料无法回链原文：{exc}",
+                ) from exc
+            case_row = None
+            cid = str(ev.get("case_id") or "").strip()
+            cname = str(ev.get("case_name") or "").strip()
+            if cid and cid in case_by_id:
+                case_row = case_by_id[cid]
+            elif cname and cname in case_by_name:
+                case_row = case_by_name[cname]
+            else:
+                for name, row in case_by_name.items():
+                    if cname and (cname in name or name in cname):
+                        case_row = row
+                        break
+            if not case_row:
+                raise TaskError(
+                    TASK_ERROR_CODES["INVALID_SCOPE"],
+                    "支持材料须标明所属案件（用案件显示名）",
+                )
+            surface = str(ev.get("surface") or ev.get("value") or "").strip()[:40]
+            records.append(
+                {
+                    "case_id": case_row["case_id"],
+                    "case_name": case_row.get("display_name") or case_row["case_id"],
+                    "chunk_id": chunk_id,
+                    "document_version_id": version_id,
+                    "filename": ev.get("filename") or "",
+                    "page_start": ev.get("page_start") or canon.get("page_start"),
+                    "page_end": ev.get("page_end") or canon.get("page_end"),
+                    "quote": canon.get("quote") or quote,
+                    "quote_hash": canon.get("quote_hash") or _quote_hash(canon.get("quote") or quote),
+                    "value": surface or display_name,
+                    "surface": surface or display_name,
+                }
+            )
+        if len(records) < 2:
+            raise TaskError(
+                TASK_ERROR_CODES["INVALID_SCOPE"],
+                "疑似同一对象至少需要两条可回原文的支持材料",
+            )
+
+        case_ids = sorted({r["case_id"] for r in records})
+        cases = [
+            {"case_id": cid, "case_name": case_by_id.get(cid, {}).get("display_name") or cid}
+            for cid in case_ids
+        ]
+        value_key = "|".join(sorted(aliases or [display_name]))
+        fingerprint = str(candidate.get("fingerprint") or "").strip() or candidate_fingerprint(
+            f"MODEL_{object_type}", value_key, case_ids or ["task"]
+        )
+
+        detail = self.get_artifact(task_id, current["id"])
+        payload = dict(detail.get("payload") or {})
+        candidates = list(payload.get("candidates") or [])
+        replaced = False
+        index = len(candidates)
+        candidate_id = new_id()
+        for pos, item in enumerate(candidates):
+            same = str(item.get("fingerprint") or "") == fingerprint or str(
+                item.get("candidate_id") or ""
+            ) == str(candidate.get("candidate_id") or "")
+            if not same:
+                continue
+            decision = str(item.get("decision") or "PENDING")
+            if decision not in {"", "PENDING", "DEFER"}:
+                raise TaskError(
+                    TASK_ERROR_CODES["STATE_CONFLICT"],
+                    "该对象已由人工核验，不能覆盖；请提示用户到实体复核修改",
+                )
+            index = pos
+            candidate_id = item.get("candidate_id") or new_id()
+            replaced = True
+            break
+
+        if not replaced and object_type == "NAME":
+            new_keys = _person_keys_from_candidate(
+                {"object_type": "NAME", "aliases": aliases, "display_name": display_name}
+            )
+            if new_keys:
+                for pos, item in enumerate(candidates):
+                    decision = str(item.get("decision") or "PENDING")
+                    if decision not in {"", "PENDING", "DEFER"}:
+                        continue
+                    old_keys = _person_keys_from_candidate(item)
+                    if not (new_keys & old_keys):
+                        continue
+                    index = pos
+                    candidate_id = item.get("candidate_id") or new_id()
+                    fingerprint = item.get("fingerprint") or fingerprint
+                    for alias in item.get("aliases") or []:
+                        text = str(alias or "").strip()
+                        if text and text not in aliases:
+                            aliases.append(text)
+                    seen_qh = {r.get("quote_hash") for r in records if r.get("quote_hash")}
+                    for rec in item.get("records") or item.get("evidence") or []:
+                        if not isinstance(rec, dict):
+                            continue
+                        qh = rec.get("quote_hash")
+                        if qh and qh in seen_qh:
+                            continue
+                        records.append(rec)
+                        if qh:
+                            seen_qh.add(qh)
+                    old_name = str(item.get("display_name") or "").strip()
+                    if old_name and len(old_name) > len(display_name):
+                        display_name = old_name[:80]
+                    old_q = str(item.get("question") or "").strip()
+                    if old_q and len(old_q) > len(question):
+                        question = old_q[:120]
+                    replaced = True
+                    break
+            case_ids = sorted({r["case_id"] for r in records if r.get("case_id")})
+            cases = [
+                {"case_id": cid, "case_name": case_by_id.get(cid, {}).get("display_name") or cid}
+                for cid in case_ids
+            ]
+
+        public_type = {
+            "NAME": "PERSON",
+            "ACCOUNT": "BANK_ACCOUNT",
+        }.get(object_type, object_type)
+        built = {
+            "candidate_id": candidate_id,
+            "fingerprint": fingerprint,
+            "entity_type": public_type,
+            "object_type": object_type,
+            "display_name": display_name,
+            "recall_method": "模型根据材料提出的疑似同一",
+            "recalled_at": utc_now(),
+            "confidence_label": "疑似·待核验",
+            "match_basis": [
+                str(x).strip()
+                for x in (candidate.get("match_basis") or [])
+                if str(x).strip()
+            ][:8]
+            or ["根据材料记载提出，是否同一对象由人工决定"],
+            "match_tier": "SUSPECTED",
+            "aliases": aliases,
+            "differences": [str(x).strip() for x in (candidate.get("differences") or []) if str(x).strip()][:6],
+            "records": records,
+            "cases": cases,
+            "field_compare": candidate.get("field_compare") or [],
+            "evidence": records,
+            "supporting_facts": [str(x).strip() for x in (candidate.get("supporting_facts") or []) if str(x).strip()][:8],
+            "conflicts": [str(x).strip() for x in (candidate.get("conflicts") or []) if str(x).strip()][:8],
+            "missing_fields": [],
+            "impact": {},
+            "agent_summary": str(candidate.get("agent_summary") or "").strip()[:150],
+            "recommendation": "DEFER",
+            "generated_clues": [],
+            "question": question,
+            "decision": "PENDING",
+            "reason": "",
+            "correction": None,
+            "producer": "DEEPSEEK_ENTITY",
+            "source": "model",
+            "linked_identifier_ids": [
+                str(x).strip()
+                for x in (candidate.get("linked_identifier_ids") or [])
+                if str(x).strip()
+            ][:8],
+            "_allow_single_case": len(case_ids) < 2,
+        }
+        if replaced:
+            candidates[index] = built
+        else:
+            candidates.append(built)
+
+        pending = sum(
+            1
+            for item in candidates
+            if str(item.get("decision") or "PENDING") in {"PENDING", "DEFER", ""}
+        )
+        analysis_gate = "ENTITY_REVIEW" if pending else ""
+        batch = self.find_artifact(task_id, "MATERIAL_BATCH", "batch")
+        artifact = self.write_artifact(
+            task_id=task_id,
+            type="ENTITY_CANDIDATE_SET",
+            title="跨案对象待核·待判断" if pending else "跨案对象待核·已完成",
+            ref_key="entity-candidates",
+            status="PENDING_REVIEW" if pending else "VALID",
+            parent_ids=[batch["id"]] if batch else json.loads(current.get("parent_ids_json") or "[]"),
+            payload={
+                **payload,
+                "summary": {
+                    **(payload.get("summary") or {}),
+                    "total": len(candidates),
+                    "pending": pending,
+                    "reviewed": len(candidates) - pending,
+                    "analysis_gate": analysis_gate,
+                },
+                "candidates": candidates,
+                "analysis_gate": analysis_gate,
+                "boundary": payload.get("boundary")
+                or "强标识等值与材料分析提出的疑似同一均为待核验候选。系统不自动合并。",
+            },
+            input_snapshot={"action": "put_entity_candidate", "user_id": user_id or "system"},
+        )
+        return {
+            "artifact": artifact,
+            "candidate_id": candidate_id,
+            "replaced": replaced,
+            "pending": pending,
+            "task": self.get_task(task_id),
+        }
+
     def review_entity_candidate(
         self,
         task_id: str,
@@ -1235,13 +1612,16 @@ class TaskService:
         if decision != "MERGE":
             self._demote_clues_for_candidate(task_id, found, actions)
         if decision == "MERGE":
-            # 将关联草稿线索升格为 VALID
+            # 仅把「已写明本张对象卡」的标识草稿改为 VALID，供流水线跟进。
+            # 这不是线索中心的确认关联：其它称呼、其它核验问题仍待人工处置。
             for art in self.get_task(task_id).get("artifacts") or []:
                 if art.get("type") != "CLUE_ITEM" or art.get("status") not in {"DRAFT", "VALID"}:
                     continue
                 clue_detail = self.get_artifact(task_id, art["id"])
                 payload = dict(clue_detail.get("payload") or {})
-                if not self.clue_matches_candidate(payload, found):
+                if not self.clue_matches_candidate(payload, found, strict=True):
+                    continue
+                if not clue_entity_merge_may_follow(payload):
                     continue
                 payload["promotion"] = "confirmed"
                 linked = list(payload.get("linked_candidate_ids") or [])
@@ -1577,7 +1957,14 @@ class TaskService:
                 "at": utc_now(),
             },
         )
-        return {"artifact": artifact, "task": self.get_task(task_id)}
+        self._rebuild_clue_set(task_id)
+        stats = self.clue_review_stats(task_id)
+        return {
+            "artifact": artifact,
+            "task": self.get_task(task_id),
+            "pending": stats["pending"],
+            "analysis_gate": stats["analysis_gate"],
+        }
 
     def append_source_verify(self, task_id: str, event: dict[str, Any]) -> dict[str, Any]:
         """追加核验留痕事件到 SOURCE_VERIFY 产物。"""
@@ -1629,7 +2016,7 @@ class TaskService:
         )
 
     def _report_state_blocked(self, state: dict[str, Any]) -> str | None:
-        """严格门禁：实体复核未完成或尚无存活线索时，返回阻止报告写作的原因。"""
+        """严格门禁：实体未完成、无线索、或线索尚未在线索中心处置完时，阻止写报告。"""
         if state["entity_payload"] and self._report_entity_pending(state["entity_payload"]) > 0:
             return (
                 "跨案对象仍有待人工确认。请先在中间工作区完成「视为同一 / 保留独立」"
@@ -1637,6 +2024,12 @@ class TaskService:
             )
         if not state["clues"]:
             return "当前尚无待核线索。请先在右侧对话中整理出疑似关联线索、写入线索中心，再撰写报告。"
+        pending = sum(1 for _art, payload in state["clues"] if clue_awaiting_review(payload))
+        if pending > 0:
+            return (
+                f"线索中心仍有 {pending} 条待核验。"
+                "请先到中间工作区对每条作出确认关联、排除或待补证，全部处置后再撰写报告。"
+            )
         return None
 
     def _report_state(self, task_id: str) -> dict[str, Any]:
@@ -1843,6 +2236,28 @@ class TaskService:
         return lines
 
     @staticmethod
+    def _report_nav_and_pending_lines(clue_packs: list[dict[str, Any]]) -> list[str]:
+        pending = 0
+        for pack in clue_packs:
+            label = str(pack.get("disposition") or "")
+            if "待确认" in label or label in {"待核", "暂缓"}:
+                pending += 1
+            elif not pack.get("disposition") or pack.get("disposition") == "待确认":
+                pending += 1
+        lines = [
+            "### 看法页导航（非新事实）",
+            "- 已确认跨案对象的连线见「链条图谱」实线；保留独立的人不连人桥，已确认的卡/设备仍可能连两案。",
+            "- 事件先后见「角色时间线」。人尚未视为同一或已保留独立时，可按账户查看资金记载。",
+            "### 线索核验进度",
+            (
+                f"- 尚有 {pending} 条线索未在线索中心处置。"
+                if pending
+                else "- 清单内线索均已有处置记录（含确认关联、排除或待补材料）。"
+            ),
+        ]
+        return lines
+
+    @staticmethod
     def _report_clue_checklist_lines(packs: list[dict[str, Any]]) -> list[str]:
         lines = ["### 待核验线索"]
         if not packs:
@@ -1969,6 +2384,8 @@ class TaskService:
                 *self._report_entity_checklist_lines(entity),
                 "",
                 *self._report_clue_checklist_lines(clue_packs),
+                "",
+                *self._report_nav_and_pending_lines(clue_packs),
                 "",
                 "### 材料路径合成（由多张处置为「已确认关联」的线索排列，非法律结论）",
                 *(path_lines or ["- 尚无两条以上可合成路径的已确认线索。"]),
@@ -2182,6 +2599,7 @@ class TaskService:
                             "generated_at": payload.get("generated_at") or ver.get("created_at") or "",
                             "generated_by": payload.get("generated_by") or "智能体",
                             "download_count": dl,
+                            "markdown": payload.get("markdown") or payload.get("text") or "",
                         }
                     )
         editions.sort(key=lambda item: str(item.get("generated_at") or ""), reverse=True)
@@ -2873,8 +3291,8 @@ class TaskService:
             "within_case_consistency": consistency,
             "message": (
                 "以上含跨案标识、外号/代称与弱平台共现提示。"
-                "外号上线、外号与代称是否同指，应单独写成待核线索；"
-                "仅某一案出现的共同参与人可写一条核验「勿挂到其他案」。"
+                "外号、不同称呼共用证卡号、商户名、证件人像应先写入实体待核（疑似同一）；"
+                "资金路径、时空、同物不同名义再写入线索。"
                 "案內多卡同号请在实体复核或材料核对中处理，不要写成跨案关联。"
             ),
         }
@@ -3096,6 +3514,8 @@ class TaskService:
         prepared: list[dict[str, Any]] = []
 
         entity_set = self.find_artifact(task_id, "ENTITY_CANDIDATE_SET", "entity-candidates")
+        # 实体集 VALID 只表示对象卡片已全部判断，不等于关联假设已确认。
+        # 实体复核完成后线索进入线索中心可核验（VALID），仍待人工处置。
         clue_status = (
             "VALID"
             if entity_set and entity_set.get("status") == "VALID"
@@ -3183,7 +3603,7 @@ class TaskService:
                     "boundary": uncertainty,
                     "producer": "AI_AGENT",
                     "rule_id": match_basis,
-                    "promotion": "confirmed" if clue_status == "VALID" else "draft_pending_entity_review",
+                    "promotion": "draft_pending_entity_review",
                     "linked_candidate_ids": list(clue.get("linked_candidate_ids") or []),
                     "fingerprint": clue.get("fingerprint") or "",
                     "fingerprints": list(clue.get("fingerprints") or []),
@@ -3252,11 +3672,14 @@ class TaskService:
                 pass
 
         artifact = self._rebuild_clue_set(task_id)
+        stats = self.clue_review_stats(task_id)
 
         return {
             "artifact": artifact,
             "clue_count": len(item_ids),
             "retired_count": retired,
+            "pending": stats["pending"],
+            "analysis_gate": stats["analysis_gate"],
             "task": self.get_task(task_id),
         }
 
@@ -3284,6 +3707,16 @@ class TaskService:
                 payload = json.loads(ver["payload_json"]) if ver and ver.get("payload_json") else {}
                 rows.append((dict(art), payload))
         return rows
+
+    def clue_review_stats(self, task_id: str) -> dict[str, Any]:
+        """存活线索中尚未在线索中心处置的条数。"""
+        active = self._active_clue_items(task_id)
+        pending = sum(1 for _art, payload in active if clue_awaiting_review(payload))
+        return {
+            "clue_count": len(active),
+            "pending": pending,
+            "analysis_gate": "CLUE_REVIEW" if pending > 0 else "",
+        }
 
     @staticmethod
     def _clue_dedup_key(payload: dict[str, Any]) -> str:
@@ -3344,10 +3777,13 @@ class TaskService:
         active = self._active_clue_items(task_id)
         items: list[dict[str, Any]] = []
         aspects: set[str] = set()
+        pending = 0
         batch = self.find_artifact(task_id, "MATERIAL_BATCH", "batch")
         entity_set = self.find_artifact(task_id, "ENTITY_CANDIDATE_SET", "entity-candidates")
         status = "VALID" if entity_set and entity_set.get("status") == "VALID" else "DRAFT"
         for art, payload in active:
+            if clue_awaiting_review(payload):
+                pending += 1
             aspect = str(payload.get("aspect") or "").upper()
             aspects.add(aspect)
             evidence = payload.get("evidence") or []
@@ -3377,9 +3813,12 @@ class TaskService:
             payload={
                 "summary": {
                     "total": len(items),
+                    "pending": pending,
+                    "analysis_gate": "CLUE_REVIEW" if pending > 0 else "",
                     "producer": "AI_AGENT",
                     "aspects": sorted(a for a in aspects if a in CLUE_ASPECTS),
                 },
+                "analysis_gate": "CLUE_REVIEW" if pending > 0 else "",
                 "items": items,
                 "boundary": "AI 生成的待核验关联线索，不代表系统已认定为同一实体或共同犯罪。",
             },
@@ -3420,19 +3859,22 @@ class TaskService:
             )
         self._mark_artifact_stale(task_id, art["id"], reason="由智能体删除")
         self._rebuild_clue_set(task_id)
+        stats = self.clue_review_stats(task_id)
         return {
             "ok": True,
             "removed_artifact_id": art["id"],
             "removed_title": payload.get("title") or art.get("title") or "",
             "remaining": len(active) - 1,
+            "pending": stats["pending"],
+            "analysis_gate": stats["analysis_gate"],
             "message": f"已删除线索：{payload.get('title') or art.get('title') or ''}",
         }
 
     def list_clue_items_for_model(self, task_id: str) -> dict[str, Any]:
         """给模型看的存活线索快照（精简，序号供 delete/覆盖引用）。
 
-        state/confirmed 已合并「人工处置」与「实体复核升格」，模型据此判断线索
-        是否已确认；confirmed=true 的线索不得覆盖或删除。
+        state/confirmed 只看线索中心人工处置；实体判断不把线索标成已确认。
+        confirmed=true 的线索不得覆盖或删除。
         """
         active = self._active_clue_items(task_id)
         clues: list[dict[str, Any]] = []
@@ -3449,7 +3891,7 @@ class TaskService:
                     "confirmed": clue_is_confirmed(payload),
                 }
             )
-        return {"ok": True, "clue_count": len(clues), "clues": clues}
+        return {"ok": True, "clue_count": len(clues), "clues": clues, **self.clue_review_stats(task_id)}
 
     def generate_clues(
         self,
@@ -3517,6 +3959,23 @@ class TaskService:
             else:
                 candidates.append(item)
             seen.add(fingerprint)
+        prev_ver = str((previous.get("summary") or {}).get("extractor_version") or "")
+        keep_stale_model_names = prev_ver == EXTRACTOR_VERSION
+        for item in previous.get("candidates") or []:
+            producer = str(item.get("producer") or "")
+            source = str(item.get("source") or "")
+            if producer != "DEEPSEEK_ENTITY" and source != "model":
+                continue
+            ot = str(item.get("object_type") or item.get("entity_type") or "").upper()
+            if not keep_stale_model_names and ot in {"NAME", "PERSON"}:
+                decision = str(item.get("decision") or "PENDING")
+                if decision in {"", "PENDING", "DEFER"}:
+                    continue
+            fingerprint = item.get("fingerprint")
+            if not fingerprint or fingerprint in seen:
+                continue
+            candidates.append(item)
+            seen.add(fingerprint)
         pending = sum(1 for item in candidates if item.get("decision") == "PENDING")
         batch = self.find_artifact(task_id, "MATERIAL_BATCH", "batch")
         analysis_gate = "ENTITY_REVIEW" if pending else ""
@@ -3542,7 +4001,7 @@ class TaskService:
                 "candidates": candidates,
                 "subject_resolve": previous.get("subject_resolve")
                 or {"subjects": {}, "surface_index": {}, "keep_separate": []},
-                "boundary": "强标识等值与疑似化名均为待核验候选。系统不自动合并，是否同一对象由人工决定。",
+                "boundary": "强标识等值与材料分析提出的疑似同一均为待核验候选。系统不自动合并，是否同一对象由人工决定。",
                 "analysis_gate": analysis_gate,
             },
             input_snapshot={
@@ -3833,6 +4292,7 @@ class TaskService:
                 uploaded_at = item.get("created_at") or ""
                 if uploaded_at:
                     uploaded_at = str(uploaded_at).replace("T", " ")[:16]
+                unlayered_pages = _quality_unlayered_pages(quality)
                 rows.append(
                     {
                         "document_id": item.get("id"),
@@ -3840,9 +4300,11 @@ class TaskService:
                         "size": item.get("size"),
                         "content_type": item.get("content_type"),
                         "status": status,
-                        "stage_label": MATERIAL_STAGE_LABELS.get(status, status),
+                        "stage_label": material_stage_label(status, quality),
+                        "stage_hint": material_stage_hint(status, quality),
                         "page_count": quality.get("page_count"),
                         "low_confidence_pages": low_pages,
+                        "unlayered_pages": unlayered_pages,
                         "version_count": item.get("version_count"),
                         "version": version_no,
                         "parser_version": current.get("parser_version") or "",
@@ -4016,6 +4478,40 @@ class TaskService:
                     },
                 )
 
+    def _nav_pending_counts(self, task_id: str) -> dict[str, int]:
+        """左栏角标：各业务页待确认条数。"""
+        entities = 0
+        entity = self.find_artifact(task_id, "ENTITY_CANDIDATE_SET", "entity-candidates")
+        if entity and entity.get("status") not in {"STALE", "INVALID"}:
+            payload = self._read_artifact_payload_raw(task_id, entity["id"])[1] or {}
+            candidates = payload.get("candidates") or []
+            if candidates:
+                entities = sum(
+                    1
+                    for item in candidates
+                    if str(item.get("decision") or "PENDING").upper() in {"", "PENDING", "DEFER"}
+                )
+            else:
+                entities = int((payload.get("summary") or {}).get("pending") or 0)
+
+        leads = int(self.clue_review_stats(task_id).get("pending") or 0)
+
+        materials = 0
+        batch = self.find_artifact(task_id, "MATERIAL_BATCH", "batch")
+        if batch and batch.get("status") not in {"STALE", "INVALID"}:
+            payload = self._read_artifact_payload_raw(task_id, batch["id"])[1] or {}
+            materials = int((payload.get("totals") or {}).get("attention") or 0)
+            for group in payload.get("groups") or []:
+                for row in group.get("materials") or []:
+                    if str(row.get("status") or "") == "DUPLICATE_PENDING":
+                        materials += 1
+
+        return {
+            "entities": entities,
+            "leads": leads,
+            "materials": materials,
+        }
+
     def _build_directory(
         self,
         artifacts: list[dict[str, Any]],
@@ -4061,6 +4557,50 @@ MATERIAL_STAGE_LABELS = {
     "FAILED": "解析失败",
     "DELETED": "已删除",
 }
+MATERIAL_MIXED_IMAGE_LABEL = "文字可分析，含图像页"
+
+
+def _quality_unlayered_pages(quality: dict | None) -> list[int]:
+    quality = quality or {}
+    raw = quality.get("unlayered_pages")
+    if raw:
+        try:
+            return sorted({int(n) for n in raw})
+        except (TypeError, ValueError):
+            pass
+    statuses = quality.get("page_statuses") or {}
+    found: list[int] = []
+    for page_no, status in statuses.items():
+        if str(status) in {"OCR_FAILED", "FAILED"}:
+            try:
+                found.append(int(page_no))
+            except (TypeError, ValueError):
+                continue
+    return sorted(set(found))
+
+
+def _quality_has_text(quality: dict | None) -> bool:
+    quality = quality or {}
+    if "has_extractable_text" in quality:
+        return bool(quality.get("has_extractable_text"))
+    statuses = quality.get("page_statuses") or {}
+    return any(str(status) == "PARSED" for status in statuses.values())
+
+
+def material_stage_label(status: str, quality: dict | None = None) -> str:
+    quality = quality or {}
+    if status == "PARSED" and _quality_has_text(quality) and _quality_unlayered_pages(quality):
+        return MATERIAL_MIXED_IMAGE_LABEL
+    return MATERIAL_STAGE_LABELS.get(status, status)
+
+
+def material_stage_hint(status: str, quality: dict | None = None) -> str:
+    quality = quality or {}
+    pages = _quality_unlayered_pages(quality)
+    if status == "PARSED" and _quality_has_text(quality) and pages:
+        nums = "、".join(str(n) for n in pages)
+        return f"已抽出文字可纳入分析；第 {nums} 页无文字层（图像或空白），画面不参与抽取"
+    return ""
 
 
 _task_service: TaskService | None = None

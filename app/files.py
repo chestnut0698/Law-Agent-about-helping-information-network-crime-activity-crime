@@ -731,12 +731,13 @@ class GlobalEntityMapper:
                 conn.close()
 
     def _allocate_alias(self, conn, original: str, sens_type: str) -> str:
-        """在同一敏感类型内分配不冲突的可读化名。"""
+        """在同一敏感类型内分配不冲突的可读化名；只避开仍被脱敏项引用的化名。"""
         taken = {
             row[0]
             for row in conn.execute(
-                "SELECT display_alias FROM entity_global_map "
-                "WHERE display_alias != '' AND sens_type = ?",
+                "SELECT m.display_alias FROM entity_global_map m "
+                "WHERE m.display_alias != '' AND m.sens_type = ? "
+                "AND EXISTS (SELECT 1 FROM redaction_items ri WHERE ri.map_ref = m.fingerprint)",
                 (sens_type,),
             ).fetchall()
         }
@@ -849,6 +850,8 @@ class GlobalEntityMapper:
             limit: int = 100,
             offset: int = 0
     ) -> dict[str, Any]:
+        if task_id:
+            self.repair_truncated_person_spans(task_id=task_id)
         conn = get_connection(self.db_path)
         try:
             params: list[Any] = []
@@ -862,9 +865,25 @@ class GlobalEntityMapper:
                     WHERE dv.document_id = ?
                 """
                 params.append(document_id)
-                if task_id:
-                    query += " AND m.task_id = ?"
-                    params.append(task_id)
+                if sens_type:
+                    query += " AND m.sens_type = ?"
+                    params.append(sens_type)
+                if anonymous_id:
+                    query += " AND m.anonymous_id = ?"
+                    params.append(anonymous_id)
+                order_col = "m.last_seen_at"
+            elif task_id:
+                query = """
+                    SELECT DISTINCT m.fingerprint, m.anonymous_id, m.display_alias, m.sens_type,
+                           m.task_id, m.first_seen_at, m.last_seen_at
+                    FROM entity_global_map m
+                    JOIN redaction_items ri ON ri.map_ref = m.fingerprint
+                    JOIN document_versions dv ON dv.id = ri.document_version_id
+                    JOIN documents d ON d.id = dv.document_id
+                    JOIN task_cases tc ON tc.case_id = d.case_id
+                    WHERE tc.task_id = ?
+                """
+                params.append(task_id)
                 if sens_type:
                     query += " AND m.sens_type = ?"
                     params.append(sens_type)
@@ -1011,13 +1030,16 @@ class GlobalEntityMapper:
                 conn.close()
 
     def repair_truncated_person_spans(self, *, task_id: str | None = None) -> dict[str, Any]:
-        """修复已落库的残缺人名脱敏跨度（姓+欠切），并重建受影响 chunk 的脱敏文。
+        """按当前人名边界修正已落库脱敏跨度（欠切补全、误扩裁短、物品误标删除），并重建受影响 chunk。
 
-        只延长 PERSON/NAME 跨度；与其它脱敏项重叠则跳过。不特化具体人名。
+        只改 PERSON/NAME；变宽时与其它脱敏项重叠则跳过。不特化具体人名。
         """
-        from tools.entities import _extend_person_span
+        from tools.entities import _extend_person_span, _person_surface_ok, load_exclusions
 
+        exclusions = load_exclusions()
         grown = 0
+        dropped = 0
+        alias_fixed = 0
         skipped_overlap = 0
         chunks_rebuilt = 0
         with db_session(self.db_path) as conn:
@@ -1048,36 +1070,43 @@ class GlobalEntityMapper:
                     """
                 ).fetchall()
 
-            # chunk_id -> list of planned updates {item_id, start, end, map_ref, placeholder, sens_type}
             plans: dict[str, list[dict[str, Any]]] = {}
+            dropped_ids: set[str] = set()
+            affected_chunks: set[str] = set()
             for row in rows:
                 text = row["text_raw"] or ""
                 s, e = int(row["start_offset"]), int(row["end_offset"])
                 if not text or not (0 <= s < e <= len(text)):
                     continue
                 ns, ne = _extend_person_span(text, s, e)
+                new_orig = text[ns:ne] if ne > ns else ""
+                if ne - ns < 2 or not _person_surface_ok(new_orig, exclusions):
+                    dropped_ids.add(row["item_id"])
+                    affected_chunks.add(row["chunk_id"])
+                    dropped += 1
+                    continue
                 if ns == s and ne == e:
                     continue
-                # 仅接受真正变长
-                if (ne - ns) <= (e - s):
-                    continue
-                others = conn.execute(
-                    """
-                    SELECT id, start_offset, end_offset FROM redaction_items
-                    WHERE chunk_id = ? AND id != ?
-                    """,
-                    (row["chunk_id"], row["item_id"]),
-                ).fetchall()
-                overlap = False
-                for oth in others:
-                    os, oe = int(oth["start_offset"]), int(oth["end_offset"])
-                    if ns < oe and ne > os:
-                        overlap = True
-                        break
-                if overlap:
-                    skipped_overlap += 1
-                    continue
-                new_orig = text[ns:ne]
+                shrinking = (ne - ns) < (e - s)
+                if not shrinking:
+                    others = conn.execute(
+                        """
+                        SELECT id, start_offset, end_offset FROM redaction_items
+                        WHERE chunk_id = ? AND id != ?
+                        """,
+                        (row["chunk_id"], row["item_id"]),
+                    ).fetchall()
+                    overlap = False
+                    for oth in others:
+                        if oth["id"] in dropped_ids:
+                            continue
+                        os, oe = int(oth["start_offset"]), int(oth["end_offset"])
+                        if ns < oe and ne > os:
+                            overlap = True
+                            break
+                    if overlap:
+                        skipped_overlap += 1
+                        continue
                 fp = self._fingerprint(new_orig)
                 existing = conn.execute(
                     "SELECT anonymous_id, sens_type FROM entity_global_map WHERE fingerprint = ?",
@@ -1114,9 +1143,10 @@ class GlobalEntityMapper:
                         "document_version_id": row["document_version_id"],
                     }
                 )
+                affected_chunks.add(row["chunk_id"])
                 grown += 1
 
-            for chunk_id, updates in plans.items():
+            for chunk_id in affected_chunks:
                 chunk = conn.execute(
                     "SELECT text_raw, document_version_id FROM document_chunks WHERE id = ?",
                     (chunk_id,),
@@ -1124,7 +1154,7 @@ class GlobalEntityMapper:
                 if not chunk:
                     continue
                 text_raw = chunk["text_raw"] or ""
-                by_id = {u["item_id"]: u for u in updates}
+                by_id = {u["item_id"]: u for u in plans.get(chunk_id, [])}
                 items = conn.execute(
                     """
                     SELECT id, start_offset, end_offset, placeholder, map_ref, sens_type, document_version_id
@@ -1137,6 +1167,8 @@ class GlobalEntityMapper:
                 new_rows = []
                 for item in items:
                     iid = item["id"]
+                    if iid in dropped_ids:
+                        continue
                     if iid in by_id:
                         u = by_id[iid]
                         start, end = u["start"], u["end"]
@@ -1180,8 +1212,92 @@ class GlobalEntityMapper:
                     )
                 chunks_rebuilt += 1
 
+            conn.execute(
+                """
+                DELETE FROM entity_global_map
+                WHERE fingerprint NOT IN (
+                    SELECT DISTINCT map_ref FROM redaction_items
+                    WHERE map_ref IS NOT NULL AND map_ref != ''
+                )
+                """
+            )
+
+            if task_id:
+                alias_rows = conn.execute(
+                    """
+                    SELECT m.fingerprint, m.display_alias, m.sens_type, m.first_seen_at,
+                           ri.chunk_id, ri.start_offset, ri.end_offset
+                    FROM entity_global_map m
+                    JOIN redaction_items ri ON ri.map_ref = m.fingerprint
+                    JOIN document_versions dv ON dv.id = ri.document_version_id
+                    JOIN documents d ON d.id = dv.document_id
+                    JOIN task_cases tc ON tc.case_id = d.case_id
+                    WHERE tc.task_id = ? AND m.sens_type IN ('PERSON', 'NAME')
+                    ORDER BY m.first_seen_at ASC
+                    """,
+                    (task_id,),
+                ).fetchall()
+            else:
+                alias_rows = conn.execute(
+                    """
+                    SELECT m.fingerprint, m.display_alias, m.sens_type, m.first_seen_at,
+                           ri.chunk_id, ri.start_offset, ri.end_offset
+                    FROM entity_global_map m
+                    JOIN redaction_items ri ON ri.map_ref = m.fingerprint
+                    WHERE m.sens_type IN ('PERSON', 'NAME')
+                    ORDER BY m.first_seen_at ASC
+                    """
+                ).fetchall()
+            pending: list[tuple[str, str, str, str]] = []
+            seen_fp: set[str] = set()
+            for row in alias_rows:
+                fp = row["fingerprint"]
+                if fp in seen_fp:
+                    continue
+                seen_fp.add(fp)
+                chunk = conn.execute(
+                    "SELECT text_raw FROM document_chunks WHERE id = ?",
+                    (row["chunk_id"],),
+                ).fetchone()
+                if not chunk:
+                    continue
+                text = chunk["text_raw"] or ""
+                s, e = int(row["start_offset"]), int(row["end_offset"])
+                if not (0 <= s < e <= len(text)):
+                    continue
+                pending.append(
+                    (fp, text[s:e], row["sens_type"] or "PERSON", row["display_alias"] or "")
+                )
+            taken_by_type: dict[str, set[str]] = {}
+            for row in conn.execute(
+                """
+                SELECT fingerprint, display_alias, sens_type FROM entity_global_map
+                WHERE display_alias != '' AND sens_type IN ('PERSON', 'NAME')
+                  AND EXISTS (
+                      SELECT 1 FROM redaction_items ri WHERE ri.map_ref = entity_global_map.fingerprint
+                  )
+                """
+            ):
+                if row["fingerprint"] in seen_fp:
+                    continue
+                taken_by_type.setdefault(row["sens_type"], set()).add(row["display_alias"])
+            for fp, original, sens, current in pending:
+                taken = taken_by_type.setdefault(sens, set())
+                new_alias = make_alias(sens, original, taken)
+                if not new_alias:
+                    continue
+                taken.add(new_alias)
+                if new_alias != current:
+                    conn.execute(
+                        "UPDATE entity_global_map SET display_alias = ? WHERE fingerprint = ?",
+                        (new_alias, fp),
+                    )
+                    alias_fixed += 1
+
         return {
             "grown": grown,
+            "dropped": dropped,
+            "alias_fixed": alias_fixed,
             "skipped_overlap": skipped_overlap,
             "chunks_rebuilt": chunks_rebuilt,
         }
@@ -1526,7 +1642,6 @@ _COMPOUND_SURNAMES = (
 )
 _ORDINAL_MARKS = (
     "甲", "乙", "丙", "丁", "戊", "己", "庚", "辛", "壬", "癸",
-    "子", "丑", "寅", "卯", "辰", "巳", "午", "未", "申", "酉", "戌", "亥",
 )
 _CJK_NAME_RE = re.compile(r"^[\u4e00-\u9fff·]+$")
 _ALIAS_TYPE_LABELS = {
@@ -1549,6 +1664,19 @@ def _split_surname(name: str) -> tuple[str, str]:
     return cleaned[0], cleaned[1:]
 
 
+def _alias_core_surname(name: str) -> str:
+    """取化名用的姓：老/小+单姓按真姓；其余走复姓/单姓切分。"""
+    cleaned = (name or "").strip().replace("·", "")
+    if not cleaned:
+        return ""
+    from tools.entities import _COMMON_SURNAMES, _NICK_PREFIX
+
+    if len(cleaned) == 2 and cleaned[0] in _NICK_PREFIX and cleaned[1] in _COMMON_SURNAMES:
+        return cleaned[1]
+    surname, _ = _split_surname(cleaned)
+    return surname
+
+
 def _base_alias(name: str) -> str:
     cleaned = (name or "").strip()
     if not cleaned:
@@ -1556,7 +1684,7 @@ def _base_alias(name: str) -> str:
     if not _CJK_NAME_RE.match(cleaned):
         head = cleaned.split()[0] if cleaned.split() else cleaned
         return f"{head[:1].upper()}某"
-    surname, _ = _split_surname(cleaned)
+    surname = _alias_core_surname(cleaned)
     return f"{surname}某" if surname else ""
 
 
@@ -1661,11 +1789,50 @@ _LEGAL_HEADING_RE = re.compile(
 )
 
 
+def _is_pipe_table_row(line: str) -> bool:
+    text = (line or "").strip().replace("\uff5c", "|")
+    return text.startswith("|") and text.count("|") >= 2
+
+
+def _compact_pipe_tables(text: str) -> str:
+    """去掉管道表行之间的空行，便于预览渲成表格；不改单元格词句。"""
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    out: list[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        if _is_pipe_table_row(lines[i]):
+            block = [lines[i].strip()]
+            j = i + 1
+            while j < n:
+                if not lines[j].strip():
+                    k = j + 1
+                    while k < n and not lines[k].strip():
+                        k += 1
+                    if k < n and _is_pipe_table_row(lines[k]):
+                        j = k
+                        continue
+                    break
+                if _is_pipe_table_row(lines[j]):
+                    block.append(lines[j].strip())
+                    j += 1
+                    continue
+                break
+            out.extend(block)
+            out.append("")
+            i = j
+            continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
+
+
 def infer_structure_markdown(text: str) -> str:
     """对已落库平坦文本做轻量结构推断，不改动原文词句。"""
     if not text or not text.strip():
         return text or ""
-    if re.search(r"(?m)^#{1,3}\s+", text) or re.search(r"(?m)^\|.+\|", text):
+    text = _compact_pipe_tables(text)
+    if re.search(r"(?m)^#{1,3}\s+", text):
         return re.sub(r"\n{3,}", "\n\n", text).strip() + "\n"
     lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     out: list[str] = []
@@ -1756,8 +1923,7 @@ def merge_person_spans(text: str, person_results: list) -> list:
     if not person_results:
         return []
 
-    MERGE_SEPARATORS = set("，,、；;。.！!？?：:\"\"''（）()【】[]《》<>／/\\\t\n\r ")
-    MERGE_STOP_WORDS = {"的", "和", "与", "及", "或", "以及", "及其", "暨"}
+    NAME_GAP_OK = set("·•・\t ")
     VERB_PREFIXES = set("受被让给为由将把向对与同跟从在到予以用拿借凭靠沿顺朝往冲离除比")
     VERB_SUFFIXES = ["说", "道", "讲", "问", "答", "看", "带", "收", "买", "卖", "叫", "询", "领"]
     NICK_SUFFIXES = "哥姐叔总嫂爷"
@@ -1774,31 +1940,16 @@ def merge_person_spans(text: str, person_results: list) -> list:
         return any(text.startswith(tok, pos) for tok in LEGAL_RIGHT_TOKENS)
 
     def _clamp(start: int, end: int) -> tuple[int, int]:
-        if start < 0 or end <= start or end > len(text):
-            return start, end
-        for i in range(start, end):
-            if text[i] in INLINE_SEPS:
-                end = i
-                break
-        for tok in LEGAL_RIGHT_TOKENS:
-            for overlap in range(1, len(tok) + 1):
-                cut = end - overlap
-                if cut >= start and text.startswith(tok, cut):
-                    end = cut
-                    break
-        while end > start and text[end - 1] in INLINE_SEPS:
-            end -= 1
-        return start, end
+        from tools.entities import _clamp_person_span
+
+        return _clamp_person_span(text, start, end)
 
     merged = []
     current = person_results[0]
 
     for r in person_results[1:]:
         gap = text[current.end : r.start]
-        clean_gap = (gap == "") or (
-            not any(ch in MERGE_SEPARATORS for ch in gap) and
-            not any(w in gap for w in MERGE_STOP_WORDS)
-        )
+        clean_gap = (gap == "") or all(ch in NAME_GAP_OK for ch in gap)
         if clean_gap:
             second_first_char = text[r.start:r.start+1]
             if second_first_char in VERB_PREFIXES or _legal_at(r.start):
@@ -1906,12 +2057,15 @@ def redact_text(
     other_results = [r for r in results if r.entity_type != "PERSON"]
 
     # 与抽取链路统一：先补残缺人名跨度，再邻接合并，最后裁称呼后的动词
-    from tools.entities import _clamp_person_span, _extend_person_span
+    from tools.entities import _clamp_person_span, _extend_person_span, _person_surface_ok, load_exclusions
 
+    exclusions = load_exclusions()
     extended_persons = []
     for r in person_results:
         ns, ne = _extend_person_span(text, r.start, r.end)
-        if ne <= ns:
+        if ne - ns < 2:
+            continue
+        if not _person_surface_ok(text[ns:ne], exclusions):
             continue
         if ns == r.start and ne == r.end:
             extended_persons.append(r)
@@ -1927,6 +2081,8 @@ def redact_text(
     for r in person_results:
         ns, ne = _clamp_person_span(text, r.start, r.end)
         if ne - ns < 2:
+            continue
+        if not _person_surface_ok(text[ns:ne], exclusions):
             continue
         if ns == r.start and ne == r.end:
             clamped_persons.append(r)
@@ -2222,8 +2378,12 @@ def _vision_text_to_lines(raw: str) -> list[OCRLine]:
     if text.startswith("```"):
         text = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", text)
         text = re.sub(r"\n?```$", "", text).strip()
-    compact = text.replace(" ", "")
-    if not text or any(mark in compact for mark in VISION_OCR_EMPTY_MARKERS):
+    compact = re.sub(r"\s+", "", text)
+    empty_compacts = {re.sub(r"\s+", "", mark) for mark in VISION_OCR_EMPTY_MARKERS}
+    # 整段就是「无文字」才算空白页；正文里偶尔出现这几个字时不得整页作废
+    if compact in empty_compacts:
+        return [OCRLine("", 1.0, [0, 0, 1, 1])]
+    if not text:
         return [OCRLine("", 0.2, [0, 0, 1, 1])]
     lines = [part.strip() for part in re.split(r"\r?\n+", text) if part.strip()]
     if not lines:
@@ -2269,10 +2429,15 @@ def _pack_ocr_result(lines: list[OCRLine], engine: OCREngine | None) -> dict[str
     kind = getattr(engine, "kind", "") if engine is not None else ""
     if kind == "vision":
         flags.append("VISION_OCR")
-    if minimum < OCR_LOW_CONFIDENCE_THRESHOLD or average < OCR_LOW_CONFIDENCE_THRESHOLD:
+    joined = "".join(texts).strip()
+    if not joined:
+        if minimum >= OCR_LOW_CONFIDENCE_THRESHOLD:
+            flags.append("EMPTY_PAGE")
+        else:
+            flags.append("EMPTY_OCR")
+            flags.append("LOW_OCR_CONFIDENCE")
+    elif minimum < OCR_LOW_CONFIDENCE_THRESHOLD or average < OCR_LOW_CONFIDENCE_THRESHOLD:
         flags.append("LOW_OCR_CONFIDENCE")
-    if not "".join(texts).strip():
-        flags.append("EMPTY_OCR")
     return {
         "text": "\n".join(texts),
         "lines": [
@@ -2417,14 +2582,16 @@ def _extract_docx(path: Path) -> list[PageResult]:
                 rows_data.append(cells)
         if rows_data:
             header = rows_data[0]
-            parts.append("\n| " + " | ".join(header) + " |")
-            parts.append("| " + " | ".join(["---"] * len(header)) + " |")
+            table_lines = [
+                "| " + " | ".join(header) + " |",
+                "| " + " | ".join(["---"] * len(header)) + " |",
+            ]
             for r in rows_data[1:]:
                 # 补齐列数
                 if len(r) < len(header):
                     r = r + [""] * (len(header) - len(r))
-                parts.append("| " + " | ".join(r[:len(header)]) + " |")
-            parts.append("")
+                table_lines.append("| " + " | ".join(r[:len(header)]) + " |")
+            parts.append("\n".join(table_lines))
 
     return [PageResult(1, "docx", "\n\n".join(parts), text_density=1.0)]
 
@@ -2464,13 +2631,15 @@ def _extract_xlsx(path: Path) -> list[PageResult]:
                 rows_data.append(cells)
         if rows_data:
             header = rows_data[0]
-            parts.append("| " + " | ".join(header) + " |")
-            parts.append("| " + " | ".join(["---"] * len(header)) + " |")
+            table_lines = [
+                "| " + " | ".join(header) + " |",
+                "| " + " | ".join(["---"] * len(header)) + " |",
+            ]
             for r in rows_data[1:]:
                 if len(r) < len(header):
                     r = r + [""] * (len(header) - len(r))
-                parts.append("| " + " | ".join(r[:len(header)]) + " |")
-            parts.append("")
+                table_lines.append("| " + " | ".join(r[:len(header)]) + " |")
+            parts.append("\n".join(table_lines))
     return [PageResult(1, "xlsx", "\n\n".join(parts), text_density=1.0)]
 
 
@@ -2610,7 +2779,11 @@ def _extract_image(path: Path) -> list[PageResult]:
 
 
 def _run_page_ocr(page: PageResult, retries: int) -> PageResult:
+    native_text = page.text or ""
     if not page.image_bytes:
+        if native_text.strip():
+            page.status = "PARSED"
+            return page
         page.status = "OCR_FAILED"
         page.error_code = ERROR_CODES["OCR_FAILED"]
         page.error_message = "missing page image for OCR"
@@ -2621,25 +2794,45 @@ def _run_page_ocr(page: PageResult, retries: int) -> PageResult:
     for _ in range(retries + 1):
         try:
             result = _recognize_image(page.image_bytes)
-            page.text = result["text"]
+            flags = result["quality_flags"]
             page.lines = result["lines"]
             page.bbox = result["bbox"]
             page.avg_confidence = result["avg_confidence"]
             page.min_confidence = result["min_confidence"]
-            page.quality_flags = sorted(set(page.quality_flags + result["quality_flags"]))
-            page.source = "ocr"
-            if "EMPTY_OCR" in result["quality_flags"]:
-                page.status = "OCR_FAILED"
-                page.error_code = ERROR_CODES["OCR_FAILED"]
-                page.error_message = "OCR returned empty text"
-            elif "LOW_OCR_CONFIDENCE" in result["quality_flags"]:
-                page.status = "NEEDS_OCR_REVIEW"
-            else:
+            page.quality_flags = sorted(set(page.quality_flags + flags))
+            ocr_text = (result["text"] or "").strip()
+            if ocr_text:
+                page.text = result["text"]
+                page.source = "ocr"
+                page.status = (
+                    "NEEDS_OCR_REVIEW" if "LOW_OCR_CONFIDENCE" in flags else "PARSED"
+                )
+                return page
+            if native_text.strip():
+                page.text = native_text
+                page.status = "PARSED" if "EMPTY_PAGE" in flags else "NEEDS_OCR_REVIEW"
+                return page
+            if "EMPTY_PAGE" in flags:
+                page.text = ""
+                page.source = "ocr"
                 page.status = "PARSED"
+                page.error_code = None
+                page.error_message = None
+                return page
+            page.text = result["text"]
+            page.source = "ocr"
+            page.status = "OCR_FAILED"
+            page.error_code = ERROR_CODES["OCR_FAILED"]
+            page.error_message = "OCR returned empty text"
             return page
         except Exception as exc:
             last_error = exc
 
+    if native_text.strip():
+        page.text = native_text
+        page.status = "NEEDS_OCR_REVIEW"
+        page.quality_flags = sorted(set(page.quality_flags + ["OCR_FAILED"]))
+        return page
     page.status = "OCR_FAILED"
     page.error_code = ERROR_CODES["OCR_FAILED"]
     page.error_message = str(last_error) if last_error else "OCR failed"
@@ -2691,44 +2884,80 @@ def parse_file_to_pages(path: Path | str, max_retries: int | None = None) -> lis
     return parsed
 
 
+def _page_has_text(page: dict[str, Any]) -> bool:
+    return bool((page.get("text") or "").strip())
+
+
+def _page_quality_flags(page: dict[str, Any]) -> list[str]:
+    flags = page.get("quality_flags")
+    if flags:
+        return list(flags)
+    try:
+        parsed = json.loads(page.get("quality_flags_json") or "[]")
+    except Exception:
+        parsed = []
+    return parsed if isinstance(parsed, list) else []
+
+
 def summarize_page_quality(pages: list[dict[str, Any]]) -> dict[str, Any]:
     confidences = [p["avg_confidence"] for p in pages if p.get("avg_confidence") is not None]
     minimums = [p["min_confidence"] for p in pages if p.get("min_confidence") is not None]
     low_pages: list[int] = []
+    unlayered_pages: list[int] = []
     warnings: list[str] = []
     statuses: dict[str, str] = {}
+    has_extractable_text = False
     for page in pages:
         page_no = str(page["page_no"])
         status = page.get("status") or "PARSED"
-        flags = page.get("quality_flags") or []
+        flags = _page_quality_flags(page)
         statuses[page_no] = status
-        if status in {"OCR_FAILED", "FAILED"}:
+        if _page_has_text(page):
+            has_extractable_text = True
+        else:
+            unlayered_pages.append(int(page["page_no"]))
+        if status in {"OCR_FAILED", "FAILED"} and (page.get("text") or "").strip():
             warnings.append(f"page {page_no}: {status}")
-        if "LOW_OCR_CONFIDENCE" in flags:
+        if "LOW_OCR_CONFIDENCE" in flags and (page.get("text") or "").strip():
             low_pages.append(int(page["page_no"]))
             warnings.append(f"page {page_no}: low OCR confidence")
         if "EMPTY_OCR" in flags:
             warnings.append(f"page {page_no}: empty OCR")
+        if "EMPTY_PAGE" in flags:
+            warnings.append(f"page {page_no}: empty page")
     return {
         "avg_confidence": sum(confidences) / len(confidences) if confidences else None,
         "min_confidence": min(minimums) if minimums else None,
         "low_confidence_pages": sorted(set(low_pages)),
+        "unlayered_pages": sorted(set(unlayered_pages)),
+        "has_extractable_text": has_extractable_text,
         "warnings": warnings,
         "page_statuses": statuses,
+        "page_count": len(pages),
     }
 
 
 def derive_version_status(pages: list[dict[str, Any]]) -> str:
-    statuses = [page.get("status") for page in pages]
-    if not statuses:
+    if not pages:
         return "FAILED"
-    if any(status == "OCR_FAILED" for status in statuses):
-        return "OCR_FAILED"
+    content = [page for page in pages if _page_has_text(page)]
+    # 空白页/空识别不得把已经抽出正文的材料打成整份失败
+    statuses = [page.get("status") for page in (content or pages)]
+    if not content:
+        if any(status == "OCR_FAILED" for status in statuses):
+            return "OCR_FAILED"
+        if any(status == "FAILED" for status in statuses):
+            return "FAILED"
+        if any(status == "NEEDS_OCR_REVIEW" for status in statuses):
+            return "NEEDS_OCR_REVIEW"
+        return "FAILED"
     if any(status == "NEEDS_OCR_REVIEW" for status in statuses):
         return "NEEDS_OCR_REVIEW"
-    if any(status == "FAILED" for status in statuses):
-        return "FAILED"
-    return "PARSED" if all(status == "PARSED" for status in statuses) else "NEEDS_OCR_REVIEW"
+    if any(status in {"OCR_FAILED", "FAILED"} for status in statuses):
+        return "NEEDS_OCR_REVIEW"
+    if all(status == "PARSED" for status in statuses):
+        return "PARSED"
+    return "NEEDS_OCR_REVIEW"
 
 
 # ---------- 分块 ----------
@@ -3254,13 +3483,39 @@ class MaterialService:
             materials = []
             for document in documents:
                 versions = list_versions(conn, document["id"])
+                current = next((v for v in versions if v.get("is_current")), None)
+                if (
+                    current
+                    and document.get("status") in {"OCR_FAILED", "FAILED", "NEEDS_OCR_REVIEW"}
+                ):
+                    pages = list_pages(conn, current["id"])
+                    new_status = derive_version_status(pages)
+                    if new_status != document.get("status"):
+                        quality_json = json.dumps(summarize_page_quality(pages), ensure_ascii=False)
+                        _update(
+                            conn,
+                            "documents",
+                            document["id"],
+                            {"status": new_status, "quality_summary_json": quality_json},
+                        )
+                        _update(
+                            conn,
+                            "document_versions",
+                            current["id"],
+                            {"status": new_status, "quality_summary_json": quality_json},
+                        )
+                        document = {
+                            **document,
+                            "status": new_status,
+                            "quality_summary_json": quality_json,
+                        }
+                        current["status"] = new_status
+                        current["quality_summary_json"] = quality_json
                 materials.append(
                     {
                         **document,
                         "quality_summary": json.loads(document.get("quality_summary_json") or "{}"),
-                        "current_version": next(
-                            (v for v in versions if v.get("is_current")), None
-                        ),
+                        "current_version": current,
                         "version_count": len(versions),
                     }
                 )
@@ -3474,6 +3729,8 @@ class MaterialService:
                 # 展示态再走一遍，清掉残片 PERSON_xxx，避免前端落屏
                 display_quote = _review_display_value(quote, aliases=aliases) if quote else None
                 display_text = _review_display_value(display_text, aliases=aliases)
+            # 预览层做结构推断；存储态原文不改
+            display_text = infer_structure_markdown(display_text)
             # 原文核验抽屉需要的卷宗抬头：案件、材料名、材料版本、识别质量
             case_row = get_case(conn, case_id) if case_id else None
             pages = [
@@ -3498,6 +3755,7 @@ class MaterialService:
                 "page_start": chunk["page_start"],
                 "page_end": chunk["page_end"],
                 "text": display_text,
+                "format": "markdown",
                 "ocr_confidence": (
                     round(sum(confidences) / len(confidences), 4) if confidences else None
                 ),

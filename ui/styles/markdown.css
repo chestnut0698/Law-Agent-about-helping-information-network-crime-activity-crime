@@ -46,11 +46,26 @@
 
 .md-content ul,
 .md-content ol {
-    margin: 8px 0 12px 20px;
+    margin: 8px 0 12px;
+    padding-left: 1.75em;
+}
+
+.md-content ul {
+    list-style-type: disc;
+}
+
+.md-content ol {
+    list-style-type: decimal;
 }
 
 .md-content li {
-    margin-bottom: 4px;
+    margin-bottom: 6px;
+    display: list-item;
+}
+
+.md-content ul ul {
+    list-style-type: circle;
+    margin: 4px 0 8px;
 }
 
 .md-content blockquote {
@@ -93,6 +108,18 @@
     border-collapse: collapse;
     margin: 12px 0;
     font-size: 13px;
+    display: table;
+}
+
+.md-table-wrap {
+    overflow-x: auto;
+    max-width: 100%;
+    margin: 12px 0;
+}
+
+.md-table-wrap table {
+    margin: 0;
+    min-width: 100%;
 }
 
 .md-content th,

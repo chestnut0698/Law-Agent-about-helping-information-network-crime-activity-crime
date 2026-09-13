@@ -34,9 +34,13 @@ from tools.timeline_subjects import (  # noqa: F401 — 兼容旧导入路径
     timeline_event_sort_key,
 )
 
-EXTRACTOR_VERSION = "stage10-nick-span-v1"
+EXTRACTOR_VERSION = "stage13-pred-obj-nick-v1"
 EVENT_EXTRACTOR_VERSION = "stage7-role-subject-v1"
 STRONG_TYPES = ("PHONE", "ACCOUNT", "DEVICE", "ID_CARD", "NAME", "ORGANIZATION", "MERCHANT", "IP")
+# 等值碰撞可含全名人物；化名/外号不靠字符串相等进待核（仅同名不够）
+IDENTIFIER_COLLIDE_TYPES = frozenset(
+    {"PHONE", "ACCOUNT", "DEVICE", "ID_CARD", "NAME", "ORGANIZATION", "MERCHANT", "IP"}
+)
 RULE_TYPE_MAP = {
     "ACCOUNT": "R001",
     "PHONE": "R002",
@@ -615,7 +619,9 @@ _COMMERCIAL_ORG_SUFFIX = (
     "股份公司",
 )
 _ORG_AGENCY_SUFFIX = (
+    "公安分局",
     "公安局",
+    "司法局",
     "派出所",
     "检察院",
     "人民法院",
@@ -625,6 +631,7 @@ _ORG_AGENCY_SUFFIX = (
     "律师事务所",
     "人民政府",
     "委员会",
+    "分局",
 )
 # spaCy 常见误切：把「赵瑞案/赵瑞犯/博元」等切成人名
 _BAD_PERSON_SUFFIX = frozenset("案犯所部庭级记诉判书")
@@ -647,6 +654,8 @@ _PERSON_RIGHT_STOP = frozenset(
 )
 # 称呼类人名后缀：已形成「姓+哥/姐」后不得再向右吞动词
 _NICK_SUFFIX = ("哥", "姐", "叔", "总", "嫂", "爷")
+# 姓前称呼：老/小 + 单姓，化名按真姓而不是按「老」「小」
+_NICK_PREFIX = frozenset("老小")
 # 「赵瑞/明知」「赵某陈述」类：法律常用词不可吞进姓名（多字优先匹配）
 _LEGAL_PERSON_RIGHT_TOKENS = (
     "明知",
@@ -669,18 +678,101 @@ _LEGAL_PERSON_RIGHT_TOKENS = (
     "说到",
 )
 _PERSON_INLINE_SEPS = frozenset("/／\\｜|")
+# 「某」后二字若能单独成谓语/状中结构，整二字留在谓语侧
+_PREDICATE_BIGRAMS = frozenset({
+    "本人", "本案", "本次", "本卡",
+    "名下", "名叫", "名义",
+    "实名", "实际", "实施", "实质",
+    "提供", "提取", "提到", "提前", "提交", "提出",
+    "违法", "违规", "违纪",
+    "身份", "采取", "采用", "采纳",
+    "先后", "随后",
+    "现在", "现场", "现金", "现已", "现将", "现住",
+    "经过", "经手", "经办", "经营",
+    "持有", "使用", "办理", "参与", "负责", "拨打",
+    "取保", "到案", "到场", "在逃",
+    "明知", "应知", "得知", "供述", "陈述",
+})
+# 人名后封闭类虚词；后接汉字时视为与后文成谓语，不因可作名末字就划入姓名
+_POST_NAME_FUNCTION = frozenset(
+    "现为系经还仅已又再就才都也却并即便则均皆亦且而或因故遂乃但若如"
+    "会能要被把将从向对与和及在于的了着过给让用由以其该此每各另"
+    "既尚正刚本违"
+)
+# 人名后常见谓语/系属（最长优先）；「某」后一字若是这些词的词头，不划入姓名
+_PERSON_RIGHT_PREDICATES = (
+    "系犯罪嫌疑人",
+    "系被上诉人",
+    "系被告人",
+    "系被害人",
+    "系受害人",
+    "系上诉人",
+    "系证人",
+    "系上线",
+    "系下线",
+    "另案处理",
+    "被依法",
+    "不如实",
+    "称其",
+    "说到",
+    "经手",
+    "经办",
+    "经营",
+    "经过",
+    "到案",
+    "到场",
+    "在逃",
+    "持有",
+    "使用",
+    "办理",
+    "实施",
+    "参与",
+    "纠集",
+    "出生",
+    "户籍",
+    "辛苦",
+    "辛劳",
+)
+_PERSON_NOT_GIVEN = frozenset("系经办持有职工作员称供认述说讲问")
 # 时间线主体视角允许的 party 类型
 _TIMELINE_PARTY_TYPES = frozenset(
     {"NAME", "ACCOUNT", "PHONE", "DEVICE", "ORGANIZATION", "MERCHANT"}
 )
 
 
+def _is_cjk(ch: str) -> bool:
+    return bool(ch) and "\u4e00" <= ch <= "\u9fff"
+
+
 def _legal_token_at(source: str, pos: int) -> str | None:
     if pos < 0 or pos >= len(source):
         return None
+    best = None
     for tok in _LEGAL_PERSON_RIGHT_TOKENS:
-        if source.startswith(tok, pos):
-            return tok
+        if source.startswith(tok, pos) and (best is None or len(tok) > len(best)):
+            best = tok
+    return best
+
+
+def _predicate_at(source: str, pos: int) -> str | None:
+    """从 pos 起是否为人名后的谓语/虚词。看它能否与后文成词，不把后接成分划进姓名。"""
+    if pos < 0 or pos >= len(source):
+        return None
+    best = _legal_token_at(source, pos)
+    for tok in _PERSON_RIGHT_PREDICATES:
+        if source.startswith(tok, pos) and (best is None or len(tok) > len(best)):
+            best = tok
+    if pos + 2 <= len(source):
+        bi = source[pos : pos + 2]
+        if bi in _PREDICATE_BIGRAMS and (best is None or len(bi) > len(best)):
+            best = bi
+    if best:
+        return best
+    ch = source[pos]
+    if ch in _PERSON_INLINE_SEPS or ch in _PERSON_RIGHT_STOP or ch in _BAD_PERSON_SUFFIX:
+        return ch
+    if ch in _POST_NAME_FUNCTION and pos + 1 < len(source) and _is_cjk(source[pos + 1]):
+        return ch
     return None
 
 
@@ -731,7 +823,29 @@ def _clamp_person_span(source: str, start: int, end: int) -> tuple[int, int]:
         end = nick_end
     while end > start and source[end - 1] in _PERSON_INLINE_SEPS:
         end -= 1
+    start, end = _cut_anon_person_span(source, start, end)
     return start, end
+
+
+def _cut_anon_person_span(source: str, start: int, end: int) -> tuple[int, int]:
+    """「某」后至多一字（某某 / 名末字 / 序次）；该字若与后文构成谓语则留在谓语侧。不向外扩展。"""
+    if start < 0 or end <= start or end > len(source):
+        return start, end
+    text = source[start:end]
+    idx = text.find("某")
+    if idx < 0:
+        return start, end
+    pos = start + idx
+    nxt = pos + 1
+    if nxt >= end:
+        return start, end
+    if source[nxt] == "某":
+        return start, nxt + 1
+    if _predicate_at(source, nxt):
+        return start, pos + 1
+    if "\u4e00" <= source[nxt] <= "\u9fff":
+        return start, nxt + 1
+    return start, pos + 1
 
 
 def _extend_person_span(source: str, start: int, end: int) -> tuple[int, int]:
@@ -743,16 +857,13 @@ def _extend_person_span(source: str, start: int, end: int) -> tuple[int, int]:
         return start, start
     span = source[start:end]
 
-    def _is_cjk(ch: str) -> bool:
-        return "\u4e00" <= ch <= "\u9fff"
-
     def _can_take_right(pos: int) -> bool:
         if pos >= len(source) or not _is_cjk(source[pos]):
             return False
         ch = source[pos]
         if ch in _BAD_PERSON_SUFFIX or ch in _PERSON_RIGHT_STOP or ch in _PERSON_INLINE_SEPS:
             return False
-        if _legal_token_at(source, pos):
+        if _predicate_at(source, pos):
             return False
         return True
 
@@ -770,8 +881,12 @@ def _extend_person_span(source: str, start: int, end: int) -> tuple[int, int]:
     # 已是「姓+哥/姐」等称呼，禁止再吞「看/带/询」
     if _is_nick_surface(span):
         return _clamp_person_span(source, start, end)
-    # 「X某/X某某」已是完整代称，禁止再吞「另案处理」等
+    # 「X某」至多再补一字（某某或名末字/序次）；后文是谓语则不补
     if span.endswith("某"):
+        if end < len(source) and _can_take_right(end):
+            nxt = source[end]
+            if nxt == "某" or "\u4e00" <= nxt <= "\u9fff":
+                end += 1
         return _clamp_person_span(source, start, end)
 
     # 「博元」←「侯」：仅当左侧一字是单姓，且再左侧不是姓名续写
@@ -796,9 +911,17 @@ def _extend_person_span(source: str, start: int, end: int) -> tuple[int, int]:
             or source[after] in _PERSON_RIGHT_STOP
             or source[after] in _BAD_PERSON_SUFFIX
             or source[after] in _PERSON_INLINE_SEPS
-            or _legal_token_at(source, after)
+            or _predicate_at(source, after)
         )
-        if (third == "某" or closed) and (end + 1 - start) <= 3:
+        if _predicate_at(source, end):
+            take = False
+        elif third == "某":
+            take = True
+        elif closed and third not in _PERSON_NOT_GIVEN:
+            take = True
+        else:
+            take = False
+        if take and (end + 1 - start) <= 3:
             end += 1
     elif len(span) == 3 and span[:2] in _COMPOUND_SURNAME_SET and end < len(source) and _can_take_right(end):
         after = end + 1
@@ -809,9 +932,17 @@ def _extend_person_span(source: str, start: int, end: int) -> tuple[int, int]:
             or source[after] in _PERSON_RIGHT_STOP
             or source[after] in _BAD_PERSON_SUFFIX
             or source[after] in _PERSON_INLINE_SEPS
-            or _legal_token_at(source, after)
+            or _predicate_at(source, after)
         )
-        if (third == "某" or closed) and (end + 1 - start) <= 4:
+        if _predicate_at(source, end):
+            take = False
+        elif third == "某":
+            take = True
+        elif closed and third not in _PERSON_NOT_GIVEN:
+            take = True
+        else:
+            take = False
+        if take and (end + 1 - start) <= 4:
             end += 1
 
     return _clamp_person_span(source, start, end)
@@ -835,15 +966,66 @@ def _person_surface_ok(raw: str, exclusions: dict[str, Any]) -> bool:
     # 「某某案」「审讯」类非人名
     if raw.endswith(("公司", "银行", "公安", "法院", "检察院")):
         return False
+    if "某" in raw:
+        idx = raw.find("某")
+        rest = raw[idx + 1 :]
+        if rest not in {"", "某"} and not (
+            len(rest) == 1 and "\u4e00" <= rest <= "\u9fff"
+        ):
+            return False
+    if _looks_like_object_mention(raw):
+        return False
     return True
+
+
+_DEIXIS = frozenset("这那该此")
+_MEASURE_WORDS = frozenset("张个笔台部条只份枚")
+_OBJECT_BARE_NOUNS = frozenset({"银行卡", "信用卡", "身份证", "手机号", "账号", "卡号"})
+_OBJECT_TAILS = ("卡", "账户", "账号", "号码", "手机", "设备", "证件")
+
+
+def _looks_like_object_mention(raw: str) -> bool:
+    """指示/限定 + 量词 + 物品通名，不是人名。"""
+    v = (raw or "").strip()
+    if not v:
+        return False
+    if v in _OBJECT_BARE_NOUNS:
+        return True
+    if v[0] in _DEIXIS:
+        rest = v[1:]
+        if rest and rest[0] in _MEASURE_WORDS:
+            rest = rest[1:]
+        if rest in _OBJECT_TAILS or any(rest.endswith(t) for t in _OBJECT_TAILS):
+            return True
+    if v.endswith(("张卡", "该卡", "此卡", "本卡")):
+        return True
+    return False
 
 
 def _is_commercial_org(value: str) -> bool:
     """商号形态（含「某…有限公司」），可用于跨案同名免佐证。"""
     v = (value or "").strip()
-    if not v or any(v.endswith(a) for a in _ORG_AGENCY_SUFFIX):
+    if not v or _is_justice_agency_org(v):
         return False
     return any(v.endswith(s) for s in _COMMERCIAL_ORG_SUFFIX)
+
+
+def _is_justice_agency_org(value: str) -> bool:
+    """办案机关、监管场所、司法辅助机构通名，不是某一测试单位。"""
+    v = (value or "").strip()
+    if not v:
+        return False
+    if any(v.endswith(a) for a in _ORG_AGENCY_SUFFIX):
+        return True
+    if v.endswith(("局", "院", "所")):
+        return True
+    if v.endswith("中心") and any(
+        k in v for k in ("办案", "执法", "公安", "检察", "司法", "看守")
+    ):
+        return True
+    if v.endswith("中心") and ("法律" in v and "援助" in v):
+        return True
+    return False
 
 
 _COMPANY_TRIM_RE = re.compile(
@@ -870,7 +1052,7 @@ def _org_surface_ok(raw: str, exclusions: dict[str, Any]) -> bool:
     norm = normalize_identifier("ORGANIZATION", raw)
     if is_excluded("ORGANIZATION", norm, exclusions):
         return False
-    if any(raw.endswith(a) for a in _ORG_AGENCY_SUFFIX):
+    if _is_justice_agency_org(raw):
         return False
     if _is_commercial_org(raw):
         return len(raw) >= 4
@@ -1055,13 +1237,10 @@ def extract_rule_mentions(text: str, mapper: GlobalEntityMapper | None = None) -
                     continue
                 if not luhn_ok(digits):
                     hit = _mention_hit("ACCOUNT", raw, start, end, producer="PRESIDIO")
-                    hit["normalized_value"] = ""
-                    hit["mask_info"] = {
-                        "masked": True,
-                        "positions": list(range(len(raw))),
-                        "kind": "luhn_failed",
-                    }
-                    hit["possible_forms"] = []
+                    info = dict(hit.get("mask_info") or {})
+                    info["kind"] = "luhn_unverified"
+                    info["masked"] = False
+                    hit["mask_info"] = info
                     found.append(hit)
                     continue
             elif object_type == "ID_CARD":
@@ -2548,6 +2727,8 @@ def _person_surname(name: str) -> str:
     text = (name or "").strip().replace("·", "")
     if not text:
         return ""
+    if len(text) == 2 and text[0] in _NICK_PREFIX and text[1] in _COMMON_SURNAMES:
+        return text[1]
     for compound in _COMPOUND_SURNAME_SET:
         if text.startswith(compound):
             return compound
@@ -2560,8 +2741,10 @@ def _person_variant_kind(name: str) -> str:
         return ""
     if any(text.endswith(s) for s in _NICK_SUFFIX) and len(text) <= 4:
         return "nick"
-    if re.fullmatch(r"[\u4e00-\u9fff]某{1,2}", text):
+    if re.fullmatch(r"[\u4e00-\u9fff]{1,2}某{1,2}", text):
         return "anon"
+    if re.fullmatch(r"[\u4e00-\u9fff]{1,2}某[\u4e00-\u9fff]", text):
+        return "partial"
     if re.fullmatch(r"[\u4e00-\u9fff·]{2,4}", text):
         return "full"
     return "other"
@@ -2885,7 +3068,7 @@ def collide_mentions(
     groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for mention in mentions:
         object_type = mention.get("object_type")
-        if object_type not in STRONG_TYPES:
+        if object_type not in IDENTIFIER_COLLIDE_TYPES:
             continue
         info = mention.get("mask_info")
         if isinstance(info, str):
@@ -2902,6 +3085,10 @@ def collide_mentions(
             ):
                 continue
         if not value or is_excluded(object_type, value, exclusions):
+            continue
+        if object_type == "NAME" and _person_variant_kind(value) != "full":
+            continue
+        if object_type == "ORGANIZATION" and not _org_surface_ok(value, exclusions):
             continue
         groups[(object_type, value)].append(mention)
 

@@ -116,9 +116,11 @@
             })[view] || '分析任务';
         },
 
-        _statusTag(text, tone) {
+        _statusTag(text, tone, title) {
             const t = tone || 'neutral';
-            return Utils.create('span', { class: `wb-status-tag ${t}`, text: text || '' });
+            const el = Utils.create('span', { class: `wb-status-tag ${t}`, text: text || '' });
+            if (title) el.title = title;
+            return el;
         },
 
         _iconBtn(className, iconName, text, attrs) {
@@ -244,38 +246,27 @@
 
         _updateNavBadges() {
             const counts = this._navCounts();
+            const labels = {
+                entities: '待确认对象',
+                leads: '待核验线索',
+                materials: '待确认材料'
+            };
             Utils.$$('[data-badge]').forEach((el) => {
                 const key = el.getAttribute('data-badge');
-                const n = counts[key] || 0;
+                const n = Number(counts[key] || 0);
                 el.hidden = !n;
-                el.textContent = String(n);
+                el.textContent = n > 99 ? '99+' : String(n);
+                el.title = n ? `${n} 条${labels[key] || '待确认'}` : '';
             });
         },
 
         _navCounts() {
-            const arts = (this.task && this.task.artifacts) || [];
-            const dir = (this.task && this.task.directory) || [];
-            let entities = 0;
-            let leads = 0;
-            let materials = 0;
-            dir.forEach((g) => {
-                if (g.key === 'entities') {
-                    entities = (g.items || []).filter((i) =>
-                        i.status === 'PENDING_REVIEW' || i.status === 'DRAFT'
-                    ).length;
-                }
-                if (g.key === 'clues') {
-                    leads = (g.items || []).filter((i) =>
-                        i.status === 'PENDING_REVIEW' || i.status === 'DRAFT'
-                    ).length;
-                }
-            });
-            const batch = arts.find((a) => a.type === 'MATERIAL_BATCH');
-            if (batch && this.artifactCache[batch.id]) {
-                const payload = this.artifactCache[batch.id].payload || {};
-                materials = (payload.totals && payload.totals.attention) || 0;
-            }
-            return { entities, leads, materials };
+            const pending = (this.task && this.task.pending_counts) || {};
+            return {
+                entities: Number(pending.entities || 0),
+                leads: Number(pending.leads || 0),
+                materials: Number(pending.materials || 0)
+            };
         },
 
         // ---------- 状态 A：范围设置 ----------
@@ -678,7 +669,7 @@
                 Utils.create('div', { class: 'wb-agent-plan-title', text: '尚未完成跨案分析' }),
                 Utils.create('div', {
                     class: 'wb-agent-plan-desc',
-                    text: '点击下方按钮，由助手按步骤分析；完成后请到左侧「实体复核 / 线索中心」核验原文。'
+                    text: '点击下方按钮，由助手按步骤分析；完成后请到左侧「实体复核 / 角色时间线 / 线索中心」核验原文。'
                 }),
                 Utils.create('div', { class: 'wb-agent-plan-actions' }, [run])
             ]);
@@ -875,12 +866,23 @@
             const confirm = this._iconBtn('wb-btn wb-btn-primary', 'play', '开始跨案分析');
             confirm.addEventListener('click', () => this._executeAnalysis(confirm));
 
+            const totals = plan.material_totals || {};
+            const docs = Number(totals.documents || 0);
+            const attention = Number(totals.attention || 0);
+            let desc = `${(plan.cases || []).length} 起案件 · 授权至 ${plan.authorized_until}。`;
+            if (!docs) {
+                desc += '点开始后按下列步骤推进；请确认材料已上传。';
+            } else if (attention) {
+                desc += `已接入 ${docs} 份材料，其中 ${attention} 份需留意质量，不阻断后续分析。`;
+            } else {
+                desc += `已接入 ${docs} 份材料，可开始跨案分析。`;
+            }
             const card = Utils.create('div', { class: 'wb-agent-plan-card' }, [
                 Utils.create('div', { class: 'wb-agent-plan-kicker', text: '分析计划已生成' }),
                 Utils.create('div', { class: 'wb-agent-plan-title', text: plan.title }),
                 Utils.create('div', {
                     class: 'wb-agent-plan-desc',
-                    text: `${plan.cases.length} 起案件 · 授权至 ${plan.authorized_until}。无需补充材料或提示词，可直接执行。`
+                    text: desc
                 }),
                 steps,
                 Utils.create('div', { class: 'wb-agent-plan-actions' }, [edit, confirm])
@@ -1174,9 +1176,9 @@
         },
 
         _clueState(payload) {
-            // 线索确认状态：人工处置(disposition) 或 实体复核升格(promotion=confirmed) 二者取其一。
+            // 只认线索中心人工处置。实体视为同一不把线索标成已确认关联。
             const disp = (payload && payload.disposition) || '';
-            const code = disp || ((payload && payload.promotion) === 'confirmed' ? 'CONFIRMED' : 'PENDING');
+            const code = disp || 'PENDING';
             const label = {
                 PENDING: '待确认', CONTINUE: '已确认关联', CONFIRMED: '已确认关联',
                 NEED_MATERIAL: '待补证', EXCLUDE: '已排除', DEFER: '暂缓'
@@ -1369,7 +1371,7 @@
                     await this.refreshTask();
                     await this._renderCurrentView();
                 } else {
-                    await this.openArtifact(data.artifact.id);
+                await this.openArtifact(data.artifact.id);
                 }
                 const followups = data.followup_actions || [];
                 if (followups.length) {
@@ -1380,10 +1382,13 @@
                 if (data.analysis_gate === 'ENTITY_REVIEW' && data.pending > 0) {
                     Toast.info(`仍有 ${data.pending} 条待核，确认后方可继续后续分析`);
                 } else if (!data.analysis_gate && data.pending === 0) {
-                    Toast.info('实体复核已完成，可继续整理线索与报告');
+                    Toast.info('实体复核已完成，可继续整理时间线与线索');
                 }
                 if (window.Agent && typeof Agent.notifyReviewState === 'function') {
-                    Agent.notifyReviewState({ pending: this._entityUnconfirmedCount() });
+                    Agent.notifyReviewState({
+                        kind: 'ENTITY_REVIEW',
+                        pending: this._entityUnconfirmedCount()
+                    });
                 }
             } catch (e) {
                 Toast.error('判断未能保存：' + e.message);
@@ -1764,20 +1769,67 @@
         },
 
         _collectHighlightTerms(source) {
-            const terms = [];
-            const push = (v) => {
-                const s = String(v || '').trim();
-                if (!s || s.length < 2) return;
-                if (/^(PERSON|PHONE|ACCOUNT|ORG|DEVICE|ID)_/i.test(s)) return;
-                if (!terms.includes(s)) terms.push(s);
+            return this._citationNeedles(source || {});
+        },
+
+        _compactHighlightText(s) {
+            return String(s || '').replace(/[\s\u00a0\u3000]+/g, '');
+        },
+
+        _normalizeHighlightNeedle(s) {
+            return String(s || '')
+                .replace(/……+/g, '')
+                .replace(/\.{3,}/g, '')
+                .replace(/^#{1,6}\s+/gm, '')
+                .replace(/^\s*[-*•]\s+/gm, '')
+                .replace(/^\s*\d+[\.．、)]\s+/gm, '')
+                .replace(/\|/g, ' ')
+                .replace(/\*\*/g, '')
+                .trim();
+        },
+
+        _isPlaceholderTerm(s) {
+            return /(?:PERSON|NAME|PHONE|ACCOUNT|ID|ORG|ORGANIZATION|DEVICE|BANK_CARD|CREDIT_CARD)_[a-f0-9]{1,16}/i.test(s || '');
+        },
+
+        _citationNeedles(source) {
+            const out = [];
+            const seen = new Set();
+            const push = (v, minLen) => {
+                const n = this._normalizeHighlightNeedle(v);
+                if (!n || n === '脱敏片段') return;
+                if (this._isPlaceholderTerm(n)) return;
+                const compact = this._compactHighlightText(n);
+                const min = minLen != null ? minLen : 2;
+                if (compact.length < min) return;
+                if (seen.has(compact)) return;
+                seen.add(compact);
+                out.push(n);
             };
-            (source && source.highlight_terms || []).forEach(push);
-            push(source && source.value);
-            push(source && source.extracted_value);
-            push(source && source.quote_display);
             const display = this._displayQuote(source || {});
-            if (display && display.length <= 80) push(display);
-            return terms.sort((a, b) => b.length - a.length).slice(0, 8);
+            push(source && source.quote_display);
+            push(display);
+            push(source && source.quote);
+            push(source && source.value, 2);
+            push(source && source.extracted_value, 2);
+            (source && source.highlight_terms || []).forEach((t) => push(t, 2));
+            const primary = this._compactHighlightText(
+                this._normalizeHighlightNeedle((source && (source.quote_display || source.quote)) || display)
+            );
+            if (primary.length >= 10) {
+                const win = Math.min(16, primary.length);
+                push(primary.slice(0, win), 6);
+                push(primary.slice(-win), 6);
+                if (primary.length >= 24) {
+                    const mid = Math.floor(primary.length / 2) - Math.floor(win / 2);
+                    push(primary.slice(mid, mid + win), 6);
+                }
+            }
+            const runs = String(display || '').match(/[\u4e00-\u9fff]{4,}/g) || [];
+            runs.sort((a, b) => b.length - a.length).slice(0, 4).forEach((r) => push(r, 4));
+            return out.sort((a, b) => (
+                this._compactHighlightText(b).length - this._compactHighlightText(a).length
+            ));
         },
 
         _escapeHtml(text) {
@@ -1808,32 +1860,76 @@
             container.innerHTML = html;
         },
 
-        _renderVerifyText(container, fullText, source) {
-            const raw = String(fullText || '');
-            const terms = this._collectHighlightTerms(source || {});
-            const anchor = terms.map((t) => raw.indexOf(t)).filter((i) => i >= 0).sort((a, b) => a - b)[0];
-            if (!raw) {
-                container.textContent = '原文为空';
-                return;
-            }
-            let start = 0;
-            let end = raw.length;
-            if (anchor != null && raw.length > 460) {
-                start = Math.max(0, anchor - 180);
-                end = Math.min(raw.length, anchor + 280);
-            } else if (raw.length > 900) {
-                end = 900;
-            }
-            const window_ = raw.slice(start, end);
-            let html = this._escapeHtml(window_);
-            terms.forEach((term) => {
-                const esc = this._escapeHtml(term);
-                if (!esc || html.indexOf(esc) < 0) return;
-                html = html.replace(esc, `<mark class="wb-cite-mark"><strong>${esc}</strong></mark>`);
+        _highlightMarkdownPreview(container, source) {
+            if (!container) return;
+            const needles = this._citationNeedles(source || {});
+            if (!needles.length) return;
+            const skip = { MARK: 1, SCRIPT: 1, STYLE: 1 };
+            const nodes = [];
+            const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
+                acceptNode(node) {
+                    const text = node.nodeValue || '';
+                    if (!text) return NodeFilter.FILTER_REJECT;
+                    const tag = node.parentElement && node.parentElement.tagName;
+                    if (tag && skip[tag]) return NodeFilter.FILTER_REJECT;
+                    return NodeFilter.FILTER_ACCEPT;
+                }
             });
-            const prefix = start > 0 ? '<span class="wb-cite-omit">……（上文省略）……</span>' : '';
-            const suffix = end < raw.length ? '<span class="wb-cite-omit">……（下文省略）……</span>' : '';
-            container.innerHTML = prefix + html + suffix;
+            while (walker.nextNode()) nodes.push(walker.currentNode);
+            if (!nodes.length) return;
+            const compactChars = [];
+            const map = [];
+            nodes.forEach((node) => {
+                const text = node.nodeValue || '';
+                for (let i = 0; i < text.length; i += 1) {
+                    if (/[\s\u00a0\u3000]/.test(text[i])) continue;
+                    compactChars.push(text[i]);
+                    map.push({ node, offset: i });
+                }
+            });
+            const compact = compactChars.join('');
+            if (!compact) return;
+            let hit = null;
+            for (let i = 0; i < needles.length; i += 1) {
+                const needle = this._compactHighlightText(this._normalizeHighlightNeedle(needles[i]));
+                if (!needle) continue;
+                const at = compact.indexOf(needle);
+                if (at >= 0) {
+                    hit = { at, length: needle.length };
+                    break;
+                }
+            }
+            if (!hit) return;
+            const groups = [];
+            let current = null;
+            for (let i = hit.at; i < hit.at + hit.length; i += 1) {
+                const loc = map[i];
+                if (!loc) break;
+                if (!current || current.node !== loc.node) {
+                    current = { node: loc.node, min: loc.offset, max: loc.offset };
+                    groups.push(current);
+                } else {
+                    current.max = loc.offset;
+                }
+            }
+            for (let g = groups.length - 1; g >= 0; g -= 1) {
+                const { node, min, max } = groups[g];
+                if (!node || !node.parentNode) continue;
+                const text = node.nodeValue || '';
+                const before = text.slice(0, min);
+                const match = text.slice(min, max + 1);
+                const after = text.slice(max + 1);
+                const frag = document.createDocumentFragment();
+                if (before) frag.appendChild(document.createTextNode(before));
+                const mark = document.createElement('mark');
+                mark.className = 'wb-cite-mark';
+                const strong = document.createElement('strong');
+                strong.textContent = match;
+                mark.appendChild(strong);
+                frag.appendChild(mark);
+                if (after) frag.appendChild(document.createTextNode(after));
+                node.parentNode.replaceChild(frag, node);
+            }
         },
 
         _renderCiteVerify(view, source, data) {
@@ -1850,7 +1946,7 @@
 
             bodyEl.appendChild(Utils.create('div', {
                 class: 'wb-cite-desc',
-                text: `第 ${index + 1} / ${list.length} 条依据 · 逐字核验原文材料后再作处置判断`
+                text: `第 ${index + 1} / ${list.length} 条依据 · 请对照原文后再作处置`
             }));
 
             const conf = data.ocr_confidence != null ? data.ocr_confidence : source.ocr_confidence;
@@ -1859,9 +1955,9 @@
             [
                 ['所属案件', data.case_name || source.case_name || '—'],
                 ['材料名称', data.filename || source.filename || source.document_name || '—'],
-                ['材料版本', data.version_no != null ? `v${data.version_no}` : '—'],
+                ['材料版本', data.version_no != null ? `第 ${data.version_no} 版` : '—'],
                 ['页码', pageNo ? `第 ${pageNo} 页` : '—'],
-                ['识别质量', conf != null ? `${Math.round(conf * 100)}%` : '—']
+                ['文字清晰度', conf != null ? `${Math.round(conf * 100)}%` : '—']
             ].forEach(([label, value]) => {
                 meta.appendChild(Utils.create('span', { class: 'wb-cite-meta-item' }, [
                     Utils.create('span', { class: 'wb-cite-meta-label', text: `${label}：` }),
@@ -1878,24 +1974,26 @@
             }
 
             const panel = Utils.create('section', { class: 'wb-cite-panel' });
-            panel.appendChild(Utils.create('div', { class: 'wb-cite-panel-head', text: '识别文本 · 高亮原句' }));
-            const textBox = Utils.create('div', { class: `wb-cite-body${view.error ? ' is-error' : ''}` });
+            panel.appendChild(Utils.create('div', { class: 'wb-cite-panel-head', text: '材料原文（黄底为摘录）' }));
+            let textBox;
             if (view.error) {
-                // 失效时也只展示展示态摘要，禁止落存储态 quote
+                textBox = Utils.create('div', { class: 'wb-cite-body is-error' });
                 textBox.textContent = this._displayQuote(source) || view.message || '原文不可展示';
             } else {
-                // 核验以定位摘录为准：展示态纯文本窗口 + 高亮，不做整页 Markdown 排版
-                this._renderVerifyText(
-                    textBox,
+                textBox = this._renderMarkdownBody(
                     data.text || this._displayQuote(source) || '',
-                    { ...source, quote_display: data.quote || source.quote_display }
+                    'wb-cite-body wb-doc-preview md-content'
                 );
+                this._highlightMarkdownPreview(textBox, {
+                    ...source,
+                    quote_display: data.quote || source.quote_display
+                });
             }
             panel.appendChild(textBox);
             if (conf != null && conf < 0.85) {
                 panel.appendChild(Utils.create('div', {
                     class: 'wb-cite-lowconf',
-                    text: '识别置信度较低，建议人工复核'
+                    text: '文字识别不够清晰，请对照原件复核'
                 }));
             }
             bodyEl.appendChild(panel);
@@ -1975,31 +2073,29 @@
             }
 
             if (isBrowse && !view.error) {
-                // mode=browse：脱敏展示文已在后端还原并结构推断；此处仅 Markdown 预览，不回写存储
                 bodyEl.appendChild(Utils.create('div', {
                     class: 'wb-cite-desc',
-                    text: '浏览预览 · Markdown 排版（仅展示，不改存储原文）'
+                    text: '材料正文'
                 }));
                 bodyEl.appendChild(this._renderMarkdownBody(view.text || '', 'wb-cite-body wb-doc-preview md-content'));
-                bodyEl.appendChild(Utils.create('div', {
-                    class: 'wb-file-meta',
-                    text: '以上为结构化预览。脱敏占位已还原后排版；text_raw / text_redacted 未改动。'
-                }));
             } else {
-                const body = Utils.create('div', { class: `wb-cite-body${view.error ? ' is-error' : ''}` });
                 const displayQuote = this._displayQuote(source || {});
-                const text = view.text || '';
                 if (view.error) {
-                    body.textContent = text || displayQuote || '原文不可展示';
+                    const body = Utils.create('div', { class: 'wb-cite-body is-error' });
+                    body.textContent = view.text || displayQuote || '原文不可展示';
+                    bodyEl.appendChild(body);
                 } else {
-                    // 对照/核验：定位摘录，不做整页 Markdown 排版
-                    this._renderHighlightedText(body, text, {
+                    const body = this._renderMarkdownBody(
+                        view.text || displayQuote || '',
+                        'wb-cite-body wb-doc-preview md-content'
+                    );
+                    this._highlightMarkdownPreview(body, {
                         ...source,
                         quote_display: displayQuote,
                         quote: displayQuote
                     });
+                    bodyEl.appendChild(body);
                 }
-                bodyEl.appendChild(body);
             }
 
             const drawerNav = Utils.create('div', { class: 'wb-cite-nav' });
@@ -2271,9 +2367,21 @@
                     await this.refreshTask();
                     await this._renderCurrentView();
                 } else {
-                    await this.openArtifact(data.artifact.id);
+                await this.openArtifact(data.artifact.id);
                 }
                 Toast.success('线索处置已记录');
+                const pending = Number(data.pending);
+                if (window.Agent && typeof Agent.notifyReviewState === 'function') {
+                    Agent.notifyReviewState({
+                        kind: 'CLUE_REVIEW',
+                        pending: Number.isFinite(pending) ? pending : -1
+                    });
+                }
+                if (Number.isFinite(pending) && pending > 0) {
+                    Toast.info(`仍有 ${pending} 条线索待核验，全部处置后将自动继续`);
+                } else if (pending === 0) {
+                    Toast.info('线索已全部核验，可继续撰写核验单');
+                }
             } catch (e) {
                 Toast.error('处置未能保存：' + e.message);
             } finally {
@@ -2297,7 +2405,7 @@
             if (typeText) {
                 panel.appendChild(Utils.create('div', {
                     class: 'wb-file-meta',
-                    text: `${typeText} · 已扫描材料片段 ${summary.scanned_chunks || 0}`
+                    text: `${typeText} · 已查阅材料记载 ${summary.scanned_chunks || 0} 处`
                 }));
             }
             const items = payload.items || [];
@@ -2364,7 +2472,7 @@
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        document_id: documentId,
+                        document_id: documentId || undefined,
                         updates: changes.updates,
                         deletions: Array.from(changes.deletions),
                         additions: changes.additions
@@ -2384,9 +2492,10 @@
                 throw e;
             }
         },
-        async _openMappingManager(documentId) {
-            if (!documentId) {
-                Toast.warning('请从材料行打开，仅查看该材料上的脱敏映射');
+        async _openMappingManager(documentId, options) {
+            const taskScope = !!(options && options.taskScope) || !documentId;
+            if (!documentId && !(this.task && this.task.id)) {
+                Toast.warning('请先选择分析任务，或从材料行打开该材料上的映射');
                 return;
             }
             // 关闭已有弹层，避免叠多层
@@ -2409,7 +2518,11 @@
                 additions: []
             };
 
-            const resp = await fetch(`/api/mappings?document_id=${encodeURIComponent(documentId)}&limit=200`);
+            const resp = await fetch(
+                documentId
+                    ? `/api/mappings?document_id=${encodeURIComponent(documentId)}&limit=200`
+                    : `/api/mappings?task_id=${encodeURIComponent(this.task.id)}&limit=400`
+            );
             const data = await resp.json();
             const items = data.items || [];
 
@@ -2419,11 +2532,13 @@
                 Utils.create('div', {}, [
                     Utils.create('div', {
                         style: 'font-size:16px;font-weight:600;',
-                        text: '本材料脱敏映射'
+                        text: documentId ? '本材料脱敏映射' : '本任务脱敏映射'
                     }),
                     Utils.create('div', {
                         style: 'font-size:12px;color:var(--muted-foreground);margin-top:4px;',
-                        text: `仅显示本份材料出现过的映射（共 ${data.total != null ? data.total : items.length} 条）；底层仍与跨材料全局映射共用，保证同一标识跨案一致。`
+                        text: documentId
+                            ? `仅显示本份材料出现过的映射（共 ${data.total != null ? data.total : items.length} 条）。改一处会影响任务内所有出现同一原文的材料；不确定时请对照下方原文样例。`
+                            : `本分析任务全部材料共用一张映射（共 ${data.total != null ? data.total : items.length} 条）。改一处后重脱敏本任务内相关片段。仍可从材料行打开单份对照原文。`
                     })
                 ]),
                 this._iconBtn('wb-btn wb-btn-ghost', 'x', '')
@@ -2457,7 +2572,9 @@
                 tbody.appendChild(Utils.create('tr', {}, [
                     Utils.create('td', {
                         colspan: '6',
-                        text: '本材料尚无脱敏映射条目。可在下方按原文新增，或先修复残缺人名跨度。'
+                        text: documentId
+                            ? '本材料尚无脱敏映射条目。可在下方按原文新增，或先修复残缺人名跨度。'
+                            : '本任务尚无脱敏映射条目。可在下方按原文新增，或先修复残缺人名跨度。'
                     })
                 ]));
             }
@@ -2540,9 +2657,9 @@
                     });
                     const result = await resp.json();
                     if (result.ok) {
-                        Toast.success(`已修复 ${result.grown || 0} 处跨度（重建 ${result.chunks_rebuilt || 0} 段材料）`);
+                        Toast.success(`已修复 ${result.grown || 0} 处跨度、去掉 ${result.dropped || 0} 条误标（重建 ${result.chunks_rebuilt || 0} 段材料）`);
                         modal.remove();
-                        this._openMappingManager(documentId);
+                        this._openMappingManager(documentId, documentId ? null : { taskScope: true });
                     } else {
                         Toast.error(result.error || result.message || '修复未完成');
                     }
@@ -2710,18 +2827,11 @@
 
                 // 显示文件名和元信息
                 const head = Utils.create('div', { class: 'wb-panel-head' }, [
-                    Utils.create('div', { class: 'wb-panel-sub', text: `结构化预览 · ${data.chunk_count} 处片段` })
+                    Utils.create('div', { class: 'wb-panel-sub', text: '材料正文' })
                 ]);
                 panel.appendChild(head);
 
                 panel.appendChild(this._renderMarkdownBody(data.text || ''));
-
-                // 底部提示
-                panel.appendChild(Utils.create('div', {
-                    class: 'wb-file-meta',
-                    text: '以上为结构化预览（标题/表格分级显示）。存储原文未改动。',
-                    style: 'margin-top: 8px; text-align: right;'
-                }));
 
             } catch (err) {
                 panel.removeChild(loading);
@@ -2729,17 +2839,37 @@
             }
         },
 
+        _materialStatusView(m) {
+            const status = (m && m.status) || 'UPLOADED';
+            const mixed = status === 'PARSED' && (m.unlayered_pages || []).length > 0;
+            const ready = status === 'PARSED';
+            const warn = ATTENTION.includes(status);
+            const fail = status === 'FAILED' || status === 'OCR_FAILED';
+            return {
+                status,
+                mixed,
+                ready,
+                warn,
+                fail,
+                text: (m && m.stage_label) || STAGE_TEXT[status] || status,
+                hint: (m && m.stage_hint) || '',
+                tone: fail ? 'danger' : (warn ? 'warn' : (mixed ? 'info' : (ready ? 'ok' : 'neutral')))
+            };
+        },
+
         _materialRow(row) {
             const docId = row.document_id;
-
-            const status = row.status || 'UPLOADED';
-            const attention = ATTENTION.includes(status);
-            const stageIndex = STAGE_ORDER.indexOf(status);
+            const view = this._materialStatusView(row);
+            const attention = view.warn || view.fail;
+            const stageIndex = STAGE_ORDER.indexOf(view.status);
             const percent = attention ? 100 : Math.round(((stageIndex + 1) / STAGE_ORDER.length) * 100);
             const ext = (row.filename || '').split('.').pop().toUpperCase().slice(0, 4) || 'FILE';
 
             const detail = [];
             if (row.page_count) detail.push(`${row.page_count} 页`);
+            if ((row.unlayered_pages || []).length) {
+                detail.push(`无文字层 ${row.unlayered_pages.length} 页`);
+            }
             if ((row.low_confidence_pages || []).length) {
                 detail.push(`低置信 ${row.low_confidence_pages.length} 页`);
             }
@@ -2762,6 +2892,9 @@
                 this._deleteMaterial(docId);
             });
 
+            const statusEl = Utils.create('div', { class: 'wb-file-status', text: view.text });
+            if (view.hint) statusEl.title = view.hint;
+
             const rowEl = Utils.create('div', { class: 'wb-file-row' }, [
                 Utils.create('div', { class: 'wb-file-type', text: ext }),
                 Utils.create('div', {}, [
@@ -2775,7 +2908,7 @@
                         text: attention ? '需人工处理' : `阶段 ${Math.max(stageIndex + 1, 1)} / ${STAGE_ORDER.length}`
                     })
                 ]),
-                Utils.create('div', { class: 'wb-file-status', text: STAGE_TEXT[status] || status }),
+                statusEl,
                 del
             ]);
 
@@ -2858,6 +2991,22 @@
             return allowed;
         },
 
+        _fileIdentity(file) {
+            return `${file && file.name}|${file && file.size}|${file && file.lastModified}`;
+        },
+
+        _mergePendingFiles(existing, incoming) {
+            const merged = Array.from(existing || []);
+            const seen = new Set(merged.map((f) => this._fileIdentity(f)));
+            (incoming || []).forEach((file) => {
+                const key = this._fileIdentity(file);
+                if (seen.has(key)) return;
+                seen.add(key);
+                merged.push(file);
+            });
+            return merged;
+        },
+
         _assignInputFiles(input, files) {
             const dt = new DataTransfer();
             files.forEach((f) => dt.items.add(f));
@@ -2912,7 +3061,7 @@
             modal.appendChild(select);
 
             const fileLabel = Utils.create('label', { class: 'wb-upload-field-label', text: '材料文件' });
-            const { drop, input } = this._buildUploadDropzone();
+            const { drop, getFiles } = this._buildUploadDropzone();
             modal.appendChild(fileLabel);
             modal.appendChild(drop);
 
@@ -2927,7 +3076,7 @@
             cancel.addEventListener('click', () => overlay.remove());
             const start = this._iconBtn('wb-btn wb-btn-primary', 'upload', '开始上传');
             start.addEventListener('click', async () => {
-                const ok = await this._uploadMaterials(select.value, input.files, start);
+                const ok = await this._uploadMaterials(select.value, getFiles(), start);
                 if (ok) {
                     overlay.remove();
                     if (this.currentView === 'materials') await this._renderCurrentView();
@@ -2951,6 +3100,7 @@
         },
 
         _buildUploadDropzone() {
+            let pending = [];
             const input = Utils.create('input', {
                 type: 'file',
                 multiple: 'multiple',
@@ -2961,10 +3111,11 @@
             const drop = Utils.create('div', { class: 'wb-upload-dropzone' });
             const dropInner = Utils.create('div', { class: 'wb-upload-drop-inner' });
             if (window.Icons) dropInner.appendChild(Icons.el('cloudUpload', 'wb-upload-cloud'));
-            dropInner.appendChild(Utils.create('div', {
+            const dropTitle = Utils.create('div', {
                 class: 'wb-upload-drop-title',
-                text: '点击选择文件或拖拽到此处'
-            }));
+                text: '点击选择或拖拽到此处，可多次添加'
+            });
+            dropInner.appendChild(dropTitle);
             dropInner.appendChild(Utils.create('div', {
                 class: 'wb-upload-drop-hint',
                 text: MATERIAL_ACCEPT_HINT
@@ -2974,25 +3125,53 @@
             drop.appendChild(fileList);
             drop.appendChild(input);
 
+            const applyPending = (next) => {
+                pending = next;
+                this._assignInputFiles(input, pending);
+                syncFileList();
+            };
             const syncFileList = () => {
                 fileList.innerHTML = '';
-                const files = input.files ? Array.from(input.files) : [];
-                if (!files.length) {
-                    dropInner.hidden = false;
-                    return;
-                }
-                dropInner.hidden = true;
-                files.forEach((f) => {
-                    fileList.appendChild(Utils.create('div', {
-                        class: 'wb-upload-file-item',
-                        text: `${f.name}（${this._sizeText(f.size)}）`
+                dropTitle.textContent = pending.length
+                    ? `已选 ${pending.length} 份，可继续添加，点「开始上传」一并提交`
+                    : '点击选择或拖拽到此处，可多次添加';
+                if (!pending.length) return;
+                pending.forEach((file, index) => {
+                    const row = Utils.create('div', { class: 'wb-upload-file-item' });
+                    row.appendChild(Utils.create('span', {
+                        class: 'wb-upload-file-name',
+                        text: `${file.name}（${this._sizeText(file.size)}）`
                     }));
+                    const remove = Utils.create('button', {
+                        type: 'button',
+                        class: 'wb-upload-file-remove',
+                        title: '移除'
+                    });
+                    if (window.Icons) remove.appendChild(Icons.el('x', 'wb-upload-file-remove-ico'));
+                    else remove.textContent = '×';
+                    remove.addEventListener('click', (event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        applyPending(pending.filter((_, i) => i !== index));
+                    });
+                    row.appendChild(remove);
+                    fileList.appendChild(row);
                 });
             };
-            drop.addEventListener('click', () => input.click());
+            const openPicker = (event) => {
+                if (event && event.target && event.target.closest('.wb-upload-file-remove')) return;
+                input.click();
+            };
+            dropInner.addEventListener('click', (event) => {
+                event.stopPropagation();
+                openPicker(event);
+            });
+            drop.addEventListener('click', (event) => {
+                if (event.target.closest('.wb-upload-file-item')) return;
+                openPicker(event);
+            });
             input.addEventListener('change', () => {
-                this._assignInputFiles(input, this._filterMaterialFiles(input.files));
-                syncFileList();
+                applyPending(this._mergePendingFiles(pending, this._filterMaterialFiles(input.files)));
             });
             drop.addEventListener('dragover', (e) => {
                 e.preventDefault();
@@ -3003,11 +3182,15 @@
                 e.preventDefault();
                 drop.classList.remove('dragover');
                 if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
-                    this._assignInputFiles(input, this._filterMaterialFiles(e.dataTransfer.files));
-                    syncFileList();
+                    applyPending(this._mergePendingFiles(pending, this._filterMaterialFiles(e.dataTransfer.files)));
                 }
             });
-            return { drop, input, syncFileList };
+            return {
+                drop,
+                input,
+                getFiles: () => pending.slice(),
+                syncFileList
+            };
         },
 
         _openAddCaseModal() {
@@ -3025,7 +3208,7 @@
                     Utils.create('div', { class: 'wb-upload-modal-title', text: '添加案件' }),
                     Utils.create('div', {
                         class: 'wb-upload-modal-sub',
-                        text: '填写案件名称并可同时上传材料；与新建任务使用同一案件库与材料存储'
+                        text: '填写案件名称，可同时上传该案材料'
                     })
                 ])
             ]);
@@ -3044,14 +3227,14 @@
             modal.appendChild(nameInput);
 
             modal.appendChild(Utils.create('label', { class: 'wb-upload-field-label', text: '上传材料（可选）' }));
-            const { drop, input } = this._buildUploadDropzone();
+            const { drop, getFiles } = this._buildUploadDropzone();
             modal.appendChild(drop);
 
             const foot = Utils.create('div', { class: 'wb-upload-modal-foot' });
             const notice = Utils.create('div', { class: 'wb-upload-legal' });
             if (window.Icons) notice.appendChild(Icons.el('fileText', 'wb-upload-legal-ico'));
             notice.appendChild(Utils.create('span', {
-                text: '案件与材料写入本任务范围，存储路径与新建分析任务一致'
+                text: '新案件及材料将纳入本分析任务'
             }));
             const actions = Utils.create('div', { class: 'wb-upload-modal-actions' });
             const cancel = this._iconBtn('wb-btn wb-btn-outline', 'x', '取消');
@@ -3068,7 +3251,7 @@
                 try {
                     const fd = new FormData();
                     fd.append('name', name);
-                    const files = this._filterMaterialFiles(input.files);
+                    const files = getFiles();
                     files.forEach((f) => fd.append('files', f));
                     const resp = await fetch(`/api/tasks/${this.task.id}/cases`, {
                         method: 'POST',
@@ -3173,15 +3356,16 @@
             const prompt = [
                 '请对本监督分析任务执行完整跨案分析：',
                 '先查看任务范围与材料是否可用于分析；若计划仍为草稿则先确认；',
-                '再开展跨案标识比对，整理转账与联络事件时间线，形成可回原文的疑似关联线索。',
-                '每完成一步根据材料情况决定是否继续；完成后请提示到中间工作区打开相应分析成果核验原文。',
+                '再开展跨案标识比对，并把材料上需要人判断「是否同一对象」的情形写入待核；',
+                '若仍有待核对象，必须停步，请用户到中间工作区「实体复核」作出视为同一或保留独立；确认完成后再整理事件时间线，形成可回原文的疑似关联线索。',
+                '完成后请提示到中间工作区打开相应分析成果核验原文。',
                 '禁止输出定罪、并案、主从犯或量刑结论；回复勿使用函数名、接口或工程术语。'
             ].join('');
             try {
                 if (!window.Agent) throw new Error('智能体未就绪');
                 await Agent.process(prompt);
                 if (!(window.Agent && Agent._wait)) {
-                    Toast.success('本轮跨案分析已结束');
+                Toast.success('本轮跨案分析已结束');
                 }
             } catch (e) {
                 Toast.error(e.message || '分析未能完成');
@@ -3564,6 +3748,10 @@
             });
             actions.appendChild(uploadBtn);
             actions.appendChild(refreshBtn);
+            const mapAllBtn = this._iconBtn('wb-btn wb-btn-outline', 'shield', '本任务脱敏映射');
+            mapAllBtn.title = '查看并修改本分析任务全部材料共用的脱敏映射';
+            mapAllBtn.addEventListener('click', () => this._openMappingManager(null, { taskScope: true }));
+            actions.appendChild(mapAllBtn);
             root.appendChild(this._pageHead(
                 '材料中心',
                 `共 ${rows.length} 份材料 · ${blocked} 份存在处理阻断问题，需处理后才能纳入分析`,
@@ -3630,11 +3818,12 @@
                 ]));
             }
             filtered.forEach((m) => {
-                const statusText = STAGE_TEXT[m.status] || m.status;
-                const ready = m.status === 'PARSED';
-                const warn = ATTENTION.includes(m.status);
-                const fail = m.status === 'FAILED' || m.status === 'OCR_FAILED';
-                const statusTone = fail ? 'danger' : (warn ? 'warn' : (ready ? 'ok' : 'neutral'));
+                const view = this._materialStatusView(m);
+                const statusText = view.text;
+                const ready = view.ready;
+                const warn = view.warn;
+                const fail = view.fail;
+                const statusTone = view.tone;
                 const availTone = ready ? 'ok' : (warn || fail ? 'danger' : 'warn');
                 const availText = ready ? '允许纳入' : (fail ? '识字失败' : (warn ? '待复核' : '处理中'));
                 const redacted = m.redacted !== false;
@@ -3643,7 +3832,7 @@
                 tr.appendChild(Utils.create('td', { text: m.case_name || '—' }));
                 tr.appendChild(Utils.create('td', { text: m.material_type || m.doc_type || '其他材料' }));
                 tr.appendChild(Utils.create('td', { text: m.version != null ? `v${m.version}` : (m.version_count != null ? `v${m.version_count}` : '—') }));
-                tr.appendChild(Utils.create('td', {}, [this._statusTag(statusText, statusTone)]));
+                tr.appendChild(Utils.create('td', {}, [this._statusTag(statusText, statusTone, view.hint)]));
                 const shield = Utils.create('td');
                 if (window.Icons) {
                     shield.innerHTML = Icons.svg(redacted ? 'shieldCheck' : 'shield', `wb-ico wb-shield ${redacted ? 'ok' : 'off'}`);
@@ -3688,7 +3877,7 @@
                                 error: false,
                                 title: m.filename || preview.filename || '材料预览',
                                 text: preview.text || preview.preview || '',
-                                meta: `${m.case_name || ''} · ${statusText} · ${preview.format === 'markdown' ? 'Markdown' : '文本'}`
+                                meta: `${m.case_name || ''} · ${statusText}`
                             }, { quote: '' });
                         } else {
                             Toast.info('暂无法预览该材料正文');
@@ -3764,7 +3953,7 @@
             let data = await this._fetchArtifact(art.id);
             const ver = (((data || {}).payload || {}).summary || {}).extractor_version || '';
             // 旧产物用过时抽取器时自动重跑，否则页面会一直显示噪声人名
-            if (!this._entityRefreshTried && this.task && this.task.id && ver !== 'stage10-nick-span-v1') {
+            if (!this._entityRefreshTried && this.task && this.task.id && ver !== 'stage13-pred-obj-nick-v1') {
                 try {
                     Toast.info('实体识别规则已升级，正在重新抽取比对…');
                     const resp = await fetch(`/api/tasks/${this.task.id}/collision/run`, { method: 'POST' });
@@ -3784,7 +3973,7 @@
                 } catch (e) {
                     Toast.warning('自动重抽未完成，仍显示旧结果：' + (e.message || ''));
                 }
-            } else if (ver === 'stage10-nick-span-v1') {
+            } else if (ver === 'stage13-pred-obj-nick-v1') {
                 this._entityRefreshTried = true;
             }
             return data;
@@ -3930,14 +4119,21 @@
                 DEVICE: '电子设备', ORGANIZATION: '组织主体', MERCHANT: '商户',
                 ID_CARD: '身份证件', IP: '网络地址'
             };
+            const identifierTypes = {
+                BANK_ACCOUNT: 1, ACCOUNT: 1, PHONE: 1, DEVICE: 1, ID_CARD: 1, IP: 1,
+                MERCHANT: 1, ORGANIZATION: 1
+            };
+            const matchEntityFilter = (c, key) => {
+                const t = c.entity_type || '';
+                if (key === 'all') return true;
+                if (key === 'queue_identifier') return !!identifierTypes[t];
+                if (key === 'queue_person' || key === 'PERSON') return t === 'PERSON' || t === 'NAME';
+                if (key === 'BANK_ACCOUNT') return t === 'BANK_ACCOUNT' || t === 'ACCOUNT';
+                return t === key;
+            };
             let filtered = typeFilter === 'all'
                 ? candidates
-                : candidates.filter((c) => {
-                    const t = c.entity_type || '';
-                    if (typeFilter === 'BANK_ACCOUNT') return t === 'BANK_ACCOUNT' || t === 'ACCOUNT';
-                    if (typeFilter === 'PERSON') return t === 'PERSON' || t === 'NAME';
-                    return t === typeFilter;
-                });
+                : candidates.filter((c) => matchEntityFilter(c, typeFilter));
             if (entitySearch) {
                 filtered = filtered.filter((candidate) => {
                     const searchable = [
@@ -3989,14 +4185,14 @@
 
             root.appendChild(this._pageHead(
                 '实体复核',
-                '逐条核验跨案实体是否为同一主体；确认结果影响线索与图谱。',
+                '标识队问号码/证件是否同一，人物队问称呼是否同一人。对照表只是记载快照，点一边不改另一边。',
                 reviewBtn,
                 `${pendingCount} 个待选`
             ));
             root.appendChild(Utils.create('div', { class: 'wb-alert warn' }, [
                 window.Icons ? Icons.el('info') : Utils.create('span', { text: 'ℹ' }),
                 Utils.create('span', {
-                    text: payload.boundary || '复核提示：系统仅提供可解释的关联候选。请结合原文与字段差异作出判断，不要将候选直接作为事实结论。'
+                    text: payload.boundary || '复核提示：标识是否同一与人是否同一分开点。对照表只反映材料记载，取消一边不会拆掉另一边。'
                 })
             ]));
             const gate = payload.analysis_gate || (payload.summary || {}).analysis_gate || '';
@@ -4028,18 +4224,14 @@
             const tabs = Utils.create('div', { class: 'wb-toolbar', style: 'margin-bottom:10px;gap:6px;flex-wrap:wrap' });
             [
                 ['all', '全部'],
+                ['queue_identifier', '标识'],
+                ['queue_person', '人物'],
                 ['BANK_ACCOUNT', '银行账户'],
                 ['PHONE', '手机号码'],
-                ['PERSON', '人物'],
                 ['DEVICE', '设备'],
                 ['ORGANIZATION', '组织']
             ].forEach(([key, label]) => {
-                const count = key === 'all' ? candidates.length : candidates.filter((c) => {
-                    const t = c.entity_type || '';
-                    if (key === 'BANK_ACCOUNT') return t === 'BANK_ACCOUNT' || t === 'ACCOUNT';
-                    if (key === 'PERSON') return t === 'PERSON' || t === 'NAME';
-                    return t === key;
-                }).length;
+                const count = candidates.filter((c) => matchEntityFilter(c, key)).length;
                 const btn = Utils.create('button', {
                     type: 'button',
                     class: `wb-btn ${typeFilter === key ? 'wb-btn-primary' : 'wb-btn-ghost'}`,
@@ -4133,7 +4325,9 @@
                     Utils.create('div', {
                         class: 'wb-list-item-meta',
                         text: (() => {
-                            const tier = c.match_tier === 'SUSPECTED' ? '疑似化名' : '强标识';
+                            const tier = c.match_tier === 'SUSPECTED'
+                                ? (c.source === 'model' || c.producer === 'DEEPSEEK_ENTITY' ? '材料分析·疑似' : '疑似同一')
+                                : '强标识等值';
                             const aliasPart = (c.aliases || []).length > 1
                                 ? ` · ${(c.aliases || []).slice(0, 3).join('/')}`
                                 : '';
@@ -4322,7 +4516,7 @@
             // 模块三：依据材料与原文片段（各类实体同一卡片：案名+页码徽标 / 引用片段 / 材料·字段·打开原文）
             const evidenceCard = Utils.create('section', { class: 'wb-detail-card wb-entity-section-card' });
             evidenceCard.appendChild(Utils.create('div', { class: 'wb-detail-card-head' }, [
-                Utils.create('div', { class: 'wb-entity-title', text: '依据材料与原文片段' })
+                Utils.create('div', { class: 'wb-entity-title', text: '依据材料与原文' })
             ]));
             const evidenceBody = Utils.create('div', { class: 'wb-detail-card-body wb-evidence-list' });
             const evidenceList = this._collectEntityEvidence(selected);
@@ -4332,7 +4526,7 @@
                 const badgeText = linkable
                     ? [
                         ev.page_start ? `第 ${ev.page_start} 页` : '已定位',
-                        ev.ocr_confidence != null ? `OCR ${Math.round(ev.ocr_confidence * 100)}%` : ''
+                        ev.ocr_confidence != null ? `识别 ${Math.round(ev.ocr_confidence * 100)}%` : ''
                     ].filter(Boolean).join(' · ')
                     : '引用失效';
                 const fieldPart = ev.field_label ? `字段·${ev.field_label}` : '';
@@ -4601,13 +4795,13 @@
             detailBody.appendChild(openEv);
 
             const clueState = this._clueState(p);
-            const decided = !!(p.disposition || clueState.confirmed);
+            const decided = !!p.disposition;
             const revising = decided && this.leadReviseId === selected.artifact.id;
-            const review = Utils.create('div', { class: 'wb-entity-review', style: 'margin-top:12px' });
+                const review = Utils.create('div', { class: 'wb-entity-review', style: 'margin-top:12px' });
             if (decided && !revising) {
                 review.appendChild(Utils.create('div', {
                     class: 'wb-file-meta',
-                    text: `已处置：${clueState.label} · ${p.disposition_reason || (clueState.confirmed ? '经实体复核确认同一后自动确认关联' : '')}`
+                    text: `已处置：${clueState.label}${p.disposition_reason ? ` · ${p.disposition_reason}` : ''}`
                 }));
                 const actions = Utils.create('div', { class: 'wb-entity-actions', style: 'justify-content:flex-start' });
                 const revise = this._iconBtn('wb-btn wb-btn-outline', 'pencil', '修改');
@@ -4916,7 +5110,7 @@
             const cardHead = Utils.create('div', { class: 'ref-tl-card-head' });
             cardHead.appendChild(Utils.create('div', {}, [
                 Utils.create('h2', { text: '主体视角' }),
-                Utils.create('p', { text: '默认人物；可切换账户查看收付与相关记载' })
+                Utils.create('p', { text: '默认人物。人尚未视为同一或已保留独立时，可切到账户查看两案资金记载。' })
             ]));
             const select = Utils.create('select');
             select.appendChild(Utils.create('option', { value: 'all|all', text: '全部主体' }));
@@ -5517,9 +5711,9 @@
                     });
                     pushEdge({
                         id: `appear:${nid}:case:${row.caseId}`,
-                        from: nid,
+                                from: nid,
                         to: `case:${row.caseId}`,
-                        label: '出现于',
+                                label: '出现于',
                         source: '时间线事件',
                         status: status === 'inferred' ? 'inferred' : 'recorded',
                         strength: status === 'inferred' ? 'weak' : 'solid',
@@ -6848,12 +7042,13 @@
             draftBtn.addEventListener('click', () => this._askAssistantToWriteReport(draftBtn));
             root.appendChild(this._pageHead(
                 '报告与审计',
-                '每次撰写生成一版核验单，互不覆盖。下载只给该行加上次数标签。',
+                '点左侧一版即可预览公文排版；下载为同一版式的 docx。每写一版占一行，互不覆盖。',
                 draftBtn,
                 reportArts.length ? `${reportArts.length} 份报告` : '尚未撰写'
             ));
 
-            const grid = Utils.create('div', { class: 'wb-report-grid' });
+            const layout = Utils.create('div', { class: 'wb-report-layout' });
+            const side = Utils.create('div', { class: 'wb-report-layout-side' });
 
             const reportCard = Utils.create('div', { class: 'wb-panel-card' });
             reportCard.appendChild(Utils.create('div', { class: 'wb-panel-card-head' }, [
@@ -6867,12 +7062,37 @@
             ]));
             const reportBody = Utils.create('div', { class: 'wb-panel-card-body' });
             let validReportCount = 0;
+            const previewCard = Utils.create('div', { class: 'wb-panel-card wb-report-preview-card' });
+            previewCard.appendChild(Utils.create('div', { class: 'wb-panel-card-head' }, [
+                Utils.create('div', {}, [
+                    Utils.create('div', { class: 'wb-entity-title', text: '版式预览' }),
+                    Utils.create('div', {
+                        class: 'wb-file-meta',
+                        text: 'A4 · 标题黑体 · 正文仿宋三号 · 首行缩进两字 · 页边距按公文'
+                    })
+                ])
+            ]));
+            const stage = Utils.create('div', { class: 'wb-doc-stage' });
+            const sheet = Utils.create('article', { class: 'wb-doc-sheet' });
+            stage.appendChild(sheet);
+            previewCard.appendChild(stage);
+
+            const showPreview = (art) => {
+                this._fillOfficialDocSheet(sheet, art && (art.markdown || art.text));
+            };
+
             if (!reportArts.length) {
                 reportBody.appendChild(Utils.create('div', {
                     class: 'wb-file-meta',
                     text: '尚未撰写。完成实体复核与线索整理后，点右上「新建报告」；每生成一次占一行。'
                 }));
+                this._fillOfficialDocSheet(sheet, '');
             } else {
+                const rows = [];
+                const selectRow = (art, row) => {
+                    rows.forEach((el) => el.classList.toggle('is-active', el === row));
+                    showPreview(art);
+                };
                 for (const art of reportArts) {
                     const valid = art.valid !== false;
                     if (valid) validReportCount += 1;
@@ -6891,13 +7111,13 @@
                     const row = Utils.create('div', { class: 'wb-report-row' }, [
                         Utils.create('div', { class: 'wb-report-row-main' }, [
                             ico,
-                            Utils.create('div', {}, [
-                                Utils.create('div', {
+                        Utils.create('div', {}, [
+                            Utils.create('div', {
                                     class: 'wb-list-item-title',
                                     text: art.title || `跨案关联线索核验单 · v${seq}`
                                 }),
-                                Utils.create('div', {
-                                    class: 'wb-file-meta',
+                            Utils.create('div', {
+                                class: 'wb-file-meta',
                                     text: [
                                         art.clue_count != null ? `线索 ${art.clue_count} 条` : '',
                                         when ? `生成于 ${when}` : '',
@@ -6910,7 +7130,8 @@
                     ]);
                     const dl = this._iconBtn('wb-btn wb-btn-outline', 'download', '下载');
                     if (!valid) dl.disabled = true;
-                    dl.addEventListener('click', async () => {
+                    dl.addEventListener('click', async (ev) => {
+                        ev.stopPropagation();
                         dl.disabled = true;
                         try {
                             await this._downloadReport(art.artifact_id, art.version);
@@ -6919,11 +7140,14 @@
                         }
                     });
                     row.appendChild(dl);
+                    row.addEventListener('click', () => selectRow(art, row));
+                    rows.push(row);
                     reportBody.appendChild(row);
                 }
+                selectRow(reportArts[0], rows[0]);
             }
             reportCard.appendChild(reportBody);
-            grid.appendChild(reportCard);
+            side.appendChild(reportCard);
 
             const summaryCard = Utils.create('div', { class: 'wb-panel-card' });
             summaryCard.appendChild(Utils.create('div', { class: 'wb-panel-card-head' }, [
@@ -6964,8 +7188,10 @@
                 style: 'margin-top:12px'
             }));
             summaryCard.appendChild(sumBody);
-            grid.appendChild(summaryCard);
-            root.appendChild(grid);
+            side.appendChild(summaryCard);
+            layout.appendChild(side);
+            layout.appendChild(previewCard);
+            root.appendChild(layout);
 
             const auditCard = Utils.create('div', { class: 'wb-panel-card', style: 'margin-top:14px' });
             auditCard.appendChild(Utils.create('div', { class: 'wb-panel-card-head' }, [
@@ -7003,6 +7229,27 @@
             wrap.appendChild(table);
             auditCard.appendChild(wrap);
             root.appendChild(auditCard);
+        },
+
+        _fillOfficialDocSheet(sheet, markdown) {
+            const text = String(markdown || '').trim();
+            if (!text) {
+                sheet.innerHTML = '';
+                sheet.appendChild(Utils.create('p', {
+                    class: 'wb-doc-empty',
+                    text: '点左侧一版查看排版。尚未撰写时，完成实体复核与线索后点「新建报告」。'
+                }));
+                return;
+            }
+            if (window.Markdown && typeof Markdown.parse === 'function') {
+                sheet.innerHTML = Markdown.parse(text);
+            } else {
+                sheet.innerHTML = '';
+                String(markdown).split('\n').forEach((line) => {
+                    const t = line.trim();
+                    if (t) sheet.appendChild(Utils.create('p', { text: t }));
+                });
+            }
         },
 
         async _askAssistantToWriteReport(button) {

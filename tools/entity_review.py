@@ -1491,3 +1491,113 @@ def propose_entity_review(
         return _tool_json({"ok": True, **result})
     except TaskError as exc:
         return _tool_json(exc.to_dict())
+
+
+def compare_material_images(
+    task_id: str,
+    filenames: list[str] | None = None,
+    user_id: str | None = None,
+) -> str:
+    """对照两份图片材料的可见画面，只给外观是否相近的提示，不认定同一人。"""
+    from pathlib import Path
+
+    from app.config import API_KEY, BASE_URL, DEEPSEEK_EXTERNAL_CALLS_ENABLED, MODEL_NAME
+    from app.files import _prepare_vision_image, _row, db_session
+
+    names = [str(x).strip() for x in (filenames or []) if str(x).strip()]
+    if len(names) < 2:
+        return _tool_json({"ok": False, "message": "请至少指定两份材料文件名，用于对照页面图像"})
+    if not DEEPSEEK_EXTERNAL_CALLS_ENABLED or not API_KEY:
+        return _tool_json(
+            {"ok": False, "message": "未启用图像对照，请根据文字记载判断，不得把外观写成已确认同一"}
+        )
+
+    service = get_task_service()
+    task = service.get_task(task_id)
+    case_ids = [c["case_id"] for c in (task.get("cases") or [])]
+    if not case_ids:
+        return _tool_json({"ok": False, "message": "任务尚未绑定案件"})
+
+    placeholders = ",".join("?" for _ in case_ids)
+    images: list[tuple[str, bytes]] = []
+    with db_session() as conn:
+        for name in names[:4]:
+            row = _row(
+                conn,
+                f"""
+                SELECT d.filename, dv.storage_path
+                FROM documents d
+                JOIN document_versions dv ON dv.id = d.current_version_id
+                WHERE d.case_id IN ({placeholders})
+                  AND (d.deleted_at IS NULL OR d.deleted_at = '')
+                  AND d.filename LIKE ?
+                ORDER BY d.created_at DESC
+                LIMIT 1
+                """,
+                tuple(case_ids) + (f"%{Path(name).name}%",),
+            )
+            if not row:
+                continue
+            path = Path(row["storage_path"] or "")
+            if path.suffix.lower() not in {".png", ".jpg", ".jpeg"} or not path.is_file():
+                continue
+            images.append((row["filename"], path.read_bytes()))
+    if len(images) < 2:
+        return _tool_json(
+            {
+                "ok": False,
+                "message": "未找到两份可对照的图片材料。请使用材料中心的图片文件名。",
+            }
+        )
+
+    import base64
+
+    from openai import OpenAI
+
+    content: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": (
+                "你只比较这些证件/材料图片中人像区域的可见外观是否相近，以及可见文字是否显示不同证件号。\n"
+                "禁止输出「就是同一人」「已经认定同一」。不确定就说看不清。\n"
+                "只输出 JSON：appearance（相近/不同/看不清），id_numbers_look_different（是/否/看不清），notes（中文，≤80字）。"
+            ),
+        }
+    ]
+    for filename, raw in images:
+        payload, mime = _prepare_vision_image(raw)
+        content.append({"type": "text", "text": f"材料：{filename}"})
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{mime};base64,{base64.b64encode(payload).decode('ascii')}",
+                    "detail": "low",
+                },
+            }
+        )
+    try:
+        client = OpenAI(api_key=API_KEY, base_url=BASE_URL, timeout=90.0)
+        resp = client.chat.completions.create(
+            model=MODEL_NAME or "deepseek-flash",
+            messages=[{"role": "user", "content": content}],
+            temperature=0,
+            max_tokens=400,
+            response_format={"type": "json_object"},
+            extra_body={"thinking": {"type": "disabled"}},
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        parsed = json.loads(text) if text.startswith("{") else {"notes": text}
+    except Exception as exc:
+        return _tool_json({"ok": False, "message": f"图像对照未能完成：{exc}"})
+
+    return _tool_json(
+        {
+            "ok": True,
+            "files": [name for name, _ in images],
+            "appearance": parsed.get("appearance") or "看不清",
+            "id_numbers_look_different": parsed.get("id_numbers_look_different") or "看不清",
+            "notes": str(parsed.get("notes") or "")[:120],
+            "boundary": "仅外观提示，不得写成已确认同一人；若需人工判断，请写入实体待核。",
+        }
+    )

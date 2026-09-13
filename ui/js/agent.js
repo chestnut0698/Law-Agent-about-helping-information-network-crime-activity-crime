@@ -1,7 +1,7 @@
 /* ========================================
    agent.js — 真实后端耦合版
    计划 → 分步（思考+执行默认折叠）→ 展开回复 → 页面跳转
-   实体复核停等：定时检测，全部确认后自动续跑
+   实体复核 / 线索核验停等：定时检测，全部确认后自动续跑
    ======================================== */
 (function (global) {
     'use strict';
@@ -11,19 +11,27 @@
         list_case_materials: 0,
         get_material_status: 0,
         refresh_task_materials: 0,
-        confirm_task_plan: 1,
-        run_task_collision: 2,
+        confirm_task_plan: 0,
+        run_task_collision: 1,
+        put_task_entity_candidate: 1,
+        compare_material_images: 1,
         run_task_timeline: 3,
         list_association_hints: 4,
         write_ai_clues: 4,
         put_task_clue: 4,
         list_task_clues: 4,
         read_artifact: 4,
-        read_material_chunk: 4
+        read_material_chunk: 4,
+        write_report: 5,
+        read_report: 5
     };
+    const PLAN_ENTITY_REVIEW_INDEX = 2;
+    const PLAN_CLUE_REVIEW_INDEX = 5;
 
     const JUMP_BY_TOOL = {
         run_task_collision: { view: 'entities', label: '去实体复核' },
+        put_task_entity_candidate: { view: 'entities', label: '去实体复核' },
+        compare_material_images: { view: 'entities', label: '去实体复核' },
         put_task_clue: { view: 'leads', label: '去线索中心' },
         write_ai_clues: { view: 'leads', label: '去线索中心' },
         delete_task_clue: { view: 'leads', label: '去线索中心' },
@@ -54,11 +62,18 @@
         read_report: 1
     };
 
-    const CONTINUE_PROMPT = [
+    const CONTINUE_AFTER_ENTITY = [
         '【系统续跑】实体复核已全部确认完毕。请继续下一步分析：',
         '若事件时间线尚未整理则先整理时间线，再形成可回原文核验的疑似关联线索。',
+        '线索写完后必须停步，请用户到中间工作区线索中心逐条核验；全部处置完成前不要撰写报告。',
         '不要重复跨案标识比对。用办案口吻说明结果在哪一页查看。',
         '禁止定罪、并案或量刑结论。'
+    ].join('');
+
+    const CONTINUE_AFTER_CLUES = [
+        '【系统续跑】关联线索已全部核验完毕。请继续撰写《跨案关联线索核验单》。',
+        '先读取报告素材，再提交正文。不要重复跨案标识比对，也不要重写已处置的线索。',
+        '用办案口吻说明核验单在哪一页查看。禁止定罪、并案或量刑结论。'
     ].join('');
 
     const Agent = {
@@ -83,6 +98,7 @@
                 add(JUMP_BY_TOOL[name]);
             });
             if (extra && extra.entityReview) add({ view: 'entities', label: '去实体复核' });
+            if (extra && extra.clueReview) add({ view: 'leads', label: '去线索中心' });
             const text = String(replyText || '');
             TEXT_JUMPS.forEach((item) => {
                 if (item.re.test(text)) add(item);
@@ -145,6 +161,7 @@
             const turnTools = [];
             let turnText = '';
             let entityReviewGate = false;
+            let clueReviewGate = false;
 
             const closeStreak = () => {
                 if (sameCard && (sameCard._current || 1) > 1 && !(sameCard._total > 1)) {
@@ -190,15 +207,25 @@
             };
 
             const maybeStartWait = () => {
-                if (!entityReviewGate) return;
-                this._readEntityUnconfirmed(taskId).then((state) => {
-                    if (state.waiting) this.startReviewWait(taskId);
-                }).catch(() => {});
+                const startClue = () => this._readClueUndisposed(taskId).then((state) => {
+                    if (state.waiting) this.startReviewWait(taskId, 'CLUE_REVIEW');
+                });
+                if (entityReviewGate) {
+                    this._readEntityUnconfirmed(taskId).then((state) => {
+                        if (state.waiting) this.startReviewWait(taskId, 'ENTITY_REVIEW');
+                        else if (clueReviewGate) return startClue();
+                    }).catch(() => {});
+                    return;
+                }
+                if (clueReviewGate) startClue().catch(() => {});
             };
 
             const finishReplyChrome = () => {
                 if (assistantWrap) {
-                    const jumps = this.collectJumps(turnTools, turnText, { entityReview: entityReviewGate });
+                    const jumps = this.collectJumps(turnTools, turnText, {
+                        entityReview: entityReviewGate,
+                        clueReview: clueReviewGate
+                    });
                     Message.attachJumps(assistantWrap, jumps);
                 }
                 maybeStartWait();
@@ -241,11 +268,11 @@
                             case 'plan': {
                                 const planData = event.plan;
                                 currentPlan = Plan.create({
-                                    title: planData.title || '分析计划',
+                                    title: planData.title || '执行计划',
                                     steps: (planData.steps || []).map((s, i) => ({
                                         title: s.title,
                                         description: s.description,
-                                        status: i === 0 ? 'running' : 'pending'
+                                        status: s.status || (i === 0 ? 'running' : 'pending')
                                     }))
                                 });
                                 chatMessages.appendChild(currentPlan);
@@ -334,6 +361,19 @@
                                     || (payload.pending_entity_reviews != null && Number(payload.pending_entity_reviews) > 0)
                                 )) {
                                     entityReviewGate = true;
+                                    if (currentPlan && window.Plan) {
+                                        Plan.setRunning(currentPlan, PLAN_ENTITY_REVIEW_INDEX);
+                                    }
+                                }
+                                if (payload && (
+                                    payload.analysis_gate === 'CLUE_REVIEW'
+                                    || payload.blocked_by_gate === 'CLUE_REVIEW'
+                                    || (payload.pending_clue_reviews != null && Number(payload.pending_clue_reviews) > 0)
+                                )) {
+                                    clueReviewGate = true;
+                                    if (currentPlan && window.Plan) {
+                                        Plan.setRunning(currentPlan, PLAN_CLUE_REVIEW_INDEX);
+                                    }
                                 }
                                 if (sameCard) {
                                     const ok = tool.status !== 'error';
@@ -376,14 +416,33 @@
                                 finishCurrent();
                                 if (currentPlan) {
                                     const steps = currentPlan.querySelectorAll('.plan-step');
-                                    steps.forEach((step, i) => {
-                                        if (!step.classList.contains('completed')) {
-                                            Plan.updateStep(currentPlan, i, 'completed');
-                                        }
-                                    });
+                                    if (entityReviewGate && window.Plan) {
+                                        steps.forEach((step, i) => {
+                                            if (i < PLAN_ENTITY_REVIEW_INDEX) {
+                                                Plan.updateStep(currentPlan, i, 'completed');
+                                            }
+                                        });
+                                        Plan.updateStep(currentPlan, PLAN_ENTITY_REVIEW_INDEX, 'running');
+                                    } else if (clueReviewGate && window.Plan) {
+                                        steps.forEach((step, i) => {
+                                            if (i < PLAN_CLUE_REVIEW_INDEX) {
+                                                Plan.updateStep(currentPlan, i, 'completed');
+                                            }
+                                        });
+                                        Plan.updateStep(currentPlan, PLAN_CLUE_REVIEW_INDEX, 'running');
+                                    } else {
+                                        steps.forEach((step, i) => {
+                                            if (!step.classList.contains('completed')) {
+                                                Plan.updateStep(currentPlan, i, 'completed');
+                                            }
+                                        });
+                                    }
                                 }
                                 if (!entityReviewGate && /实体复核|视为同一|保留独立/.test(turnText)) {
                                     entityReviewGate = true;
+                                }
+                                if (!clueReviewGate && /线索中心|确认关联|待核线索/.test(turnText)) {
+                                    clueReviewGate = true;
                                 }
                                 finishReplyChrome();
                                 if (global.Workbench && typeof global.Workbench.refreshTask === 'function') {
@@ -410,7 +469,10 @@
                     }
                 }
                 if (assistantWrap && !Utils.$('.agent-jump-row', assistantWrap)) {
-                    const jumps = this.collectJumps(turnTools, turnText, { entityReview: entityReviewGate });
+                    const jumps = this.collectJumps(turnTools, turnText, {
+                        entityReview: entityReviewGate,
+                        clueReview: clueReviewGate
+                    });
                     Message.attachJumps(assistantWrap, jumps);
                 }
             } catch (err) {
@@ -430,32 +492,65 @@
             return `lz-agent-wait:${taskId}`;
         },
 
-        _hasWaitFlag(taskId) {
+        _readWaitFlag(taskId) {
             try {
-                return !!sessionStorage.getItem(this._waitKey(taskId));
+                const raw = sessionStorage.getItem(this._waitKey(taskId));
+                if (!raw) return null;
+                const parsed = JSON.parse(raw);
+                if (parsed && parsed.kind) return parsed;
+                return { kind: 'ENTITY_REVIEW' };
             } catch (_) {
-                return false;
+                return null;
             }
         },
 
-        _setWaitFlag(taskId, on) {
+        _hasWaitFlag(taskId) {
+            return !!this._readWaitFlag(taskId);
+        },
+
+        _setWaitFlag(taskId, on, kind) {
             try {
-                if (on) sessionStorage.setItem(this._waitKey(taskId), JSON.stringify({ kind: 'ENTITY_REVIEW' }));
-                else sessionStorage.removeItem(this._waitKey(taskId));
+                if (on) {
+                    sessionStorage.setItem(
+                        this._waitKey(taskId),
+                        JSON.stringify({ kind: kind || 'ENTITY_REVIEW' })
+                    );
+                } else {
+                    sessionStorage.removeItem(this._waitKey(taskId));
+                }
             } catch (_) { /* ignore */ }
         },
 
-        startReviewWait(taskId) {
+        _waitCopy(kind) {
+            if (kind === 'CLUE_REVIEW') {
+                return {
+                    idle: '正在等待您完成线索核验。全部处置后将自动继续撰写核验单。',
+                    remain: (n) => `正在等待您完成线索核验（尚余 ${n} 条）。全部处置后将自动继续。`,
+                    done: '线索已全部核验，即将继续撰写核验单…',
+                    note: '线索已全部核验，助手继续撰写核验单…'
+                };
+            }
+            return {
+                idle: '正在等待您完成实体复核。全部确认后将自动继续。',
+                remain: (n) => `正在等待您完成实体复核（尚余 ${n} 条）。全部确认后将自动继续。`,
+                done: '实体复核已全部确认，即将继续分析…',
+                note: '实体复核已全部确认，助手继续分析…'
+            };
+        },
+
+        startReviewWait(taskId, kind) {
+            const waitKind = kind || 'ENTITY_REVIEW';
             if (!taskId) return;
-            if (this._wait && this._wait.taskId === taskId && this._wait.timer) {
-                this._setWaitFlag(taskId, true);
+            if (this._wait && this._wait.taskId === taskId && this._wait.timer && this._wait.kind === waitKind) {
+                this._setWaitFlag(taskId, true, waitKind);
                 return;
             }
             this.stopReviewWait({ silent: true });
-            this._setWaitFlag(taskId, true);
+            this._setWaitFlag(taskId, true, waitKind);
+            const copy = this._waitCopy(waitKind);
             const chatMessages = Utils.$('#chat-messages');
             const el = Utils.create('div', { class: 'agent-wait-line' });
-            const text = Utils.create('span', { class: 'agent-wait-text', text: '正在等待您完成实体复核。全部确认后将自动继续。' });
+            const text = Utils.create('span', { class: 'agent-wait-text', text: copy.idle });
             const cancel = Utils.create('button', { type: 'button', class: 'agent-wait-cancel', text: '取消自动继续' });
             cancel.addEventListener('click', () => this.stopReviewWait());
             el.appendChild(text);
@@ -464,7 +559,7 @@
                 chatMessages.appendChild(el);
                 chatMessages.scrollTop = chatMessages.scrollHeight;
             }
-            this._wait = { taskId, kind: 'ENTITY_REVIEW', el, text, timer: null, continuing: false };
+            this._wait = { taskId, kind: waitKind, el, text, timer: null, continuing: false };
             this._pollReviewWait();
             this._wait.timer = setInterval(() => this._pollReviewWait(), 4000);
         },
@@ -486,7 +581,8 @@
         },
 
         notifyReviewState(info) {
-            if (!this._wait || this._wait.kind !== 'ENTITY_REVIEW') return;
+            const kind = (info && info.kind) || 'ENTITY_REVIEW';
+            if (!this._wait || this._wait.kind !== kind) return;
             const pending = Number((info && info.pending) != null ? info.pending : -1);
             if (pending >= 0) this._updateWaitLine(pending);
             if (pending === 0) this._continueAfterReview();
@@ -496,21 +592,49 @@
             const taskId = task && task.id;
             if (!taskId) return;
             this.stopReviewWait({ silent: true, keepFlag: true });
-            const already = this._historyAlreadyContinued(historyRows);
-            if (already) {
-                this._setWaitFlag(taskId, false);
-                return;
-            }
-            const state = await this._readEntityUnconfirmed(taskId);
-            const asks = this._historyAsksEntityReview(historyRows);
-            const flagged = this._hasWaitFlag(taskId);
-            if (state.waiting && (asks || flagged)) {
-                this.startReviewWait(taskId);
-                this._updateWaitLine(state.pending);
-                return;
-            }
-            if (flagged && !state.waiting) {
+            const flag = this._readWaitFlag(taskId);
+            const entityContinued = this._historyHasContinue(historyRows, 'ENTITY_REVIEW');
+            const clueContinued = this._historyHasContinue(historyRows, 'CLUE_REVIEW');
+            const entityState = await this._readEntityUnconfirmed(taskId);
+            const clueState = await this._readClueUndisposed(taskId);
+            const asksEntity = this._historyAsksEntityReview(historyRows);
+            const asksClue = this._historyAsksClueReview(historyRows);
+
+            if (flag && flag.kind === 'ENTITY_REVIEW') {
+                if (entityContinued) {
+                    this._setWaitFlag(taskId, false);
+                } else if (entityState.waiting) {
+                    this.startReviewWait(taskId, 'ENTITY_REVIEW');
+                    this._updateWaitLine(entityState.pending);
+                    return;
+                } else {
+                    this._wait = { taskId, kind: 'ENTITY_REVIEW', el: null, text: null, timer: null, continuing: false };
+                    this._continueAfterReview();
+                    return;
+                }
+            } else if (flag && flag.kind === 'CLUE_REVIEW') {
+                if (clueContinued) {
+                    this._setWaitFlag(taskId, false);
+                    return;
+                }
+                if (clueState.waiting) {
+                    this.startReviewWait(taskId, 'CLUE_REVIEW');
+                    this._updateWaitLine(clueState.pending);
+                    return;
+                }
+                this._wait = { taskId, kind: 'CLUE_REVIEW', el: null, text: null, timer: null, continuing: false };
                 this._continueAfterReview();
+                return;
+            }
+
+            if (entityState.waiting && asksEntity && !entityContinued) {
+                this.startReviewWait(taskId, 'ENTITY_REVIEW');
+                this._updateWaitLine(entityState.pending);
+                return;
+            }
+            if (clueState.waiting && asksClue && !clueContinued) {
+                this.startReviewWait(taskId, 'CLUE_REVIEW');
+                this._updateWaitLine(clueState.pending);
             }
         },
 
@@ -527,12 +651,28 @@
             return false;
         },
 
-        _historyAlreadyContinued(rows) {
+        _historyAsksClueReview(rows) {
             if (!Array.isArray(rows)) return false;
             for (let i = rows.length - 1; i >= 0; i -= 1) {
                 const row = rows[i];
+                if (!row || row.role !== 'assistant') continue;
+                if (Array.isArray(row.tool_calls) && row.tool_calls.length) continue;
+                const text = String(row.content || '');
+                if (!text.trim()) continue;
+                return /线索中心|待核线索|确认关联|排除或待补/.test(text);
+            }
+            return false;
+        },
+
+        _historyHasContinue(rows, kind) {
+            if (!Array.isArray(rows)) return false;
+            const prefix = kind === 'CLUE_REVIEW'
+                ? '【系统续跑】关联线索已全部核验'
+                : '【系统续跑】实体复核已全部确认';
+            for (let i = rows.length - 1; i >= 0; i -= 1) {
+                const row = rows[i];
                 if (!row) continue;
-                if (row.role === 'user' && String(row.content || '').startsWith('【系统续跑】')) {
+                if (row.role === 'user' && String(row.content || '').startsWith(prefix)) {
                     return rows.slice(i + 1).some((item) => item.role === 'assistant' && String(item.content || '').trim());
                 }
             }
@@ -572,6 +712,32 @@
             }
         },
 
+        async _readClueUndisposed(taskId) {
+            const id = taskId || (global.Workbench && global.Workbench.task && global.Workbench.task.id);
+            if (!id) return { waiting: false, pending: 0 };
+            try {
+                const resp = await fetch(`/api/tasks/${id}`);
+                const task = await resp.json();
+                if (!task || task.error_code) return { waiting: false, pending: 0 };
+                const art = (task.artifacts || []).find((item) =>
+                    item.type === 'CLUE_SET' && item.status !== 'INVALID' && item.status !== 'STALE'
+                );
+                if (!art) return { waiting: false, pending: 0 };
+                const detail = await fetch(`/api/tasks/${id}/artifacts/${art.id}`);
+                const data = await detail.json();
+                const payload = data && data.payload;
+                const summary = (payload && payload.summary) || {};
+                const total = Number(summary.total || ((payload && payload.items) || []).length || 0);
+                if (!Object.prototype.hasOwnProperty.call(summary, 'pending')) {
+                    return { waiting: total > 0, pending: total > 0 ? -1 : 0 };
+                }
+                const pending = Number(summary.pending || 0);
+                return { waiting: total > 0 && pending > 0, pending };
+            } catch (_) {
+                return { waiting: false, pending: 0 };
+            }
+        },
+
         _countUnconfirmed(payload) {
             const candidates = (payload && payload.candidates) || [];
             if (candidates.length) {
@@ -585,18 +751,20 @@
 
         _updateWaitLine(pending) {
             if (!this._wait || !this._wait.text) return;
+            const copy = this._waitCopy(this._wait.kind);
             if (pending == null || pending < 0) {
-                this._wait.text.textContent = '正在等待您完成实体复核。全部确认后将自动继续。';
+                this._wait.text.textContent = copy.idle;
                 return;
             }
-            this._wait.text.textContent = pending > 0
-                ? `正在等待您完成实体复核（尚余 ${pending} 条）。全部确认后将自动继续。`
-                : '实体复核已全部确认，即将继续分析…';
+            this._wait.text.textContent = pending > 0 ? copy.remain(pending) : copy.done;
         },
 
         async _pollReviewWait() {
             if (!this._wait || this._busy) return;
-            const state = await this._readEntityUnconfirmed(this._wait.taskId);
+            const kind = this._wait.kind;
+            const state = kind === 'CLUE_REVIEW'
+                ? await this._readClueUndisposed(this._wait.taskId)
+                : await this._readEntityUnconfirmed(this._wait.taskId);
             this._updateWaitLine(state.pending);
             if (!state.waiting) this._continueAfterReview();
         },
@@ -604,13 +772,16 @@
         async _continueAfterReview() {
             if (!this._wait || this._wait.continuing || this._busy) return;
             const taskId = this._wait.taskId;
+            const kind = this._wait.kind || 'ENTITY_REVIEW';
+            const copy = this._waitCopy(kind);
             this._wait.continuing = true;
             this.stopReviewWait({ silent: true });
             this._setWaitFlag(taskId, false);
+            const prompt = kind === 'CLUE_REVIEW' ? CONTINUE_AFTER_CLUES : CONTINUE_AFTER_ENTITY;
             try {
-                await this.process(CONTINUE_PROMPT, {
+                await this.process(prompt, {
                     silent: true,
-                    note: '实体复核已全部确认，助手继续分析…'
+                    note: copy.note
                 });
             } catch (err) {
                 console.error('Agent auto-continue error:', err);

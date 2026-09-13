@@ -255,6 +255,15 @@
     margin-bottom: 8px;
 }
 
+.message-content ul,
+.message-content ol {
+    margin: 8px 0 12px;
+    padding-left: 1.75em;
+}
+.message-content ul { list-style-type: disc; }
+.message-content ol { list-style-type: decimal; }
+.message-content li { margin-bottom: 6px; display: list-item; }
+
 .message-content p:last-child {
     margin-bottom: 0;
 }

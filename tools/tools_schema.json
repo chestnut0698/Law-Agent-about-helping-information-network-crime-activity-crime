@@ -302,11 +302,88 @@
     "type": "function",
     "function": {
       "name": "run_task_collision",
-      "description": "对任务范围内已解析材料执行强标识确定性碰撞，生成实体候选产物（ENTITY_CANDIDATE_SET）。",
+      "description": "对任务范围内已解析材料执行卡号/手机号等强标识等值碰撞，生成实体待核清单。完成后请根据材料补写疑似同一对象（不同称呼共用证卡号、外号、商户名、证件人像），再请用户到实体复核确认；确认前不要写线索。",
       "parameters": {
         "type": "object",
         "properties": {},
         "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "put_task_entity_candidate",
+      "description": "把一条「是否同一对象」的疑似待核写入实体复核（不代替人工点视为同一/保留独立）。用于系统等值碰撞未列出的情形：不同称呼共用证/卡/号、外号代称、商户名、证件人像、有编号物品。摘录必须从查阅材料返回的正文逐字抄写。对用户称「写入待核对象」。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "candidate": {
+            "type": "object",
+            "description": "待核对象",
+            "properties": {
+              "entity_type": {
+                "type": "string",
+                "description": "PERSON/BANK_ACCOUNT/PHONE/ID_CARD/DEVICE/ORGANIZATION/MERCHANT/IP，或中文：人物/账户/手机/证件/设备/组织/商户"
+              },
+              "display_name": {
+                "type": "string",
+                "description": "待核问题或显示名，≤80字"
+              },
+              "question": {
+                "type": "string",
+                "description": "请核验…是否同一对象"
+              },
+              "aliases": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "涉及的称呼/化名"
+              },
+              "match_basis": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "材料上看到的依据，不是法律结论"
+              },
+              "records": {
+                "type": "array",
+                "description": "至少两条可回原文支持材料",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "case_name": {"type": "string"},
+                    "chunk_id": {"type": "string"},
+                    "document_version_id": {"type": "string"},
+                    "quote": {"type": "string"},
+                    "filename": {"type": "string"},
+                    "page_start": {"type": "integer"},
+                    "surface": {"type": "string"}
+                  },
+                  "required": ["case_name", "chunk_id", "document_version_id", "quote"]
+                }
+              }
+            },
+            "required": ["entity_type", "display_name", "records"]
+          }
+        },
+        "required": ["candidate"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "compare_material_images",
+      "description": "对照两份图片材料中证件人像等可见外观是否相近、可见证件号是否不同。只返回外观提示，不得写成已确认同一人。对用户称「对照证件页面」。之后如需人工判断，再写入实体待核。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "filenames": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "至少两个材料文件名（材料中心列出的图片文件）"
+          }
+        },
+        "required": ["filenames"]
       }
     }
   },
@@ -326,7 +403,7 @@
     "type": "function",
     "function": {
       "name": "list_task_clues",
-      "description": "查看当前存活待核线索清单（含序号与核验维度）。整理或调整线索前先调用以了解现状；本工具不修改任何数据。返回每条线索的 state（中文确认状态）与 confirmed（是否已确认）：confirmed=true 表示该线索已由人工确认关联——可能是人工在线索中心处置，也可能是实体复核确认同一后系统升格；已确认的线索不得再覆盖或删除，撰写报告时应作为已确认关联陈述。confirmed=false 且 state=待确认 的才是真正待人工核验的线索。",
+      "description": "查看当前存活待核线索清单（含序号与核验维度）。整理或调整线索前先调用以了解现状；本工具不修改任何数据。返回每条线索的 state（中文确认状态）与 confirmed（是否已在线索中心确认关联）。已由人工处置的线索不得再覆盖或删除。尚有待核验线索时不要撰写报告，应停步请用户到线索中心处置。",
       "parameters": {
         "type": "object",
         "properties": {},
@@ -450,7 +527,7 @@
     "type": "function",
     "function": {
       "name": "list_association_hints",
-      "description": "列出系统规则给出的关联提示（账户/电话/设备、外号跨案、外号与代称、某一案共同参与人等），仅供整理线索参考，不会写入线索中心。对用户说明时称「关联提示」，不要念本工具英文名。正式线索请写入线索中心。外号上线与仅某一案出现的共同参与人应单独写成待核线索。",
+      "description": "列出系统规则给出的关联提示（账户/电话/设备、外号跨案、弱平台共现等），仅供整理参考。外号、不同称呼共用证卡号、商户名、证件人像应先写入实体待核；资金/时空/同物不同名义再写入线索。对用户称「关联提示」。",
       "parameters": {
         "type": "object",
         "properties": {},
@@ -572,7 +649,7 @@
     "type": "function",
     "function": {
       "name": "read_report",
-      "description": "撰写《跨案关联线索核验单》前先调用本工具：返回任务范围、实体复核结论（视为同一/保留独立的脱敏名单与计数）、存活线索清单（标题/核验方面/处置/来源编号与短摘录）、上一版报告正文（若有，仅供参考，本次提交会新增一版而不覆盖）以及写作规范。系统清单才是事实源，正文用「见来源N」指向即可。若返回的 blocked 不为空，表示当前还不能撰写报告，请先按提示让用户在中间工作区完成实体确认或整理线索。",
+      "description": "撰写《跨案关联线索核验单》前先调用本工具：返回任务范围、实体复核结论（视为同一/保留独立的脱敏名单与计数）、存活线索清单（标题/核验方面/处置/来源编号与短摘录）、上一版报告正文（若有，仅供参考，本次提交会新增一版而不覆盖）以及写作规范。系统清单才是事实源，正文用「见来源N」指向即可。若返回的 blocked 不为空，表示当前还不能撰写报告，请先按提示让用户完成实体确认、整理线索或在线索中心处置完毕。",
       "parameters": {
         "type": "object",
         "properties": {},

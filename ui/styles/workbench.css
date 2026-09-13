@@ -1859,6 +1859,13 @@ body,
     border-collapse: collapse;
     margin: 12px 0;
     font-size: 12px;
+    display: table;
+}
+.wb-doc-preview .md-table-wrap,
+.wb-cite-body .md-table-wrap {
+    overflow-x: auto;
+    max-width: 100%;
+    margin: 12px 0;
 }
 .wb-doc-preview.md-content th,
 .wb-doc-preview.md-content td {
@@ -2283,14 +2290,52 @@ body,
     display: flex;
     flex-direction: column;
     gap: 6px;
+    margin-top: 12px;
 }
 .wb-upload-file-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
     font-size: 12px;
     color: var(--text-secondary);
     padding: 6px 8px;
     border-radius: 6px;
     background: var(--bg-primary);
     border: 1px solid var(--border-light);
+    cursor: default;
+}
+.wb-upload-file-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.wb-upload-file-remove {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: none;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+}
+.wb-upload-file-remove:hover {
+    color: var(--text-primary);
+    background: var(--bg-hover);
+}
+.wb-upload-file-remove-ico {
+    width: 14px;
+    height: 14px;
+}
+.wb-upload-file-remove-ico .wb-ico {
+    width: 14px;
+    height: 14px;
 }
 .wb-upload-modal-foot {
     display: flex;
@@ -3560,29 +3605,37 @@ body,
     border-left-color: var(--primary);
 }
 
-.wb-report-grid {
+.wb-report-layout {
     display: grid;
-    grid-template-columns: minmax(0, 2fr) minmax(240px, 1fr);
+    grid-template-columns: minmax(260px, 320px) minmax(0, 1fr);
     gap: 14px;
     margin-bottom: 14px;
     align-items: start;
 }
-.wb-report-grid > .wb-panel-card {
-    height: auto;
-    align-self: start;
-}
-@media (max-width: 1100px) {
-    .wb-report-grid { grid-template-columns: 1fr; }
+.wb-report-layout-side {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    min-width: 0;
 }
 .wb-report-row {
     display: flex;
     justify-content: space-between;
     align-items: center;
     gap: 12px;
-    padding: 14px 0;
+    padding: 12px 10px;
+    margin: 0 -10px;
     border-bottom: 1px solid var(--border-color);
+    border-radius: 10px;
+    cursor: pointer;
 }
 .wb-report-row:last-child { border-bottom: 0; }
+.wb-report-row:hover {
+    background: color-mix(in srgb, var(--muted-foreground) 8%, transparent);
+}
+.wb-report-row.is-active {
+    background: color-mix(in srgb, var(--primary) 12%, transparent);
+}
 .wb-report-row-main {
     display: flex;
     align-items: flex-start;
@@ -3606,6 +3659,93 @@ body,
     gap: 6px;
     margin-top: 8px;
 }
+.wb-report-preview-card {
+    min-width: 0;
+}
+.wb-doc-stage {
+    background: color-mix(in srgb, var(--muted-foreground) 16%, var(--background, #ece8df));
+    border-radius: 12px;
+    padding: 18px 12px 28px;
+    overflow: auto;
+    max-height: calc(100vh - 220px);
+}
+.wb-doc-sheet {
+    width: 210mm;
+    min-height: 297mm;
+    margin: 0 auto;
+    box-sizing: border-box;
+    background: #fff;
+    color: #000;
+    padding: 37mm 26mm 35mm 28mm;
+    box-shadow: 0 10px 36px rgba(0, 0, 0, 0.16);
+    font-family: "仿宋_GB2312", "FangSong_GB2312", FangSong, STFangsong, "仿宋", serif;
+    font-size: 16pt;
+    line-height: 28pt;
+}
+.wb-doc-sheet h1,
+.wb-doc-sheet h2,
+.wb-doc-sheet h3,
+.wb-doc-sheet p,
+.wb-doc-sheet li,
+.wb-doc-sheet ul,
+.wb-doc-sheet ol,
+.wb-doc-sheet blockquote {
+    color: #000;
+    margin: 0;
+}
+.wb-doc-sheet h1 {
+    font-family: SimHei, STHeiti, "黑体", "Heiti SC", sans-serif;
+    font-size: 22pt;
+    font-weight: 700;
+    text-align: center;
+    text-indent: 0;
+    line-height: 1.5;
+    margin: 0 0 12pt;
+}
+.wb-doc-sheet h2 {
+    font-family: SimHei, STHeiti, "黑体", "Heiti SC", sans-serif;
+    font-size: 16pt;
+    font-weight: 700;
+    text-indent: 0;
+    line-height: 28pt;
+    margin: 12pt 0 6pt;
+}
+.wb-doc-sheet h3 {
+    font-family: "KaiTi_GB2312", KaiTi, STKaiti, "楷体", serif;
+    font-size: 16pt;
+    font-weight: 400;
+    text-indent: 0;
+    line-height: 28pt;
+    margin: 8pt 0 4pt;
+}
+.wb-doc-sheet p {
+    text-indent: 2em;
+    font-size: 16pt;
+    line-height: 28pt;
+}
+.wb-doc-sheet ul,
+.wb-doc-sheet ol {
+    padding-left: 2em;
+    margin: 0;
+}
+.wb-doc-sheet li {
+    text-indent: 0;
+    font-size: 16pt;
+    line-height: 28pt;
+}
+.wb-doc-sheet blockquote {
+    text-indent: 2em;
+    font-size: 16pt;
+    line-height: 28pt;
+}
+.wb-doc-sheet a { color: #000; text-decoration: underline; }
+.wb-doc-sheet strong { font-weight: 700; }
+.wb-doc-empty {
+    text-indent: 0 !important;
+    color: #666 !important;
+    text-align: center;
+    padding-top: 80pt;
+}
 .wb-report-stats {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -3627,6 +3767,10 @@ body,
     margin-top: 4px;
     font-size: 22px;
     font-weight: 650;
+}
+@media (max-width: 1100px) {
+    .wb-report-layout { grid-template-columns: 1fr; }
+    .wb-doc-stage { max-height: none; }
 }
 
 .wb-btn .wb-ico { margin-right: 2px; }

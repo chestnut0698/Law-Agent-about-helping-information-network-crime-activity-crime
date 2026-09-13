@@ -11,6 +11,51 @@ from app.tasks import get_task_service
 
 logger = logging.getLogger(__name__)
 
+_FULL_RUN_MARKERS = (
+    "请对本监督分析任务执行完整跨案分析",
+    "执行完整跨案分析",
+)
+_CONTINUE_MARK = "【系统续跑】"
+_CONTINUE_AFTER_ENTITY = "【系统续跑】实体复核已全部确认完毕。"
+_CONTINUE_AFTER_CLUES = "【系统续跑】关联线索已全部核验完毕。"
+
+
+def _execution_plan_for(user_input: str) -> dict | None:
+    """只有完整跨案分析或人工核验后续跑才铺执行计划；自由问答不套固定步骤。"""
+    if not PLANS:
+        return None
+    text = user_input or ""
+    continue_clues = text.startswith(_CONTINUE_AFTER_CLUES)
+    continue_entity = text.startswith(_CONTINUE_AFTER_ENTITY) or (
+        text.startswith(_CONTINUE_MARK) and not continue_clues
+    )
+    full_run = any(mark in text for mark in _FULL_RUN_MARKERS)
+    if not continue_clues and not continue_entity and not full_run:
+        return None
+    entity_gate = PLAN_ENTITY_REVIEW_INDEX
+    steps = []
+    for i in range(len(PLANS[0])):
+        if continue_clues:
+            status = "completed"
+        elif continue_entity:
+            status = "completed" if i < entity_gate else ("running" if i == entity_gate + 1 else "pending")
+        else:
+            status = "running" if i == 0 else "pending"
+        steps.append(
+            {
+                "title": PLANS[0][i],
+                "description": PLANS[1][i],
+                "status": status,
+            }
+        )
+    kind = "continue-clues" if continue_clues else ("continue" if continue_entity else "full")
+    return {
+        "title": "执行计划",
+        "kind": kind,
+        "steps": steps,
+    }
+
+
 # ReAct（Reason + Act）模式的核心思想——让 AI 交替进行"推理（Reason）"和"行动（Act）"，并通过观察（Observation）来驱动下一步。
 class ReactAgent(BaseAgent):
     def __init__(self, task_id=0):
@@ -74,23 +119,9 @@ class ReactAgent(BaseAgent):
         # 每条新消息回到可思考状态；本消息内一旦思维链超长会切到无思考
         self._no_think = False
 
-        plan_steps = []
-        if PLANS:
-            for i in range(len(PLANS[0])):
-                plan_steps.append(
-                    {
-                        "title": PLANS[0][i],
-                        "description": PLANS[1][i],
-                        "status": "pending",
-                    }
-                )
-        yield (
-            "plan",
-            {
-                "title": "执行计划",
-                "steps": plan_steps,
-            },
-        )
+        plan = _execution_plan_for(user_input)
+        if plan:
+            yield ("plan", plan)
         try:
             max_rounds = 16
             # 纯思考轮不要落成空 assistant，否则下一轮 DeepSeek 会因消息序列/缺

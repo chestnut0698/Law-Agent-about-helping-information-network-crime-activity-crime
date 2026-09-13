@@ -11,6 +11,7 @@ from tools.entity_review import (
     list_candidate_relations,
     validate_candidate_evidence,
     propose_entity_review,
+    compare_material_images,
 )
 
 # 会话附件兼容路径：未经卷宗脱敏门控，不得进入抽取/碰撞上下文。
@@ -32,6 +33,7 @@ tool_functions = {
     "refresh_task_materials": refresh_task_materials,
     "delete_task_material": delete_task_material,
     "run_task_collision": run_task_collision,
+    "put_task_entity_candidate": put_task_entity_candidate,
     "run_task_timeline": run_task_timeline,
     "list_association_hints": list_association_hints,
     "list_task_clues": list_task_clues,
@@ -46,4 +48,5 @@ tool_functions = {
     "list_candidate_relations": list_candidate_relations,
     "validate_candidate_evidence": validate_candidate_evidence,
     "propose_entity_review": propose_entity_review,
+    "compare_material_images": compare_material_images,
 }
