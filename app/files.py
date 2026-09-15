@@ -1303,6 +1303,115 @@ class GlobalEntityMapper:
         }
 
     # --------------------------------------------------------------
+    # 脱敏重建：一律以 text_raw 为唯一基准，取该 chunk 全部脱敏项整块重写
+    # （改映射不重跑 spaCy；未变更项沿用原占位符，只有被改的映射重算）
+    # --------------------------------------------------------------
+    _PHONE_SENS_TYPES = ("PHONE", "PHONE_NUMBER")
+
+    def _placeholder_from_mapping(
+        self, conn, cache: dict, map_ref: str, sens_type: str, original: str
+    ):
+        """按当前映射与解析期同款规则给出占位符；映射不存在返回 None（等于还原原文）。"""
+        if not map_ref:
+            return None
+        if map_ref not in cache:
+            cache[map_ref] = conn.execute(
+                "SELECT anonymous_id, sens_type FROM entity_global_map WHERE fingerprint = ?",
+                (map_ref,),
+            ).fetchone()
+        row = cache[map_ref]
+        if not row:
+            return None
+        if (
+            (sens_type or "").upper() in self._PHONE_SENS_TYPES
+            or (row["sens_type"] or "").upper() in self._PHONE_SENS_TYPES
+        ):
+            masked = mask_phone_number(original)
+            if masked and masked != original:
+                return masked
+        return row["anonymous_id"]
+
+    def _rebuild_chunk_redaction(
+        self,
+        conn,
+        chunk_id: str,
+        *,
+        extra_items: list[dict[str, Any]] | None = None,
+        drop_map_refs: set[str] | None = None,
+        recompute_refs: set[str] | None = None,
+        cache: dict | None = None,
+    ) -> bool:
+        """以 text_raw 为基准，用该 chunk 的全部脱敏项整块重建 text_redacted 与 redaction_items。
+
+        - drop_map_refs：这些映射的项不再脱敏（还原原文），用于删除映射；
+        - recompute_refs：这些映射的占位符按当前映射重算，用于更新匿名码/类型；
+        - extra_items：新增项（start_offset/end_offset/map_ref/sens_type，均为 raw 坐标）。
+        不调用任何模型；未变更的项沿用原占位符，避免改动同 chunk 其它实体。
+        """
+        chunk = conn.execute(
+            "SELECT text_raw, document_version_id FROM document_chunks WHERE id = ?",
+            (chunk_id,),
+        ).fetchone()
+        if not chunk:
+            return False
+        text_raw = chunk["text_raw"] or ""
+        if not text_raw:
+            return False
+        dv_id = chunk["document_version_id"]
+        drop = drop_map_refs or set()
+        recompute = recompute_refs or set()
+        cache = cache if cache is not None else {}
+
+        items = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT start_offset, end_offset, placeholder, map_ref, sens_type "
+                "FROM redaction_items WHERE chunk_id = ?",
+                (chunk_id,),
+            ).fetchall()
+        ]
+        for extra in extra_items or []:
+            items.append(dict(extra))
+        items.sort(key=lambda r: int(r["start_offset"]), reverse=True)
+
+        new_text = text_raw
+        new_rows = []
+        for item in items:
+            map_ref = str(item.get("map_ref") or "")
+            if map_ref in drop:
+                continue
+            start, end = int(item["start_offset"]), int(item["end_offset"])
+            if not (0 <= start < end <= len(text_raw)):
+                continue
+            sens = str(item.get("sens_type") or "")
+            if item.get("placeholder") is not None and map_ref not in recompute:
+                placeholder = item["placeholder"]
+            else:
+                placeholder = self._placeholder_from_mapping(
+                    conn, cache, map_ref, sens, text_raw[start:end]
+                )
+                if placeholder is None:
+                    continue
+            new_text = new_text[:start] + placeholder + new_text[end:]
+            new_rows.append(
+                (new_id(), dv_id, chunk_id, sens, start, end, placeholder, map_ref, utc_now())
+            )
+
+        conn.execute(
+            "UPDATE document_chunks SET text_redacted = ? WHERE id = ?",
+            (new_text, chunk_id),
+        )
+        conn.execute("DELETE FROM redaction_items WHERE chunk_id = ?", (chunk_id,))
+        for nr in new_rows:
+            conn.execute(
+                "INSERT INTO redaction_items "
+                "(id, document_version_id, chunk_id, sens_type, start_offset, end_offset, placeholder, map_ref, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                nr,
+            )
+        return True
+
+    # --------------------------------------------------------------
     # 核心重构方法：batch_apply_and_redact
     # --------------------------------------------------------------
     def batch_apply_and_redact(self, payload: dict) -> dict[str, Any]:
@@ -1318,14 +1427,13 @@ class GlobalEntityMapper:
             document_id = payload.get("document_id")
 
             # ---------- 1. 应用删除和更新（影响 redaction_items） ----------
-            affected_chunks = {}
-
-            # 收集删除影响的 chunk
-            for fp in deletions:
+            # 只需知道哪些 chunk 需要整块重建；重建时取该 chunk 全部项，不丢其它实体
+            affected_chunks: set[str] = set()
+            for fp in list(deletions) + list(updates):
                 if document_id:
                     rows = conn.execute(
                         """
-                        SELECT ri.id, ri.chunk_id, ri.start_offset, ri.end_offset, ri.placeholder, ri.map_ref
+                        SELECT ri.chunk_id
                         FROM redaction_items ri
                         JOIN document_chunks dc ON dc.id = ri.chunk_id
                         JOIN document_versions dv ON dv.id = dc.document_version_id
@@ -1335,32 +1443,10 @@ class GlobalEntityMapper:
                     ).fetchall()
                 else:
                     rows = conn.execute(
-                        "SELECT id, chunk_id, start_offset, end_offset, placeholder, map_ref FROM redaction_items WHERE map_ref = ?",
+                        "SELECT chunk_id FROM redaction_items WHERE map_ref = ?",
                         (fp,)
                     ).fetchall()
-                for row in rows:
-                    affected_chunks.setdefault(row["chunk_id"], []).append(dict(row))
-
-            # 收集更新影响的 chunk
-            for fp in updates:
-                if document_id:
-                    rows = conn.execute(
-                        """
-                        SELECT ri.id, ri.chunk_id, ri.start_offset, ri.end_offset, ri.placeholder, ri.map_ref
-                        FROM redaction_items ri
-                        JOIN document_chunks dc ON dc.id = ri.chunk_id
-                        JOIN document_versions dv ON dv.id = dc.document_version_id
-                        WHERE ri.map_ref = ? AND dv.document_id = ?
-                        """,
-                        (fp, document_id)
-                    ).fetchall()
-                else:
-                    rows = conn.execute(
-                        "SELECT id, chunk_id, start_offset, end_offset, placeholder, map_ref FROM redaction_items WHERE map_ref = ?",
-                        (fp,)
-                    ).fetchall()
-                for row in rows:
-                    affected_chunks.setdefault(row["chunk_id"], []).append(dict(row))
+                affected_chunks.update(row["chunk_id"] for row in rows)
 
             # 执行更新映射（entity_global_map 层面）
             for fp, update in updates.items():
@@ -1379,106 +1465,18 @@ class GlobalEntityMapper:
                         params
                     )
 
-            # 对受影响的 chunk 进行重脱敏（删除和更新）
+            # 对受影响的 chunk 整块重建（取该 chunk 全部项，同 chunk 其它脱敏项一并保留）
             redacted_count = 0
-            for chunk_id, old_items in affected_chunks.items():
-                chunk = conn.execute(
-                    "SELECT text_raw, document_version_id FROM document_chunks WHERE id = ?",
-                    (chunk_id,)
-                ).fetchone()
-                if not chunk:
-                    continue
-
-                text_raw = chunk["text_raw"]
-                doc_version_id = chunk["document_version_id"]
-                new_text = text_raw
-                new_items = []
-
-                # 按 start_offset 降序
-                sorted_items = sorted(old_items, key=lambda x: x["start_offset"], reverse=True)
-
-                for item in sorted_items:
-                    start = item["start_offset"]
-                    end = item["end_offset"]
-                    map_ref = item["map_ref"]
-
-                    if map_ref in deletions:
-                        placeholder = text_raw[start:end]  # 恢复原文
-                    else:
-                        # 检查更新
-                        update = updates.get(map_ref)
-                        if update:
-                            new_anon = conn.execute(
-                                "SELECT anonymous_id, sens_type FROM entity_global_map WHERE fingerprint = ?",
-                                (map_ref,)
-                            ).fetchone()
-                            if new_anon:
-                                new_placeholder = new_anon["anonymous_id"]
-                                sens_type = new_anon["sens_type"]
-                                new_items.append({
-                                    "id": new_id(),
-                                    "document_version_id": doc_version_id,
-                                    "chunk_id": chunk_id,
-                                    "sens_type": sens_type,
-                                    "start_offset": start,
-                                    "end_offset": end,
-                                    "placeholder": new_placeholder,
-                                    "map_ref": map_ref,
-                                    "created_at": utc_now()
-                                })
-                                placeholder = new_placeholder
-                            else:
-                                placeholder = text_raw[start:end]
-                        else:
-                            # 保持不变
-                            cur_anon = conn.execute(
-                                "SELECT anonymous_id, sens_type FROM entity_global_map WHERE fingerprint = ?",
-                                (map_ref,)
-                            ).fetchone()
-                            if cur_anon:
-                                new_items.append({
-                                    "id": new_id(),
-                                    "document_version_id": doc_version_id,
-                                    "chunk_id": chunk_id,
-                                    "sens_type": cur_anon["sens_type"],
-                                    "start_offset": start,
-                                    "end_offset": end,
-                                    "placeholder": cur_anon["anonymous_id"],
-                                    "map_ref": map_ref,
-                                    "created_at": utc_now()
-                                })
-                                placeholder = cur_anon["anonymous_id"]
-                            else:
-                                placeholder = text_raw[start:end]
-
-                    new_text = new_text[:start] + placeholder + new_text[end:]
-
-                # 更新 chunk
-                conn.execute(
-                    "UPDATE document_chunks SET text_redacted = ? WHERE id = ?",
-                    (new_text, chunk_id)
-                )
-                conn.execute("DELETE FROM redaction_items WHERE chunk_id = ?", (chunk_id,))
-                for item_data in new_items:
-                    conn.execute(
-                        """
-                        INSERT INTO redaction_items 
-                        (id, document_version_id, chunk_id, sens_type, start_offset, end_offset, placeholder, map_ref, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            item_data["id"],
-                            item_data["document_version_id"],
-                            item_data["chunk_id"],
-                            item_data["sens_type"],
-                            item_data["start_offset"],
-                            item_data["end_offset"],
-                            item_data["placeholder"],
-                            item_data["map_ref"],
-                            item_data["created_at"]
-                        )
-                    )
-                redacted_count += 1
+            _map_cache: dict = {}
+            for chunk_id in affected_chunks:
+                if self._rebuild_chunk_redaction(
+                    conn,
+                    chunk_id,
+                    drop_map_refs=set(deletions),
+                    recompute_refs=set(updates),
+                    cache=_map_cache,
+                ):
+                    redacted_count += 1
 
             # ---------- 2. 处理新增映射（先插入映射，再应用到所有文档） ----------
             for add in additions:
@@ -1551,7 +1549,6 @@ class GlobalEntityMapper:
                     occupied_intervals = [(row["start_offset"], row["end_offset"]) for row in existing_items]
 
                     # 查找所有匹配位置（非重叠）
-                    import re
                     positions = []
                     start_pos = 0
                     while True:
@@ -1561,59 +1558,27 @@ class GlobalEntityMapper:
                         positions.append((idx, idx + len(original)))
                         start_pos = idx + 1
 
-                    # 筛选未被占用的位置
-                    new_positions = []
+                    # 未被占用的匹配位置（raw 坐标）；统一走整块重建，不用 raw 偏移切已脱敏文本
+                    extras = []
                     for start, end in positions:
-                        overlapped = False
-                        for os, oe in occupied_intervals:
-                            if not (end <= os or start >= oe):
-                                overlapped = True
-                                break
-                        if not overlapped:
-                            new_positions.append((start, end))
-
-                    if not new_positions:
+                        if any(
+                            not (end <= os or start >= oe)
+                            for os, oe in occupied_intervals
+                        ):
+                            continue
+                        extras.append({
+                            "start_offset": start,
+                            "end_offset": end,
+                            "map_ref": fp,
+                            "sens_type": sens_type,
+                        })
+                    if not extras:
                         continue
 
-                    # 获取当前 text_redacted
-                    cur_redacted = conn.execute(
-                        "SELECT text_redacted FROM document_chunks WHERE id = ?",
-                        (chunk_id,)
-                    ).fetchone()[0]
-
-                    # 按 start 降序，从后往前替换
-                    new_positions_sorted = sorted(new_positions, key=lambda x: x[0], reverse=True)
-                    new_text = cur_redacted
-                    for start, end in new_positions_sorted:
-                        new_text = new_text[:start] + placeholder + new_text[end:]
-
-                    # 更新 chunk
-                    conn.execute(
-                        "UPDATE document_chunks SET text_redacted = ? WHERE id = ?",
-                        (new_text, chunk_id)
-                    )
-
-                    # 插入新的 redaction_items
-                    for start, end in new_positions_sorted:
-                        conn.execute(
-                            """
-                            INSERT INTO redaction_items 
-                            (id, document_version_id, chunk_id, sens_type, start_offset, end_offset, placeholder, map_ref, created_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """,
-                            (
-                                new_id(),
-                                doc_version_id,
-                                chunk_id,
-                                sens_type,
-                                start,
-                                end,
-                                placeholder,
-                                fp,
-                                utc_now()
-                            )
-                        )
-                    redacted_count += 1
+                    if self._rebuild_chunk_redaction(
+                        conn, chunk_id, extra_items=extras, cache=_map_cache
+                    ):
+                        redacted_count += 1
 
             # ---------- 3. 删除映射（entity_global_map） ----------
             for fp in deletions:
