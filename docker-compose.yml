@@ -1,0 +1,21 @@
+services:
+  law-agent:
+    build:
+      context: .
+      args:
+        # 国内网络可改为 https://pypi.tuna.tsinghua.edu.cn/simple
+        PIP_INDEX_URL: https://pypi.org/simple
+    image: law-agent:1.0.0
+    container_name: law-agent
+    # 密钥只在运行时注入：先把 .env.example 复制为 .env 再填
+    env_file:
+      - .env
+    environment:
+      APP_HOST: 0.0.0.0
+      APP_PORT: "8000"
+    ports:
+      - "8000:8000"
+    volumes:
+      # 会话、SQLite、上传材料落在宿主机，容器重建不丢
+      - ./data:/app/data
+    restart: unless-stopped

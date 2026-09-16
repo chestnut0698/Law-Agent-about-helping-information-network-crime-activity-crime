@@ -42,8 +42,16 @@
                     class: 'agent-jump-btn',
                     text: item.label
                 });
-                btn.addEventListener('click', () => {
-                    if (global.Workbench && typeof global.Workbench.setView === 'function') {
+                btn.addEventListener('click', async () => {
+                    if (!global.Workbench) return;
+                    if (item.action === 'mapping' && typeof global.Workbench._openMappingManager === 'function') {
+                        if (typeof global.Workbench.setView === 'function') {
+                            await global.Workbench.setView('materials');
+                        }
+                        global.Workbench._openMappingManager(null, { taskScope: true });
+                        return;
+                    }
+                    if (typeof global.Workbench.setView === 'function') {
                         global.Workbench.setView(item.view);
                     }
                 });

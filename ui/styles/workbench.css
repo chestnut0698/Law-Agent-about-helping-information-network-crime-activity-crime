@@ -1976,19 +1976,86 @@ body,
 }
 
 .wb-nav-switcher-item {
-    display: block;
+    display: flex;
+    align-items: center;
+    gap: 4px;
     width: 100%;
-    padding: 8px 10px;
+    padding: 4px 4px 4px 8px;
     border: 0;
     background: transparent;
     text-align: left;
-    cursor: pointer;
     color: var(--text-primary);
     font: inherit;
     font-size: 12px;
 }
 .wb-nav-switcher-item:hover,
 .wb-nav-switcher-item.active { background: var(--accent-light); }
+.wb-nav-switcher-open {
+    flex: 1;
+    min-width: 0;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    padding: 6px 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.wb-task-x {
+    flex-shrink: 0;
+    width: 22px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--text-muted);
+    font: inherit;
+    font-size: 16px;
+    line-height: 22px;
+    cursor: pointer;
+}
+.wb-task-x:hover { color: #c0392b; }
+
+.wb-swipe-row {
+    overflow: hidden;
+    margin-bottom: 8px;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    background: var(--bg-primary);
+}
+.wb-swipe-row:has(.wb-list-item.active) {
+    border-color: color-mix(in srgb, var(--primary) 30%, var(--border-color));
+}
+.wb-swipe-track {
+    display: flex;
+    flex-wrap: nowrap;
+    width: 100%;
+    transition: transform 0.2s ease;
+}
+.wb-swipe-row .wb-list-item {
+    flex: 0 0 100%;
+    max-width: 100%;
+    box-sizing: border-box;
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+    background: var(--bg-primary);
+    touch-action: pan-y;
+    user-select: none;
+}
+.wb-swipe-delete {
+    flex: 0 0 76px;
+    width: 76px;
+    border: 0;
+    margin: 0;
+    background: #c0392b;
+    color: #fff;
+    font: inherit;
+    font-size: 13px;
+    cursor: pointer;
+}
 
 .wb-nav-section-label {
     margin-top: 10px;
@@ -3028,12 +3095,10 @@ body,
     color: var(--muted-foreground);
 }
 .ref-task-switcher .wb-list-item {
-    border: 1px solid var(--border-color);
-    margin-bottom: 8px;
+    border: 0;
 }
 .ref-task-switcher .wb-list-item.active {
-    border-color: color-mix(in srgb, var(--primary) 30%, transparent);
-    background: color-mix(in srgb, var(--primary) 5%, transparent);
+    background: color-mix(in srgb, var(--primary) 8%, var(--bg-primary));
 }
 
 /* —— 角色时间线：对齐前端参考 timeline/page.tsx —— */

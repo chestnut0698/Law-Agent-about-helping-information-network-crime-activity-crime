@@ -1579,7 +1579,7 @@ def compare_material_images(
     try:
         client = OpenAI(api_key=API_KEY, base_url=BASE_URL, timeout=90.0)
         resp = client.chat.completions.create(
-            model=MODEL_NAME or "deepseek-flash",
+            model=MODEL_NAME or "deepseek-v4-flash",
             messages=[{"role": "user", "content": content}],
             temperature=0,
             max_tokens=400,

@@ -478,74 +478,115 @@ class TaskService:
         }
 
     def delete_task(self, task_id: str) -> dict:
+        """删除任务及对话、产物、材料、抽取与脱敏映射；案件若未被其他任务占用一并删除。"""
         with db_session() as conn:
-            docs = _rows(conn, """
-                        SELECT DISTINCT dv.storage_path, d.id AS document_id
-                        FROM document_versions dv
-                        JOIN documents d ON d.id = dv.document_id
-                        JOIN task_cases tc ON tc.case_id = d.case_id
-                        WHERE tc.task_id = ?
-                          AND d.deleted_at IS NULL
-                    """, (task_id,))
+            def has_table(name: str) -> bool:
+                return bool(
+                    conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                        (name,),
+                    ).fetchone()
+                )
 
-            dirs_to_cleanup = set()
+            case_ids = [
+                row["case_id"]
+                for row in _rows(conn, "SELECT case_id FROM task_cases WHERE task_id = ?", (task_id,))
+            ]
+            exclusive_cases = []
+            for case_id in case_ids:
+                shared = conn.execute(
+                    "SELECT 1 FROM task_cases WHERE case_id = ? AND task_id != ?",
+                    (case_id, task_id),
+                ).fetchone()
+                if not shared:
+                    exclusive_cases.append(case_id)
 
-            for doc in docs:
-                # 删除原始文件
-                storage_path = doc['storage_path']
+            versions: list[dict[str, Any]] = []
+            doc_ids: list[str] = []
+            if exclusive_cases and has_table("documents"):
+                marks = ",".join("?" * len(exclusive_cases))
+                doc_ids = [
+                    row["id"]
+                    for row in _rows(
+                        conn,
+                        f"SELECT id FROM documents WHERE case_id IN ({marks})",
+                        exclusive_cases,
+                    )
+                ]
+            if doc_ids and has_table("document_versions"):
+                marks = ",".join("?" * len(doc_ids))
+                versions = _rows(
+                    conn,
+                    f"SELECT id, document_id, storage_path FROM document_versions "
+                    f"WHERE document_id IN ({marks})",
+                    doc_ids,
+                )
+
+            dirs_to_cleanup: set[str] = set()
+            for ver in versions:
+                storage_path = ver.get("storage_path")
                 if storage_path and os.path.exists(storage_path):
                     try:
                         os.remove(storage_path)
                         dirs_to_cleanup.add(os.path.dirname(storage_path))
-
-                    except OSError as e:
-                        print(f"Warning: failed to delete file {storage_path}: {e}")
+                    except OSError as exc:
+                        print(f"Warning: failed to delete file {storage_path}: {exc}")
             root_dirs = {
                 str(Path(MATERIAL_STORAGE_DIR).resolve()),
                 str(Path(REDACTION_STORAGE_DIR).resolve()),
             }
             for dir_path in sorted(dirs_to_cleanup, key=len, reverse=True):
-                # 从最深层开始清理
                 current = Path(dir_path).resolve()
                 while True:
-                    if not current.exists():
+                    if not current.exists() or str(current) in root_dirs:
                         break
-                    # 检查是否到达根目录（停止条件）
-                    if str(current) in root_dirs:
-                        break
-                    # 检查目录是否为空（仅包含 . 和 ..）
                     if any(current.iterdir()):
-                        break  # 非空目录，停止向上
+                        break
                     try:
                         current.rmdir()
-                        print(f"Removed empty directory: {current}")
-                        # 继续向上检查父目录
                         current = current.parent
-                    except OSError as e:
-                        print(f"Warning: failed to remove directory {current}: {e}")
+                    except OSError:
                         break
-            # 1. 删除关联的聊天消息
+
+            for table in ("entity_mentions", "event_mentions", "rejected_candidates", "rule_hits"):
+                if has_table(table):
+                    conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
+
+            for ver in versions:
+                vid = ver["id"]
+                if has_table("redaction_items"):
+                    conn.execute("DELETE FROM redaction_items WHERE document_version_id = ?", (vid,))
+                if has_table("document_chunks"):
+                    conn.execute("DELETE FROM document_chunks WHERE document_version_id = ?", (vid,))
+                if has_table("document_pages"):
+                    conn.execute("DELETE FROM document_pages WHERE document_version_id = ?", (vid,))
+                if has_table("parse_jobs"):
+                    conn.execute("DELETE FROM parse_jobs WHERE document_version_id = ?", (vid,))
+                if has_table("material_audit_events"):
+                    conn.execute("DELETE FROM material_audit_events WHERE document_version_id = ?", (vid,))
+                conn.execute("DELETE FROM document_versions WHERE id = ?", (vid,))
+            for did in doc_ids:
+                if has_table("material_audit_events"):
+                    conn.execute("DELETE FROM material_audit_events WHERE document_id = ?", (did,))
+                conn.execute("DELETE FROM documents WHERE id = ?", (did,))
+
             conn.execute("DELETE FROM chat_messages WHERE task_id = ?", (task_id,))
-
-            # 2. 删除关联的案件记录
-            conn.execute("DELETE FROM task_cases WHERE task_id = ?", (task_id,))
-
-            # 3. 删除关联的产物版本
             artifacts = _rows(conn, "SELECT id FROM artifacts WHERE task_id = ?", (task_id,))
             for art in artifacts:
                 conn.execute("DELETE FROM artifact_versions WHERE artifact_id = ?", (art["id"],))
-
-            # 4. 删除产物本身
             conn.execute("DELETE FROM artifacts WHERE task_id = ?", (task_id,))
-
-            # 5. 删除任务本身（表名是 supervision_tasks，不是 tasks）
+            conn.execute("DELETE FROM task_cases WHERE task_id = ?", (task_id,))
+            if exclusive_cases and has_table("cases"):
+                conn.execute(
+                    f"DELETE FROM cases WHERE id IN ({','.join('?' * len(exclusive_cases))})",
+                    exclusive_cases,
+                )
             conn.execute("DELETE FROM supervision_tasks WHERE id = ?", (task_id,))
-
             conn.commit()
 
-        from app.files import GlobalEntityMapper  # 确保导入
-        mapper = GlobalEntityMapper(db_path=self.db_path)
-        mapper.delete_by_task_id(task_id)
+        from app.files import GlobalEntityMapper
+
+        GlobalEntityMapper(db_path=self.db_path).delete_by_task_id(task_id)
         return {"success": True, "task_id": task_id}
 
     def list_tasks(self, limit: int = 8) -> list[dict[str, Any]]:
@@ -697,13 +738,10 @@ class TaskService:
             "material_totals": totals,
             "steps": [
                 {"key": "PARSE", "label": "材料解析与识字", "mode": "auto"},
-                {"key": "COLLIDE", "label": "跨案标识比对", "mode": "auto"},
-                {"key": "ENTITY_WRITE", "label": "补写疑似同一对象", "mode": "auto"},
-                {"key": "ENTITY_REVIEW", "label": "判断对象是否同一", "mode": "review"},
+                {"key": "COLLIDE", "label": "跨案标识比对并补写疑似同一", "mode": "auto"},
                 {"key": "TIMELINE", "label": "整理事件时间线", "mode": "auto"},
                 {"key": "CLUE", "label": "形成疑似关联线索", "mode": "auto"},
-                {"key": "CLUE_REVIEW", "label": "核验关联线索", "mode": "review"},
-                {"key": "REPORT", "label": "撰写线索报告", "mode": "review"},
+                {"key": "REPORT", "label": "撰写跨案关联线索核验单", "mode": "auto"},
             ],
         }
 

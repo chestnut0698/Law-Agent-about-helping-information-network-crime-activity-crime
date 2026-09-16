@@ -15,6 +15,8 @@
 | 包管理 | 建议使用虚拟环境（`venv`） |
 | 浏览器 | 现代 Chromium / Firefox / Edge 即可 |
 | 模型 API | 配置 **DeepSeek** |
+| git | 必需，脱敏库 `prikit` 只能从源仓库安装 |
+| Tesseract | 可选，`prikit` 的图片识字兜底（Docker 镜像已内置） |
 
 可选：安装 [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) 作为离线识字兜底。默认用 DeepSeek 多模态识别 PNG/JPG 以及扫描件 PDF 中的文字，**不必先装 Paddle**。关闭 `DEEPSEEK_EXTERNAL_CALLS_ENABLED` 或未配置密钥时，才会尝试 Paddle，再退回内置 Fallback。
 
@@ -64,7 +66,7 @@ cp .env.example .env          # Windows 可用 copy .env.example .env
 # 推荐：默认模型链路 DeepSeek
 DEEPSEEK_API_KEY=你的密钥
 DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-flash
+DEEPSEEK_MODEL=deepseek-v4-flash
 ```
 
 启动服务（仍在仓库根目录、虚拟环境已激活）：
@@ -78,6 +80,53 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 浏览器打开：<http://127.0.0.1:8000>
 
 前端由 FastAPI 挂载 `ui/` 静态目录，无需另起前端工程。
+
+---
+
+## Docker 部署
+
+镜像已预装 Python 3.11、全部依赖、中文实体模型 `zh_core_web_trf` 和 Tesseract 识字引擎，
+无需在宿主机装任何 Python 包或模型。仍需两个外部条件：**DeepSeek 密钥**与**可访问 api.deepseek.com 的网络**。
+
+### 方式一：从源码构建
+
+```bash
+cp .env.example .env          # 填入密钥；.env 不会进镜像
+docker compose up -d --build
+```
+
+国内网络建议换源，首次构建需下载约 1.5GB 依赖：
+
+```bash
+docker compose build --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+### 方式二：导入已打包镜像
+
+```bash
+docker load -i law-agent-1.0.0.tar
+cp .env.example .env          # 填入密钥
+docker compose up -d
+```
+
+两种方式都在 <http://127.0.0.1:8000> 访问。查看日志 `docker compose logs -f`，停止 `docker compose down`。
+
+### 镜像约定
+
+| 项 | 说明 |
+| --- | --- |
+| 端口 | 容器 `8000` 映射到宿主机 `8000`，可在 `docker-compose.yml` 改 |
+| 监听地址 | 容器内为 `0.0.0.0`（`APP_HOST`），本地直跑仍默认 `127.0.0.1` |
+| 密钥 | 只经 `env_file: .env` 运行时注入，镜像与源码包均不含真实密钥 |
+| 数据持久化 | `./data` 挂载进容器，会话、SQLite、上传材料容器重建不丢 |
+| 算力 | 纯 CPU，torch 为 CPU 构建，不需要显卡或 CUDA |
+| 示例卷宗 | 随镜像带 `database/G020`、`G021` 两组，其余在源码包内 |
+
+导出镜像交付：
+
+```bash
+docker save law-agent:1.0.0 -o law-agent-1.0.0.tar
+```
 
 ---
 

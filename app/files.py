@@ -2266,7 +2266,7 @@ class DeepSeekVisionOCREngine:
         from openai import OpenAI
 
         self._client = OpenAI(api_key=API_KEY, base_url=BASE_URL, timeout=90.0)
-        self._model = MODEL_NAME or "deepseek-flash"
+        self._model = MODEL_NAME or "deepseek-v4-flash"
 
     def recognize(self, image_bytes: bytes) -> list[OCRLine]:
         import base64

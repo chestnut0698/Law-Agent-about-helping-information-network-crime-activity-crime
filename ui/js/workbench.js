@@ -173,6 +173,124 @@
             this._updateNavBadges();
         },
 
+        async _deleteTask(task) {
+            if (!task || !task.id) return false;
+            const title = task.title || '未命名任务';
+            if (!confirm(`确定删除任务「${title}」？删除后不可恢复。`)) return false;
+            try {
+                const resp = await fetch(`/api/tasks/${task.id}`, { method: 'DELETE' });
+                const data = await resp.json();
+                if (data.error_code) {
+                    Toast.error(data.message || '删除失败');
+                    return false;
+                }
+                Toast.success('任务已删除');
+                const deletedCurrent = this.task && this.task.id === task.id;
+                if (this.draftTaskId === task.id) this.draftTaskId = null;
+                if (deletedCurrent) {
+                    this.task = null;
+                    State.currentTaskId = null;
+                }
+                await this.loadTasks();
+                if (!deletedCurrent && this.currentView === 'tasks' && this.task) {
+                    await this._renderCurrentView();
+                }
+                return true;
+            } catch (err) {
+                Toast.error('删除失败：' + (err && err.message ? err.message : '请稍后重试'));
+                return false;
+            }
+        },
+
+        _bindTaskSwipe(front, onDelete) {
+            const wrap = Utils.create('div', { class: 'wb-swipe-row' });
+            const track = Utils.create('div', { class: 'wb-swipe-track' });
+            const del = Utils.create('button', {
+                type: 'button',
+                class: 'wb-swipe-delete',
+                text: '删除'
+            });
+            del.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                onDelete();
+            });
+            track.appendChild(front);
+            track.appendChild(del);
+            wrap.appendChild(track);
+
+            const width = 76;
+            let startX = 0;
+            let startY = 0;
+            let origin = 0;
+            let current = 0;
+            let dragging = false;
+            let swiped = false;
+            let ignoreClick = false;
+
+            const setX = (x, animate) => {
+                current = Math.max(-width, Math.min(0, x));
+                track.style.transition = animate ? '' : 'none';
+                track.style.transform = current ? `translateX(${current}px)` : '';
+                wrap.classList.toggle('is-open', current <= -width * 0.5);
+            };
+            const closeOthers = () => {
+                Utils.$$('.wb-swipe-row.is-open').forEach((row) => {
+                    if (row === wrap) return;
+                    row.classList.remove('is-open');
+                    const other = Utils.$('.wb-swipe-track', row);
+                    if (other) other.style.transform = '';
+                });
+            };
+
+            front.addEventListener('pointerdown', (e) => {
+                if (e.pointerType === 'mouse' && e.button !== 0) return;
+                closeOthers();
+                dragging = true;
+                swiped = false;
+                startX = e.clientX;
+                startY = e.clientY;
+                origin = current;
+                track.style.transition = 'none';
+                try { front.setPointerCapture(e.pointerId); } catch (_) { /* ignore */ }
+            });
+            front.addEventListener('pointermove', (e) => {
+                if (!dragging) return;
+                const dx = e.clientX - startX;
+                const dy = e.clientY - startY;
+                if (!swiped && Math.abs(dy) > 10 && Math.abs(dy) > Math.abs(dx)) {
+                    dragging = false;
+                    setX(origin, true);
+                    return;
+                }
+                if (Math.abs(dx) > 6) swiped = true;
+                if (swiped) setX(origin + dx, false);
+            });
+            const endDrag = () => {
+                if (!dragging) return;
+                dragging = false;
+                const open = current < -width * 0.35;
+                setX(open ? -width : 0, true);
+                if (swiped) ignoreClick = true;
+            };
+            front.addEventListener('pointerup', endDrag);
+            front.addEventListener('pointercancel', endDrag);
+            front.addEventListener('click', (e) => {
+                if (ignoreClick) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    ignoreClick = false;
+                    return;
+                }
+                if (current < 0) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setX(0, true);
+                }
+            }, true);
+            return wrap;
+        },
+
         _renderSwitcher() {
             const nameEl = Utils.$('#wb-switcher-name');
             const metaEl = Utils.$('#wb-switcher-meta');
@@ -190,44 +308,33 @@
             if (!menu) return;
             menu.innerHTML = '';
             (this.tasks || []).forEach((task) => {
-                const item = Utils.create('button', {
+                const row = Utils.create('div', {
+                    class: `wb-nav-switcher-item${this.task && this.task.id === task.id ? ' active' : ''}`
+                });
+                const openBtn = Utils.create('button', {
                     type: 'button',
-                    class: `wb-nav-switcher-item${this.task && this.task.id === task.id ? ' active' : ''}`,
+                    class: 'wb-nav-switcher-open',
                     text: task.title || '未命名任务'
                 });
-                item.addEventListener('click', async () => {
+                openBtn.addEventListener('click', async () => {
                     menu.hidden = true;
                     await this.openTask(task.id);
                 });
-                const del = Utils.create('span', {
-                    class: 'wb-task-del',
-                    text: ' ×',
+                const del = Utils.create('button', {
+                    type: 'button',
+                    class: 'wb-task-x',
+                    text: '×',
                     title: '删除任务'
                 });
                 del.addEventListener('click', async (e) => {
+                    e.preventDefault();
                     e.stopPropagation();
-                    if (!confirm(`确定删除任务「${task.title}」？`)) return;
-                    try {
-                        const resp = await fetch(`/api/tasks/${task.id}`, { method: 'DELETE' });
-                        const data = await resp.json();
-                        if (data.error_code) {
-                            Toast.error(data.message || '删除失败');
-                            return;
-                        }
-                        Toast.success('任务已删除');
-                        if (this.draftTaskId === task.id) this.draftTaskId = null;
-                        if (this.task && this.task.id === task.id) {
-                            this.task = null;
-                            State.currentTaskId = null;
-                            this.showStart();
-                        }
-                        await this.loadTasks();
-                    } catch (err) {
-                        Toast.error('删除失败：' + err.message);
-                    }
+                    menu.hidden = true;
+                    await this._deleteTask(task);
                 });
-                item.appendChild(del);
-                menu.appendChild(item);
+                row.appendChild(openBtn);
+                row.appendChild(del);
+                menu.appendChild(row);
             });
             if (!(this.tasks || []).length) {
                 menu.appendChild(Utils.create('div', {
@@ -626,7 +733,7 @@
                 && item.status !== 'INVALID'
                 && item.status !== 'STALE'
             );
-            if (!art) return 0;
+            if (!art) return null;
             const data = this.artifactCache[art.id];
             const payload = data && data.payload;
             if (!payload) return null;
@@ -1385,9 +1492,10 @@
                     Toast.info('实体复核已完成，可继续整理时间线与线索');
                 }
                 if (window.Agent && typeof Agent.notifyReviewState === 'function') {
+                    const pending = Number(data.pending);
                     Agent.notifyReviewState({
                         kind: 'ENTITY_REVIEW',
-                        pending: this._entityUnconfirmedCount()
+                        pending: Number.isFinite(pending) ? pending : this._entityUnconfirmedCount()
                     });
                 }
             } catch (e) {
@@ -3613,7 +3721,7 @@
                     })
                 ]);
                 row.addEventListener('click', () => this.openTask(t.id));
-                listBody.appendChild(row);
+                listBody.appendChild(this._bindTaskSwipe(row, () => this._deleteTask(t)));
             });
             switcher.appendChild(listBody);
             grid.appendChild(switcher);

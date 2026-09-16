@@ -11,9 +11,14 @@ python-multipart==0.0.32
 pymupdf==1.28.2
 Pillow==12.3.0
 pytest==9.1.1
-paddleocr>=2.7.0
-paddlepaddle>=2.5.0
-prikit==1.0.0
-presidio-analyze
-spacy
-PyPDF2
+PyPDF2==3.0.1
+
+# 脱敏：prikit 未发布到 PyPI，只能按 commit 从源仓库安装（需要本机有 git）
+prikit @ git+https://github.com/Cryptocxf/PriKit.git@83df4411ef3af2e31c28c43a465cd52839768ef8
+presidio-analyzer==2.2.364
+spacy==3.8.16
+# 中文实体模型另行安装，约 450MB：python -m spacy download zh_core_web_trf
+
+# 离线 OCR 兜底，默认不装：识字走 DeepSeek 多模态，构造失败会自动降级
+# paddleocr>=2.7.0
+# paddlepaddle>=2.5.0

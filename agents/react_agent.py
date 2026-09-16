@@ -32,13 +32,20 @@ def _execution_plan_for(user_input: str) -> dict | None:
     full_run = any(mark in text for mark in _FULL_RUN_MARKERS)
     if not continue_clues and not continue_entity and not full_run:
         return None
-    entity_gate = PLAN_ENTITY_REVIEW_INDEX
     steps = []
     for i in range(len(PLANS[0])):
         if continue_clues:
-            status = "completed"
+            status = (
+                "completed"
+                if i < PLAN_REPORT_INDEX
+                else ("running" if i == PLAN_REPORT_INDEX else "pending")
+            )
         elif continue_entity:
-            status = "completed" if i < entity_gate else ("running" if i == entity_gate + 1 else "pending")
+            status = (
+                "completed"
+                if i < PLAN_TIMELINE_INDEX
+                else ("running" if i == PLAN_TIMELINE_INDEX else "pending")
+            )
         else:
             status = "running" if i == 0 else "pending"
         steps.append(

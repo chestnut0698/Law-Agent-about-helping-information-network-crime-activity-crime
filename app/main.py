@@ -6,7 +6,7 @@ import asyncio
 from agents.react_agent import *
 from typing import Optional
 import json
-from app.config import REPO_ROOT
+from app.config import APP_HOST, APP_PORT, REPO_ROOT
 from app.files import MaterialError, get_material_service, init_db, get_global_mapper
 from app.tasks import TaskError, TASK_ERROR_CODES, get_task_service, init_task_db
 
@@ -915,4 +915,4 @@ app.mount("/", StaticFiles(directory=str(REPO_ROOT / "ui"), html=True), name="ui
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host=APP_HOST, port=APP_PORT)

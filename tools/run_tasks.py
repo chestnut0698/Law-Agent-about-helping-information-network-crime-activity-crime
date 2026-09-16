@@ -251,11 +251,14 @@ def put_task_entity_candidate(
         result = get_task_service().put_entity_candidate(
             task_id, candidate, user_id=user_id or "system"
         )
-        pending = result.get("pending")
+        pending = int(result.get("pending") or 0)
+        gate = "ENTITY_REVIEW" if pending > 0 else ""
         return _tool_json(
             {
                 "ok": True,
                 "pending": pending,
+                "pending_entity_reviews": pending,
+                "analysis_gate": gate or None,
                 "replaced": result.get("replaced"),
                 "message": (
                     "已写入实体待核对象，请继续补写其他疑似同一项；"
